@@ -355,7 +355,7 @@ def _create_guest_files(
         # Find used IP addresses by scanning existing init.sh files
         used_ips = set()
         if os.path.exists(SYSTEMD_MACHINES):
-            for container_dir in glob.glob(f"{SYSTEMD_MACHINES}/claudette.*"):
+            for container_dir in glob.glob(f"{SYSTEMD_MACHINES}/sandy.*"):
                 # Skip cache directory
                 if container_dir.endswith(".__cache"):
                     continue
@@ -401,7 +401,7 @@ def _create_guest_files(
         init_script_content = f"""#!/bin/sh
 set -e
 # Container network initialization script
-# Generated automatically by claudette-nspawn
+# Generated automatically by sandy
 
 # Network configuration variables
 CONTAINER_IP="{container_ip}"
@@ -433,7 +433,7 @@ echo 'nameserver 1.0.0.1' >> /etc/resolv.conf
         _write(init_script_path, init_script_content, mode=0o0755)
 
 
-class ClaudetteNet:
+class SandyNet:
     """Manages network bridge and NAT configuration for containers"""
 
     # Private networks to block for container isolation
@@ -451,7 +451,7 @@ class ClaudetteNet:
     ]
 
     def __init__(self):
-        self.bridge_name = "cldtbr0"
+        self.bridge_name = "sandybr0"
         self.network: Optional[str] = None
         self.network_cidr: Optional[str] = None
         self.gateway: Optional[str] = None
@@ -850,18 +850,18 @@ class ClaudetteNet:
         """Create base nftables tables and chains"""
         try:
             # Create table if it doesn't exist
-            if not self._nft_table_exists("ip", "claudette"):
+            if not self._nft_table_exists("ip", "sandy"):
                 self._run_nft(
-                    "add", "table", "ip", "claudette", error_prefix="Create IPv4 table"
+                    "add", "table", "ip", "sandy", error_prefix="Create IPv4 table"
                 )
 
             # Create chains for NAT
-            if not self._nft_chain_exists("ip", "claudette", "postrouting"):
+            if not self._nft_chain_exists("ip", "sandy", "postrouting"):
                 self._run_nft(
                     "add",
                     "chain",
                     "ip",
-                    "claudette",
+                    "sandy",
                     "postrouting",
                     "{",
                     "type",
@@ -876,12 +876,12 @@ class ClaudetteNet:
                 )
 
             # Create chains for PREROUTING (for port forwarding DNAT)
-            if not self._nft_chain_exists("ip", "claudette", "prerouting"):
+            if not self._nft_chain_exists("ip", "sandy", "prerouting"):
                 self._run_nft(
                     "add",
                     "chain",
                     "ip",
-                    "claudette",
+                    "sandy",
                     "prerouting",
                     "{",
                     "type",
@@ -896,12 +896,12 @@ class ClaudetteNet:
                 )
 
             # Create chains for OUTPUT NAT (for host-generated traffic DNAT)
-            if not self._nft_chain_exists("ip", "claudette", "output"):
+            if not self._nft_chain_exists("ip", "sandy", "output"):
                 self._run_nft(
                     "add",
                     "chain",
                     "ip",
-                    "claudette",
+                    "sandy",
                     "output",
                     "{",
                     "type",
@@ -916,12 +916,12 @@ class ClaudetteNet:
                 )
 
             # Create chains for forwarding
-            if not self._nft_chain_exists("ip", "claudette", "forward"):
+            if not self._nft_chain_exists("ip", "sandy", "forward"):
                 self._run_nft(
                     "add",
                     "chain",
                     "ip",
-                    "claudette",
+                    "sandy",
                     "forward",
                     "{",
                     "type",
@@ -936,12 +936,12 @@ class ClaudetteNet:
                 )
 
             # Create chains for OUTPUT filter (host->container traffic control)
-            if not self._nft_chain_exists("ip", "claudette", "output_filter"):
+            if not self._nft_chain_exists("ip", "sandy", "output_filter"):
                 self._run_nft(
                     "add",
                     "chain",
                     "ip",
-                    "claudette",
+                    "sandy",
                     "output_filter",
                     "{",
                     "type",
@@ -956,18 +956,18 @@ class ClaudetteNet:
                 )
 
             # Create IPv6 table if ip6 support is needed
-            if not self._nft_table_exists("ip6", "claudette"):
+            if not self._nft_table_exists("ip6", "sandy"):
                 self._run_nft(
-                    "add", "table", "ip6", "claudette", error_prefix="Create IPv6 table"
+                    "add", "table", "ip6", "sandy", error_prefix="Create IPv6 table"
                 )
 
             # Create IPv6 forward chain
-            if not self._nft_chain_exists("ip6", "claudette", "forward"):
+            if not self._nft_chain_exists("ip6", "sandy", "forward"):
                 self._run_nft(
                     "add",
                     "chain",
                     "ip6",
-                    "claudette",
+                    "sandy",
                     "forward",
                     "{",
                     "type",
@@ -1001,28 +1001,28 @@ class ClaudetteNet:
             return False
 
         try:
-            # Handle cldt-nat-post chain in NAT table
-            if self._iptables_chain_exists("cldt-nat-post", "nat"):
+            # Handle sandy-nat-post chain in NAT table
+            if self._iptables_chain_exists("sandy-nat-post", "nat"):
                 # Chain exists, flush and zero it
                 self._run_iptables(
                     "-F",
-                    "cldt-nat-post",
+                    "sandy-nat-post",
                     table="nat",
-                    error_prefix="Flush cldt-nat-post chain",
+                    error_prefix="Flush sandy-nat-post chain",
                 )
                 self._run_iptables(
                     "-Z",
-                    "cldt-nat-post",
+                    "sandy-nat-post",
                     table="nat",
-                    error_prefix="Zero cldt-nat-post chain",
+                    error_prefix="Zero sandy-nat-post chain",
                 )
             else:
                 # Create new chain
                 self._run_iptables(
                     "-N",
-                    "cldt-nat-post",
+                    "sandy-nat-post",
                     table="nat",
-                    error_prefix="Create cldt-nat-post chain",
+                    error_prefix="Create sandy-nat-post chain",
                 )
 
                 # Insert jump rule for -s network_cidr at top of POSTROUTING
@@ -1032,7 +1032,7 @@ class ClaudetteNet:
                     "-s",
                     network_cidr,
                     "-j",
-                    "cldt-nat-post",
+                    "sandy-nat-post",
                     table="nat",
                     error_prefix="Insert POSTROUTING jump rule",
                 )
@@ -1047,33 +1047,33 @@ class ClaudetteNet:
                     "-s",
                     "127.0.0.1/8",
                     "-j",
-                    "cldt-nat-post",
+                    "sandy-nat-post",
                     table="nat",
                     error_prefix="Insert POSTROUTING jump rule",
                 )
 
-            # Handle cldt-nat-out chain in NAT table (for OUTPUT DNAT)
-            if self._iptables_chain_exists("cldt-nat-out", "nat"):
+            # Handle sandy-nat-out chain in NAT table (for OUTPUT DNAT)
+            if self._iptables_chain_exists("sandy-nat-out", "nat"):
                 # Chain exists, flush and zero it
                 self._run_iptables(
                     "-F",
-                    "cldt-nat-out",
+                    "sandy-nat-out",
                     table="nat",
-                    error_prefix="Flush cldt-nat-out chain",
+                    error_prefix="Flush sandy-nat-out chain",
                 )
                 self._run_iptables(
                     "-Z",
-                    "cldt-nat-out",
+                    "sandy-nat-out",
                     table="nat",
-                    error_prefix="Zero cldt-nat-out chain",
+                    error_prefix="Zero sandy-nat-out chain",
                 )
             else:
                 # Create new chain
                 self._run_iptables(
                     "-N",
-                    "cldt-nat-out",
+                    "sandy-nat-out",
                     table="nat",
-                    error_prefix="Create cldt-nat-out chain",
+                    error_prefix="Create sandy-nat-out chain",
                 )
 
                 # Insert jump rule at top of OUTPUT
@@ -1081,33 +1081,33 @@ class ClaudetteNet:
                     "-I",
                     "OUTPUT",
                     "-j",
-                    "cldt-nat-out",
+                    "sandy-nat-out",
                     table="nat",
                     error_prefix="Insert OUTPUT jump rule for NAT",
                 )
 
-            # Handle cldt-nat-pre chain in NAT table (for PREROUTING DNAT)
-            if self._iptables_chain_exists("cldt-nat-pre", "nat"):
+            # Handle sandy-nat-pre chain in NAT table (for PREROUTING DNAT)
+            if self._iptables_chain_exists("sandy-nat-pre", "nat"):
                 # Chain exists, flush and zero it
                 self._run_iptables(
                     "-F",
-                    "cldt-nat-pre",
+                    "sandy-nat-pre",
                     table="nat",
-                    error_prefix="Flush cldt-nat-pre chain",
+                    error_prefix="Flush sandy-nat-pre chain",
                 )
                 self._run_iptables(
                     "-Z",
-                    "cldt-nat-pre",
+                    "sandy-nat-pre",
                     table="nat",
-                    error_prefix="Zero cldt-nat-pre chain",
+                    error_prefix="Zero sandy-nat-pre chain",
                 )
             else:
                 # Create new chain
                 self._run_iptables(
                     "-N",
-                    "cldt-nat-pre",
+                    "sandy-nat-pre",
                     table="nat",
-                    error_prefix="Create cldt-nat-pre chain",
+                    error_prefix="Create sandy-nat-pre chain",
                 )
 
                 # Insert jump rule at top of PREROUTING
@@ -1115,53 +1115,53 @@ class ClaudetteNet:
                     "-I",
                     "PREROUTING",
                     "-j",
-                    "cldt-nat-pre",
+                    "sandy-nat-pre",
                     table="nat",
                     error_prefix="Insert PREROUTING jump rule for NAT",
                 )
 
-            # Handle cldt-rej chain in filter table (for logging and rejecting)
-            if self._iptables_chain_exists("cldt-rej"):
+            # Handle sandy-rej chain in filter table (for logging and rejecting)
+            if self._iptables_chain_exists("sandy-rej"):
                 # Chain exists, flush and zero it
                 self._run_iptables(
-                    "-F", "cldt-rej", error_prefix="Flush cldt-rej chain"
+                    "-F", "sandy-rej", error_prefix="Flush sandy-rej chain"
                 )
-                self._run_iptables("-Z", "cldt-rej", error_prefix="Zero cldt-rej chain")
+                self._run_iptables("-Z", "sandy-rej", error_prefix="Zero sandy-rej chain")
             else:
                 # Create new chain
                 self._run_iptables(
-                    "-N", "cldt-rej", error_prefix="Create cldt-rej chain"
+                    "-N", "sandy-rej", error_prefix="Create sandy-rej chain"
                 )
 
-            # Add LOG and REJECT rules to cldt-rej chain
+            # Add LOG and REJECT rules to sandy-rej chain
             self._run_iptables(
                 "-A",
-                "cldt-rej",
+                "sandy-rej",
                 "-j",
                 "LOG",
                 "--log-prefix",
                 "[CLDT-BLOCK] ",
-                error_prefix="Add LOG rule to cldt-rej",
+                error_prefix="Add LOG rule to sandy-rej",
             )
             self._run_iptables(
                 "-A",
-                "cldt-rej",
+                "sandy-rej",
                 "-j",
                 "REJECT",
-                error_prefix="Add REJECT rule to cldt-rej",
+                error_prefix="Add REJECT rule to sandy-rej",
             )
 
-            # Handle cldt-fwd chain in filter table
-            if self._iptables_chain_exists("cldt-fwd"):
+            # Handle sandy-fwd chain in filter table
+            if self._iptables_chain_exists("sandy-fwd"):
                 # Chain exists, flush and zero it
                 self._run_iptables(
-                    "-F", "cldt-fwd", error_prefix="Flush cldt-fwd chain"
+                    "-F", "sandy-fwd", error_prefix="Flush sandy-fwd chain"
                 )
-                self._run_iptables("-Z", "cldt-fwd", error_prefix="Zero cldt-fwd chain")
+                self._run_iptables("-Z", "sandy-fwd", error_prefix="Zero sandy-fwd chain")
             else:
                 # Create new chain
                 self._run_iptables(
-                    "-N", "cldt-fwd", error_prefix="Create cldt-fwd chain"
+                    "-N", "sandy-fwd", error_prefix="Create sandy-fwd chain"
                 )
 
                 # Insert jump rule at top of FORWARD
@@ -1173,21 +1173,21 @@ class ClaudetteNet:
                     "-s",
                     network_cidr,
                     "-j",
-                    "cldt-fwd",
+                    "sandy-fwd",
                     error_prefix="Insert FORWARD jump rule",
                 )
 
-            # Handle cldt-out chain in filter table (for host->container traffic control)
-            if self._iptables_chain_exists("cldt-out"):
+            # Handle sandy-out chain in filter table (for host->container traffic control)
+            if self._iptables_chain_exists("sandy-out"):
                 # Chain exists, flush and zero it
                 self._run_iptables(
-                    "-F", "cldt-out", error_prefix="Flush cldt-out chain"
+                    "-F", "sandy-out", error_prefix="Flush sandy-out chain"
                 )
-                self._run_iptables("-Z", "cldt-out", error_prefix="Zero cldt-out chain")
+                self._run_iptables("-Z", "sandy-out", error_prefix="Zero sandy-out chain")
             else:
                 # Create new chain
                 self._run_iptables(
-                    "-N", "cldt-out", error_prefix="Create cldt-out chain"
+                    "-N", "sandy-out", error_prefix="Create sandy-out chain"
                 )
 
                 # Insert jump rule to OUTPUT
@@ -1202,7 +1202,7 @@ class ClaudetteNet:
                     "-d",
                     network_cidr,
                     "-j",
-                    "cldt-out",
+                    "sandy-out",
                     error_prefix="Append OUTPUT jump rule (bridge)",
                 )
 
@@ -1217,26 +1217,26 @@ class ClaudetteNet:
     # - allow everything leaving the bridge
     #
     # This provides reasonable host and local network protection, but doesn't
-    # limit what claude can talk to. Eventually add some sort of configuration
+    # limit what agents can talk to. Eventually add some sort of configuration
     # for this (perhaps use systemd-nspawn's IPAllowList and IPDenyList,
     # perhaps not). This might look like:
     #
-    # 1. creating a per-container chain named cldt-hostN (where 'N' is the
+    # 1. creating a per-container chain named sandy-hostN (where 'N' is the
     #    last octet of the ip address
     # 2. adding per-container rules (eg, -j REJECT rule at the end with
     #    whatever ACCEPT rules are desired)
-    # 3. managing cldt-fwd to '-I cldt-fwd -s 10.x.y.N -j cldt-hostN' when the
+    # 3. managing sandy-fwd to '-I sandy-fwd -s 10.x.y.N -j sandy-hostN' when the
     #    container is brought up, remove it when removed, etc
     def _setup_ipv4_firewall_ipt(self, network_cidr: str) -> bool:
         """Configure NAT and forwarding rules"""
         try:
             # Add MASQUERADE rule
-            # Note: The original requirement had "-o cldtbr0" but for NAT we typically
+            # Note: The original requirement had "-o sandybr0" but for NAT we typically
             # want to masquerade on the outbound interface (not the bridge).
-            # Using ! -o cldtbr0 to masquerade on all interfaces except the bridge
+            # Using ! -o sandybr0 to masquerade on all interfaces except the bridge
             self._run_iptables(
                 "-A",
-                "cldt-nat-post",
+                "sandy-nat-post",
                 "-s",
                 network_cidr,
                 "!",
@@ -1254,17 +1254,17 @@ class ClaudetteNet:
             # Block access to private IP ranges (insert at beginning of chain)
             rule_number = 1
             for net in self.PRIVATE_NETWORKS:
-                # Jump to cldt-rej chain for logging and rejecting
+                # Jump to sandy-rej chain for logging and rejecting
                 self._run_iptables(
                     "-I",
-                    "cldt-fwd",
+                    "sandy-fwd",
                     str(rule_number),
                     "-i",
                     self.bridge_name,
                     "-d",
                     net,
                     "-j",
-                    "cldt-rej",
+                    "sandy-rej",
                     error_prefix=f"Block access to {net}",
                 )
                 rule_number += 1
@@ -1272,7 +1272,7 @@ class ClaudetteNet:
             # Add FORWARD rules for established connections
             self._run_iptables(
                 "-A",
-                "cldt-fwd",
+                "sandy-fwd",
                 "-m",
                 "conntrack",
                 "--ctstate",
@@ -1287,7 +1287,7 @@ class ClaudetteNet:
             # Add FORWARD rule for new connections from bridge (to public IPs only)
             self._run_iptables(
                 "-A",
-                "cldt-fwd",
+                "sandy-fwd",
                 "-i",
                 self.bridge_name,
                 "-s",
@@ -1301,45 +1301,45 @@ class ClaudetteNet:
             # Allow all ICMP out for ping, errors, REJECT responses, etc
             self._run_iptables(
                 "-A",
-                "cldt-out",
+                "sandy-out",
                 "-p",
                 "icmp",
                 "-j",
                 "ACCEPT",
-                error_prefix="Allow ICMP echo-request in cldt-out",
+                error_prefix="Allow ICMP echo-request in sandy-out",
             )
 
             # Allow established/related connections
             self._run_iptables(
                 "-A",
-                "cldt-out",
+                "sandy-out",
                 "-m",
                 "conntrack",
                 "--ctstate",
                 "RELATED,ESTABLISHED",
                 "-j",
                 "ACCEPT",
-                error_prefix="Add conntrack OUTPUT rule to cldt-out",
+                error_prefix="Add conntrack OUTPUT rule to sandy-out",
             )
 
             # Log blocked host->container traffic
             self._run_iptables(
                 "-A",
-                "cldt-out",
+                "sandy-out",
                 "-j",
                 "LOG",
                 "--log-prefix",
                 "[CLDT-OUT-BLOCK] ",
-                error_prefix="Add LOG rule to cldt-out",
+                error_prefix="Add LOG rule to sandy-out",
             )
 
             # Reject all other host->container traffic
             self._run_iptables(
                 "-A",
-                "cldt-out",
+                "sandy-out",
                 "-j",
                 "REJECT",
-                error_prefix="Add REJECT rule to cldt-out",
+                error_prefix="Add REJECT rule to sandy-out",
             )
 
             return True
@@ -1354,52 +1354,52 @@ class ClaudetteNet:
             return True  # Not an error, just skip IPv6 setup
 
         try:
-            # Handle cldt-rej6 chain for IPv6 in filter table (for logging and rejecting)
-            if self._ip6tables_chain_exists("cldt-rej6"):
+            # Handle sandy-rej6 chain for IPv6 in filter table (for logging and rejecting)
+            if self._ip6tables_chain_exists("sandy-rej6"):
                 # Chain exists, flush and zero it
                 self._run_ip6tables(
-                    "-F", "cldt-rej6", error_prefix="Flush cldt-rej6 chain"
+                    "-F", "sandy-rej6", error_prefix="Flush sandy-rej6 chain"
                 )
                 self._run_ip6tables(
-                    "-Z", "cldt-rej6", error_prefix="Zero cldt-rej6 chain"
+                    "-Z", "sandy-rej6", error_prefix="Zero sandy-rej6 chain"
                 )
             else:
                 # Create new chain
                 self._run_ip6tables(
-                    "-N", "cldt-rej6", error_prefix="Create cldt-rej6 chain"
+                    "-N", "sandy-rej6", error_prefix="Create sandy-rej6 chain"
                 )
 
-                # Add LOG and REJECT rules to cldt-rej6 chain
+                # Add LOG and REJECT rules to sandy-rej6 chain
                 self._run_ip6tables(
                     "-A",
-                    "cldt-rej6",
+                    "sandy-rej6",
                     "-j",
                     "LOG",
                     "--log-prefix",
                     "[CLDT-BLOCK] ",
-                    error_prefix="Add LOG rule to cldt-rej6",
+                    error_prefix="Add LOG rule to sandy-rej6",
                 )
                 self._run_ip6tables(
                     "-A",
-                    "cldt-rej6",
+                    "sandy-rej6",
                     "-j",
                     "REJECT",
-                    error_prefix="Add REJECT rule to cldt-rej6",
+                    error_prefix="Add REJECT rule to sandy-rej6",
                 )
 
-            # Handle cldt-fwd6 chain for IPv6 in filter table
-            if self._ip6tables_chain_exists("cldt-fwd6"):
+            # Handle sandy-fwd6 chain for IPv6 in filter table
+            if self._ip6tables_chain_exists("sandy-fwd6"):
                 # Chain exists, flush and zero it
                 self._run_ip6tables(
-                    "-F", "cldt-fwd6", error_prefix="Flush cldt-fwd6 chain"
+                    "-F", "sandy-fwd6", error_prefix="Flush sandy-fwd6 chain"
                 )
                 self._run_ip6tables(
-                    "-Z", "cldt-fwd6", error_prefix="Zero cldt-fwd6 chain"
+                    "-Z", "sandy-fwd6", error_prefix="Zero sandy-fwd6 chain"
                 )
             else:
                 # Create new chain and insert jump rule
                 self._run_ip6tables(
-                    "-N", "cldt-fwd6", error_prefix="Create cldt-fwd6 chain"
+                    "-N", "sandy-fwd6", error_prefix="Create sandy-fwd6 chain"
                 )
                 # Insert jump rule at top of FORWARD
                 self._run_ip6tables(
@@ -1408,24 +1408,24 @@ class ClaudetteNet:
                     "-i",
                     self.bridge_name,
                     "-j",
-                    "cldt-fwd6",
+                    "sandy-fwd6",
                     error_prefix="Insert IPv6 FORWARD jump rule",
                 )
 
             # Block access to IPv6 private ranges (insert at beginning of chain)
             rule_number = 1
             for net in self.IPV6_PRIVATE_NETWORKS:
-                # Jump to cldt-rej6 chain for logging and rejecting
+                # Jump to sandy-rej6 chain for logging and rejecting
                 self._run_ip6tables(
                     "-I",
-                    "cldt-fwd6",
+                    "sandy-fwd6",
                     str(rule_number),
                     "-i",
                     self.bridge_name,
                     "-d",
                     net,
                     "-j",
-                    "cldt-rej6",
+                    "sandy-rej6",
                     error_prefix=f"Block access to IPv6 {net}",
                 )
                 rule_number += 1
@@ -1433,11 +1433,11 @@ class ClaudetteNet:
             # Add rule to reject all remaining IPv6 traffic from bridge (container isolation)
             self._run_ip6tables(
                 "-A",
-                "cldt-fwd6",
+                "sandy-fwd6",
                 "-i",
                 self.bridge_name,
                 "-j",
-                "cldt-rej6",
+                "sandy-rej6",
                 error_prefix="Add IPv6 bridge REJECT rule",
             )
 
@@ -1470,7 +1470,7 @@ class ClaudetteNet:
                 "flush",
                 "chain",
                 "ip",
-                "claudette",
+                "sandy",
                 "postrouting",
                 error_prefix="Flush postrouting chain",
             )
@@ -1478,7 +1478,7 @@ class ClaudetteNet:
                 "flush",
                 "chain",
                 "ip",
-                "claudette",
+                "sandy",
                 "forward",
                 error_prefix="Flush forward chain",
             )
@@ -1488,7 +1488,7 @@ class ClaudetteNet:
                 "add",
                 "rule",
                 "ip",
-                "claudette",
+                "sandy",
                 "postrouting",
                 "ip",
                 "saddr",
@@ -1511,7 +1511,7 @@ class ClaudetteNet:
                     "add",
                     "rule",
                     "ip",
-                    "claudette",
+                    "sandy",
                     "forward",
                     "iifname",
                     f'"{self.bridge_name}"',
@@ -1528,7 +1528,7 @@ class ClaudetteNet:
                     "add",
                     "rule",
                     "ip",
-                    "claudette",
+                    "sandy",
                     "forward",
                     "iifname",
                     f'"{self.bridge_name}"',
@@ -1544,7 +1544,7 @@ class ClaudetteNet:
                 "add",
                 "rule",
                 "ip",
-                "claudette",
+                "sandy",
                 "forward",
                 "ct",
                 "state",
@@ -1560,7 +1560,7 @@ class ClaudetteNet:
                 "add",
                 "rule",
                 "ip",
-                "claudette",
+                "sandy",
                 "forward",
                 "iifname",
                 f'"{self.bridge_name}"',
@@ -1604,7 +1604,7 @@ class ClaudetteNet:
                 "flush",
                 "chain",
                 "ip",
-                "claudette",
+                "sandy",
                 "output_filter",
                 error_prefix="Flush output_filter chain",
             )
@@ -1617,7 +1617,7 @@ class ClaudetteNet:
                 "add",
                 "rule",
                 "ip",
-                "claudette",
+                "sandy",
                 "output_filter",
                 "oifname",
                 f'"{self.bridge_name}"',
@@ -1639,7 +1639,7 @@ class ClaudetteNet:
                 "add",
                 "rule",
                 "ip",
-                "claudette",
+                "sandy",
                 "output_filter",
                 "oifname",
                 f'"{self.bridge_name}"',
@@ -1661,7 +1661,7 @@ class ClaudetteNet:
                 "add",
                 "rule",
                 "ip",
-                "claudette",
+                "sandy",
                 "output_filter",
                 "oifname",
                 f'"{self.bridge_name}"',
@@ -1682,7 +1682,7 @@ class ClaudetteNet:
                 "add",
                 "rule",
                 "ip",
-                "claudette",
+                "sandy",
                 "output_filter",
                 "oifname",
                 f'"{self.bridge_name}"',
@@ -1713,7 +1713,7 @@ class ClaudetteNet:
                 "flush",
                 "chain",
                 "ip6",
-                "claudette",
+                "sandy",
                 "forward",
                 error_prefix="Flush IPv6 forward chain",
             )
@@ -1725,7 +1725,7 @@ class ClaudetteNet:
                     "add",
                     "rule",
                     "ip6",
-                    "claudette",
+                    "sandy",
                     "forward",
                     "iifname",
                     f'"{self.bridge_name}"',
@@ -1742,7 +1742,7 @@ class ClaudetteNet:
                     "add",
                     "rule",
                     "ip6",
-                    "claudette",
+                    "sandy",
                     "forward",
                     "iifname",
                     f'"{self.bridge_name}"',
@@ -1758,7 +1758,7 @@ class ClaudetteNet:
                 "add",
                 "rule",
                 "ip6",
-                "claudette",
+                "sandy",
                 "forward",
                 "iifname",
                 f'"{self.bridge_name}"',
@@ -1771,7 +1771,7 @@ class ClaudetteNet:
                 "add",
                 "rule",
                 "ip6",
-                "claudette",
+                "sandy",
                 "forward",
                 "iifname",
                 f'"{self.bridge_name}"',
@@ -1853,7 +1853,7 @@ class ClaudetteNet:
         if self.firewall_backend == "iptables":
             print("I: Removing iptables rules...")
             # Remove chains from filter and nat tables
-            if self._iptables_chain_exists("cldt-fwd"):
+            if self._iptables_chain_exists("sandy-fwd"):
                 # Remove jump rule from FORWARD chain
                 _run_secure_subprocess(
                     [
@@ -1865,23 +1865,23 @@ class ClaudetteNet:
                         "-s",
                         self.network_cidr,
                         "-j",
-                        "cldt-fwd",
+                        "sandy-fwd",
                     ],
                     capture_output=True,
                     check=False,
                 )
                 # Flush and delete the chain
-                self._run_iptables("-F", "cldt-fwd", error_prefix="Flush cldt-fwd")
-                self._run_iptables("-X", "cldt-fwd", error_prefix="Delete cldt-fwd")
+                self._run_iptables("-F", "sandy-fwd", error_prefix="Flush sandy-fwd")
+                self._run_iptables("-X", "sandy-fwd", error_prefix="Delete sandy-fwd")
 
-            # Remove cldt-rej chain if it exists
-            if self._iptables_chain_exists("cldt-rej"):
+            # Remove sandy-rej chain if it exists
+            if self._iptables_chain_exists("sandy-rej"):
                 # Flush and delete the chain
-                self._run_iptables("-F", "cldt-rej", error_prefix="Flush cldt-rej")
-                self._run_iptables("-X", "cldt-rej", error_prefix="Delete cldt-rej")
+                self._run_iptables("-F", "sandy-rej", error_prefix="Flush sandy-rej")
+                self._run_iptables("-X", "sandy-rej", error_prefix="Delete sandy-rej")
 
-            # Remove cldt-out chain if it exists
-            if self._iptables_chain_exists("cldt-out"):
+            # Remove sandy-out chain if it exists
+            if self._iptables_chain_exists("sandy-out"):
                 # Remove jump rules from OUTPUT chain
                 if self.gateway:
                     # Remove bridge interface rule
@@ -1897,16 +1897,16 @@ class ClaudetteNet:
                             "-d",
                             self.network_cidr,
                             "-j",
-                            "cldt-out",
+                            "sandy-out",
                         ],
                         capture_output=True,
                         check=False,
                     )
                 # Flush and delete the chain
-                self._run_iptables("-F", "cldt-out", error_prefix="Flush cldt-out")
-                self._run_iptables("-X", "cldt-out", error_prefix="Delete cldt-out")
+                self._run_iptables("-F", "sandy-out", error_prefix="Flush sandy-out")
+                self._run_iptables("-X", "sandy-out", error_prefix="Delete sandy-out")
 
-            if self._iptables_chain_exists("cldt-nat-post", "nat"):
+            if self._iptables_chain_exists("sandy-nat-post", "nat"):
                 # Remove jump rule from POSTROUTING chain
                 if self.network_cidr:
                     _run_secure_subprocess(
@@ -1919,7 +1919,7 @@ class ClaudetteNet:
                             "-s",
                             self.network_cidr,
                             "-j",
-                            "cldt-nat-post",
+                            "sandy-nat-post",
                         ],
                         capture_output=True,
                         check=False,
@@ -1937,7 +1937,7 @@ class ClaudetteNet:
                             "-s",
                             "127.0.0.1/8",
                             "-j",
-                            "cldt-nat-post",
+                            "sandy-nat-post",
                         ],
                         capture_output=True,
                         check=False,
@@ -1946,19 +1946,19 @@ class ClaudetteNet:
                 # Flush and delete the chain
                 self._run_iptables(
                     "-F",
-                    "cldt-nat-post",
+                    "sandy-nat-post",
                     table="nat",
-                    error_prefix="Flush cldt-nat-post",
+                    error_prefix="Flush sandy-nat-post",
                 )
                 self._run_iptables(
                     "-X",
-                    "cldt-nat-post",
+                    "sandy-nat-post",
                     table="nat",
-                    error_prefix="Delete cldt-nat-post",
+                    error_prefix="Delete sandy-nat-post",
                 )
 
-            # Remove cldt-nat-out chain if it exists
-            if self._iptables_chain_exists("cldt-nat-out", "nat"):
+            # Remove sandy-nat-out chain if it exists
+            if self._iptables_chain_exists("sandy-nat-out", "nat"):
                 # Remove jump rule from OUTPUT chain
                 _run_secure_subprocess(
                     [
@@ -1968,24 +1968,24 @@ class ClaudetteNet:
                         "-D",
                         "OUTPUT",
                         "-j",
-                        "cldt-nat-out",
+                        "sandy-nat-out",
                     ],
                     capture_output=True,
                     check=False,
                 )
                 # Flush and delete the chain
                 self._run_iptables(
-                    "-F", "cldt-nat-out", table="nat", error_prefix="Flush cldt-nat-out"
+                    "-F", "sandy-nat-out", table="nat", error_prefix="Flush sandy-nat-out"
                 )
                 self._run_iptables(
                     "-X",
-                    "cldt-nat-out",
+                    "sandy-nat-out",
                     table="nat",
-                    error_prefix="Delete cldt-nat-out",
+                    error_prefix="Delete sandy-nat-out",
                 )
 
-            # Remove cldt-nat-pre chain if it exists
-            if self._iptables_chain_exists("cldt-nat-pre", "nat"):
+            # Remove sandy-nat-pre chain if it exists
+            if self._iptables_chain_exists("sandy-nat-pre", "nat"):
                 # Remove jump rule from PREROUTING chain
                 _run_secure_subprocess(
                     [
@@ -1995,25 +1995,25 @@ class ClaudetteNet:
                         "-D",
                         "PREROUTING",
                         "-j",
-                        "cldt-nat-pre",
+                        "sandy-nat-pre",
                     ],
                     capture_output=True,
                     check=False,
                 )
                 # Flush and delete the chain
                 self._run_iptables(
-                    "-F", "cldt-nat-pre", table="nat", error_prefix="Flush cldt-nat-pre"
+                    "-F", "sandy-nat-pre", table="nat", error_prefix="Flush sandy-nat-pre"
                 )
                 self._run_iptables(
                     "-X",
-                    "cldt-nat-pre",
+                    "sandy-nat-pre",
                     table="nat",
-                    error_prefix="Delete cldt-nat-pre",
+                    error_prefix="Delete sandy-nat-pre",
                 )
 
             # Remove IPv6 rules if they exist
             if self.has_ip6tables:
-                if self._ip6tables_chain_exists("cldt-fwd6"):
+                if self._ip6tables_chain_exists("sandy-fwd6"):
                     # Remove jump rule from FORWARD chain
                     _run_secure_subprocess(
                         [
@@ -2023,46 +2023,46 @@ class ClaudetteNet:
                             "-i",
                             self.bridge_name,
                             "-j",
-                            "cldt-fwd6",
+                            "sandy-fwd6",
                         ],
                         capture_output=True,
                         check=False,
                     )
                     # Flush and delete the chain
                     self._run_ip6tables(
-                        "-F", "cldt-fwd6", error_prefix="Flush cldt-fwd6"
+                        "-F", "sandy-fwd6", error_prefix="Flush sandy-fwd6"
                     )
                     self._run_ip6tables(
-                        "-X", "cldt-fwd6", error_prefix="Delete cldt-fwd6"
+                        "-X", "sandy-fwd6", error_prefix="Delete sandy-fwd6"
                     )
 
-                # Remove cldt-rej6 chain if it exists
-                if self._ip6tables_chain_exists("cldt-rej6"):
+                # Remove sandy-rej6 chain if it exists
+                if self._ip6tables_chain_exists("sandy-rej6"):
                     # Flush and delete the chain
                     self._run_ip6tables(
-                        "-F", "cldt-rej6", error_prefix="Flush cldt-rej6"
+                        "-F", "sandy-rej6", error_prefix="Flush sandy-rej6"
                     )
                     self._run_ip6tables(
-                        "-X", "cldt-rej6", error_prefix="Delete cldt-rej6"
+                        "-X", "sandy-rej6", error_prefix="Delete sandy-rej6"
                     )
 
         elif self.firewall_backend == "nftables":
             print("I: Removing nftables rules...")
             # Remove nftables tables
-            if self._nft_table_exists("ip", "claudette"):
+            if self._nft_table_exists("ip", "sandy"):
                 self._run_nft(
                     "delete",
                     "table",
                     "ip",
-                    "claudette",
+                    "sandy",
                     error_prefix="Delete IPv4 table",
                 )
-            if self._nft_table_exists("ip6", "claudette"):
+            if self._nft_table_exists("ip6", "sandy"):
                 self._run_nft(
                     "delete",
                     "table",
                     "ip6",
-                    "claudette",
+                    "sandy",
                     error_prefix="Delete IPv6 table",
                 )
 
@@ -2087,7 +2087,7 @@ class ClaudetteNet:
             self.gateway = None
 
 
-class Claudette:
+class Sandy:
     def __init__(self):
         self.container = "ai-dev"
         self.workspace = "workspace"
@@ -2164,23 +2164,23 @@ class Claudette:
             sys.exit(1)
 
     def _check_required_scripts(self):
-        """Check that required cn-* scripts are available and set paths"""
-        # Check cn-debootstrap.sh
-        self.cn_debootstrap = os.path.join(self.script_dir, "cn-debootstrap.sh")
+        """Check that required *.sh scripts are available and set paths"""
+        # Check debootstrap.sh
+        self.cn_debootstrap = os.path.join(self.script_dir, "debootstrap.sh")
         if not os.path.exists(self.cn_debootstrap):
-            print("E: Missing required script: cn-debootstrap.sh")
+            print("E: Missing required script: debootstrap.sh")
             sys.exit(1)
 
-        # Check cn-oci.sh
-        self.cn_oci = os.path.join(self.script_dir, "cn-oci.sh")
+        # Check oci.sh
+        self.cn_oci = os.path.join(self.script_dir, "oci.sh")
         if not os.path.exists(self.cn_oci):
-            print("E: Missing required script: cn-oci.sh")
+            print("E: Missing required script: oci.sh")
             sys.exit(1)
 
-        # Check cn-setup-container.sh
-        self.cn_setup_container = os.path.join(self.script_dir, "cn-setup-container.sh")
+        # Check setup-container.sh
+        self.cn_setup_container = os.path.join(self.script_dir, "setup-container.sh")
         if not os.path.exists(self.cn_setup_container):
-            print("E: Missing required script: cn-setup-container.sh")
+            print("E: Missing required script: setup-container.sh")
             sys.exit(1)
 
     def _set_bootstrap_method(self):
@@ -2252,7 +2252,7 @@ class Claudette:
 
         # Get the actual UID for self.user from container's /etc/passwd
         container_uid = None
-        mdir = os.path.join(SYSTEMD_MACHINES, f"claudette.{container_name}")
+        mdir = os.path.join(SYSTEMD_MACHINES, f"sandy.{container_name}")
         passwd_path = os.path.join(mdir, "etc", "passwd")
 
         if not os.path.exists(passwd_path):
@@ -2387,7 +2387,7 @@ class Claudette:
         )
 
     def _get_machine_dir(self):
-        return os.path.join(SYSTEMD_MACHINES, f"claudette.{self.container}")
+        return os.path.join(SYSTEMD_MACHINES, f"sandy.{self.container}")
 
     def _remove_machine_dir(self, mdir, prompt=True):
         """Remove a machine directory with safety checks"""
@@ -2422,19 +2422,19 @@ class Claudette:
         except subprocess.CalledProcessError:
             return None
 
-    def _get_running_claudette_containers(self):
-        """Get list of all running claudette containers"""
+    def _get_running_sandy_containers(self):
+        """Get list of all running sandy containers"""
         running = []
 
-        # Check all claudette.* directories
+        # Check all sandy.* directories
         if os.path.exists(SYSTEMD_MACHINES):
-            for mdir in glob.glob(f"{SYSTEMD_MACHINES}/claudette.*"):
+            for mdir in glob.glob(f"{SYSTEMD_MACHINES}/sandy.*"):
                 # Skip cache directory
                 if mdir.endswith(".__cache"):
                     continue
 
                 # Extract container name from directory
-                container_name = os.path.basename(mdir).replace("claudette.", "")
+                container_name = os.path.basename(mdir).replace("sandy.", "")
 
                 # Check if this container is running
                 if self._is_container_running(container_name):
@@ -2444,7 +2444,7 @@ class Claudette:
 
     def _get_cache_dir(self):
         """Get the cache directory path"""
-        cache_dir = os.path.join(SYSTEMD_MACHINES, "claudette.__cache")
+        cache_dir = os.path.join(SYSTEMD_MACHINES, "sandy.__cache")
         if os.path.exists(cache_dir):
             _verify_safe_dir(cache_dir)
 
@@ -2667,7 +2667,7 @@ class Claudette:
         """Ensure the network helper is available and configured."""
         if self.network and self.network.configured:
             return True
-        self.network = ClaudetteNet()
+        self.network = SandyNet()
         return bool(self.network and self.network.configured)
 
     def _update_port_mapping_state(self, container_name: str, container_ip: str):
@@ -2803,7 +2803,7 @@ class Claudette:
         cache_path = self._get_cache_path()
 
         # Create manifest with all cached parameters
-        manifest_path = os.path.join(srcdir, ".claudette.manifest")
+        manifest_path = os.path.join(srcdir, ".sandy.manifest")
         assert not os.path.exists(manifest_path)  # should never happen
         manifest_content = "\n".join(self._create_manifest_content()) + "\n"
         print(f"I: Creating cache '{cache_path}' with manifest:\n{manifest_content}")
@@ -2955,8 +2955,8 @@ class Claudette:
             # run without --ephemeral, --private-users and restrictive
             # networking (need to do this at least once without --private-users
             # to setup the container properly). Also run with:
-            # --directory=/var/lib/machines/claudette.foo
-            # --machine=foo  # this makes it show up as 'foo', not 'claudette.foo'
+            # --directory=/var/lib/machines/sandy.foo
+            # --machine=foo  # this makes it show up as 'foo', not 'sandy.foo'
             # --timezone=off # needed if self.cn_setup_container upgrades
             #                # tzdata since nspawn otherwise bind mounts this
             #                # file into the container. Omitting this allows
@@ -3135,7 +3135,7 @@ class Claudette:
             print("W: No firewall backend available, port forwarding disabled")
 
     def _setup_port_forwarding_ipt(self, container_ip: str) -> bool:
-        """Setup port forwarding rules for iptables - called from Claudette"""
+        """Setup port forwarding rules for iptables - called from Sandy"""
         if not self.port_mappings:
             return True
 
@@ -3161,7 +3161,7 @@ class Claudette:
                 # DNAT in OUTPUT chain (for host-generated traffic to 127.0.0.1)
                 self.network._run_iptables(
                     "-A",
-                    "cldt-nat-out",
+                    "sandy-nat-out",
                     "-p",
                     proto,
                     "-d",
@@ -3179,7 +3179,7 @@ class Claudette:
                 # DNAT in PREROUTING chain (for forwarded traffic)
                 self.network._run_iptables(
                     "-A",
-                    "cldt-nat-pre",
+                    "sandy-nat-pre",
                     "-p",
                     proto,
                     "-d",
@@ -3198,7 +3198,7 @@ class Claudette:
                 # This is necessary so the container can route the response back
                 self.network._run_iptables(
                     "-A",
-                    "cldt-nat-post",
+                    "sandy-nat-post",
                     "-p",
                     proto,
                     "-s",
@@ -3218,7 +3218,7 @@ class Claudette:
                 # FORWARD acceptance rule (insert at beginning for priority)
                 self.network._run_iptables(
                     "-I",
-                    "cldt-fwd",
+                    "sandy-fwd",
                     "1",
                     "-p",
                     proto,
@@ -3238,7 +3238,7 @@ class Claudette:
                 # Allow direct access to container IP from host (insert at beginning for priority)
                 self.network._run_iptables(
                     "-I",
-                    "cldt-out",
+                    "sandy-out",
                     "1",
                     "-o",
                     self.network.bridge_name,
@@ -3256,7 +3256,7 @@ class Claudette:
                     "NEW",
                     "-j",
                     "ACCEPT",
-                    error_prefix=f"Add cldt-out rule for direct access to {proto}:{container_port}",
+                    error_prefix=f"Add sandy-out rule for direct access to {proto}:{container_port}",
                 )
 
                 print(
@@ -3274,7 +3274,7 @@ class Claudette:
         return [
             "rule",
             "ip",
-            "claudette",
+            "sandy",
             chain,
             proto,
             "dport",
@@ -3293,7 +3293,7 @@ class Claudette:
         return [
             "rule",
             "ip",
-            "claudette",
+            "sandy",
             "postrouting",
             proto,
             "dport",
@@ -3315,7 +3315,7 @@ class Claudette:
         return [
             "rule",
             "ip",
-            "claudette",
+            "sandy",
             "forward",
             proto,
             "dport",
@@ -3340,7 +3340,7 @@ class Claudette:
         return [
             "rule",
             "ip",
-            "claudette",
+            "sandy",
             "output_filter",
             "oifname",
             f'"{bridge_name}"',
@@ -3360,7 +3360,7 @@ class Claudette:
         ]
 
     def _setup_port_forwarding_nft(self, container_ip: str) -> bool:
-        """Setup port forwarding rules for nftables - called from Claudette"""
+        """Setup port forwarding rules for nftables - called from Sandy"""
         if not self.port_mappings:
             return True
 
@@ -3486,7 +3486,7 @@ class Claudette:
                 # Remove DNAT in OUTPUT chain (for host-generated traffic to 127.0.0.1)
                 self.network._run_iptables(
                     "-D",
-                    "cldt-nat-out",
+                    "sandy-nat-out",
                     "-p",
                     proto,
                     "-d",
@@ -3503,7 +3503,7 @@ class Claudette:
                 # Remove DNAT in PREROUTING chain (for forwarded traffic)
                 self.network._run_iptables(
                     "-D",
-                    "cldt-nat-pre",
+                    "sandy-nat-pre",
                     "-p",
                     proto,
                     "-d",
@@ -3520,7 +3520,7 @@ class Claudette:
                 # Remove SNAT in POSTROUTING chain
                 self.network._run_iptables(
                     "-D",
-                    "cldt-nat-post",
+                    "sandy-nat-post",
                     "-p",
                     proto,
                     "-s",
@@ -3539,7 +3539,7 @@ class Claudette:
                 # Remove FORWARD acceptance rule
                 self.network._run_iptables(
                     "-D",
-                    "cldt-fwd",
+                    "sandy-fwd",
                     "-p",
                     proto,
                     "-d",
@@ -3557,7 +3557,7 @@ class Claudette:
                 # Remove direct access rule from host
                 self.network._run_iptables(
                     "-D",
-                    "cldt-out",
+                    "sandy-out",
                     "-o",
                     self.network.bridge_name,
                     "-p",
@@ -3574,7 +3574,7 @@ class Claudette:
                     "NEW",
                     "-j",
                     "ACCEPT",
-                    error_prefix=f"Remove cldt-out rule for direct access to {proto}:{container_port}",
+                    error_prefix=f"Remove sandy-out rule for direct access to {proto}:{container_port}",
                 )
                 print(
                     f"I: Removed port forwarding: 127.0.0.1:{host_port} → {container_ip}:{container_port} ({proto})"
@@ -3747,7 +3747,7 @@ class Claudette:
         if args.network == "lenient":
             # Setup networking (bridge and NAT) if not already done
             if self.network is None:
-                self.network = ClaudetteNet()
+                self.network = SandyNet()
         elif args.network == "host":
             # Host networking - don't initialize network bridge
             if self.network is None:
@@ -3763,8 +3763,8 @@ class Claudette:
             print(f"E: '{mdir}' does not exist. Use --build")
             sys.exit(1)
 
-        # --directory=/var/lib/machines/claudette.foo
-        # --machine=foo           # show up as 'foo', not 'claudette.foo'
+        # --directory=/var/lib/machines/sandy.foo
+        # --machine=foo           # show up as 'foo', not 'sandy.foo'
         # --tmpfs=/tmp:mode=1777  # memory tmpfs
         # --private-users         # user namespace - pick for >=250, fixed for <250
         # --as-pid2               # emulate docker app container (no init)
@@ -3783,7 +3783,7 @@ class Claudette:
         # Use bridge network if configured and not in host mode
         if args.network != "host" and self.network and self.network.configured:
             # --network-bridge implies --network-veth (which implies
-            # --private-network). We currently setup a single bridge (cldtbr0)
+            # --private-network). We currently setup a single bridge (sandybr0)
             # and configure it with an unused IP address in a /24 network. The
             # container's network interface shows up as 'host0' while the
             # host's side of the veth shows up as vb-<container>@ifN. Firewall
@@ -3947,16 +3947,16 @@ class Claudette:
 
             # Setup networking if not already done (needed for cleanup)
             if self.network is None:
-                self.network = ClaudetteNet()
+                self.network = SandyNet()
 
-            # Check if any claudette containers are running
-            running_containers = self._get_running_claudette_containers()
+            # Check if any sandy containers are running
+            running_containers = self._get_running_sandy_containers()
             if running_containers:
                 container_list = ", ".join(running_containers)
                 print(
                     f"E: Cannot remove network while containers are running: {container_list}"
                 )
-                print("Stop all containers first with 'claudette down'")
+                print("Stop all containers first with 'sandy down'")
                 sys.exit(1)
 
             # Remove network bridge and firewall rules
@@ -3976,7 +3976,7 @@ class Claudette:
 
         if all:
             if os.path.exists(SYSTEMD_MACHINES):
-                for mdir in glob.glob(f"{SYSTEMD_MACHINES}/claudette.*"):
+                for mdir in glob.glob(f"{SYSTEMD_MACHINES}/sandy.*"):
                     # Skip cache directory
                     if mdir != self._get_cache_dir():
                         mdirs_to_remove.append(mdir)
@@ -4112,7 +4112,7 @@ class Claudette:
             return
 
         containers = []
-        for mdir in glob.glob(f"{SYSTEMD_MACHINES}/claudette.*"):
+        for mdir in glob.glob(f"{SYSTEMD_MACHINES}/sandy.*"):
             # Skip cache directory
             if mdir == self._get_cache_dir():
                 continue
@@ -4196,7 +4196,7 @@ def parse_args_custom():
 
     # Now parse the full command
     parser = argparse.ArgumentParser(
-        description="Claudette CLI - Container management for Claude development",
+        description="Sandy CLI - Container management for ai agent development",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -4339,26 +4339,26 @@ def main():
     # Parse arguments with custom handling
     args = parse_args_custom()
 
-    # Create Claudette instance
-    claudette = Claudette()
+    # Create Sandy instance
+    sandy = Sandy()
 
     # Set global options with proper validation
     if args.workspace:
         if not _validate_workspace_path(args.workspace):
             print(f"E: Invalid workspace path '{_sanitize_log_output(args.workspace)}'")
             sys.exit(1)
-        claudette.workspace = args.workspace
+        sandy.workspace = args.workspace
 
     if args.container:
         if not _validate_container_name(args.container):
             print(f"E: Invalid container name '{_sanitize_log_output(args.container)}'")
             sys.exit(1)
-        claudette.container = args.container
+        sandy.container = args.container
     else:
         # Validate default container name too
-        if not _validate_container_name(claudette.container):
+        if not _validate_container_name(sandy.container):
             print(
-                f"E: Invalid default container name '{_sanitize_log_output(claudette.container)}'"
+                f"E: Invalid default container name '{_sanitize_log_output(sandy.container)}'"
             )
             sys.exit(1)
 
@@ -4366,41 +4366,41 @@ def main():
         if not _validate_username(args.user):
             print(f"E: Invalid username '{_sanitize_log_output(args.user)}'")
             sys.exit(1)
-        claudette.user = args.user
-        if claudette.user == "root":
-            claudette.user_home = "/root"
+        sandy.user = args.user
+        if sandy.user == "root":
+            sandy.user_home = "/root"
     else:
         # Validate default username too
-        if not _validate_username(claudette.user):
+        if not _validate_username(sandy.user):
             print(
-                f"E: Invalid default username '{_sanitize_log_output(claudette.user)}'"
+                f"E: Invalid default username '{_sanitize_log_output(sandy.user)}'"
             )
             sys.exit(1)
 
     # Execute command
     if args.command == "up":
-        claudette.run_up(args)
+        sandy.run_up(args)
     elif args.command == "down":
-        claudette.run_down(args)
+        sandy.run_down(args)
     elif args.command == "rm":
-        claudette.run_rm(args, all=args.all, cache=args.cache, network=args.network)
+        sandy.run_rm(args, all=args.all, cache=args.cache, network=args.network)
     elif args.command == "bash":
-        claudette.run_bash(args)
+        sandy.run_bash(args)
     elif args.command == "exec":
-        claudette.run_exec(args)
+        sandy.run_exec(args)
     elif args.command == "status":
-        claudette.run_status()
+        sandy.run_status()
     elif args.command == "logs":
-        claudette.stub_logs(args)
+        sandy.stub_logs(args)
     elif args.command == "auth":
-        claudette.stub_auth(args)
+        sandy.stub_auth(args)
     elif args.command == "usage":
-        claudette.run_usage(args)
+        sandy.run_usage(args)
     elif args.command == "list":
-        claudette.run_list()
+        sandy.run_list()
     else:
         # No command specified, run default (launch Claude Code)
-        claudette.run_claude(not args.safe)
+        sandy.run_claude(not args.safe)
 
 
 if __name__ == "__main__":
