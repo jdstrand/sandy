@@ -4162,7 +4162,7 @@ Examples:
 Environment Variables:
   SANDY_BOOTSTRAP         # Bootstrap method: 'oci' or 'debootstrap'
   SANDY_BOOTSTRAP_BASE    # Base image override (eg 'debian:bookworm' or 'ubuntu:noble')
-  SANDY_SETUP_SCRIPT      # Custom setup script (default: ./scripts/setup-container.sh)
+  SANDY_SETUP_SCRIPT      # Custom setup script (default: ./setup-container.sh)
   SANDY_CONTAINER_CACHE   # Disable container caching: 'n' (enabled by default)
         """,
     )
