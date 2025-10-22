@@ -2185,7 +2185,7 @@ class Sandy:
 
     def _set_bootstrap_method(self):
         """Determine bootstrap method based on environment variable or auto-detection"""
-        method_raw = os.environ.get("CLAUDETTE_NSPAWN_BOOTSTRAP", "")
+        method_raw = os.environ.get("SANDY_BOOTSTRAP", "")
 
         # Validate environment variable
         if method_raw and not _validate_env_var(
@@ -2227,7 +2227,7 @@ class Sandy:
             sys.exit(1)
 
         # Check for base image override with validation
-        base_override = os.environ.get("CLAUDETTE_NSPAWN_BOOTSTRAP_BASE", "")
+        base_override = os.environ.get("SANDY_BOOTSTRAP_BASE", "")
         if base_override:
             if not _validate_image_name(base_override):
                 print(
@@ -2782,7 +2782,7 @@ class Sandy:
 
     def _get_setup_script_path(self):
         """Get path to setup script (custom or default)"""
-        custom_setup = os.environ.get("CLAUDETTE_NSPAWN_SETUP_SCRIPT", "")
+        custom_setup = os.environ.get("SANDY_SETUP_SCRIPT", "")
         if custom_setup and os.path.exists(custom_setup):
             return custom_setup
         else:
@@ -3694,7 +3694,7 @@ class Sandy:
 
         # Check if caching is disabled (enabled by default)
         cache_disabled = os.environ.get(
-            "CLAUDETTE_NSPAWN_CONTAINER_CACHE", ""
+            "SANDY_CONTAINER_CACHE", ""
         ).lower() in [
             "n",
             "no",
@@ -4160,10 +4160,10 @@ Examples:
   %(prog)s bash -c "echo hello"      # Run bash with arguments
 
 Environment Variables:
-  CLAUDETTE_NSPAWN_BOOTSTRAP         # Bootstrap method: 'oci' or 'debootstrap'
-  CLAUDETTE_NSPAWN_BOOTSTRAP_BASE    # Base image override (eg 'debian:bookworm' or 'ubuntu:noble')
-  CLAUDETTE_NSPAWN_SETUP_SCRIPT      # Custom setup script (default: ./scripts/ch-setup-container.sh)
-  CLAUDETTE_NSPAWN_CONTAINER_CACHE   # Disable container caching: 'n' (enabled by default)
+  SANDY_BOOTSTRAP         # Bootstrap method: 'oci' or 'debootstrap'
+  SANDY_BOOTSTRAP_BASE    # Base image override (eg 'debian:bookworm' or 'ubuntu:noble')
+  SANDY_SETUP_SCRIPT      # Custom setup script (default: ./scripts/setup-container.sh)
+  SANDY_CONTAINER_CACHE   # Disable container caching: 'n' (enabled by default)
         """,
     )
 
