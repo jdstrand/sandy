@@ -153,6 +153,7 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/claude ; then
   chown "$AI_USER:$AI_USER" "/home/$AI_USER/.claude.json"
   chmod 600 "/home/$AI_USER/.claude.json"
   echo "I: run with 'claude' (https://www.claude.com/product/claude-code)"
+  echo "I: see usage with 'ccusage'"
 fi
 
 # Install copilot cli

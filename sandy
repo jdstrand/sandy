@@ -4071,40 +4071,6 @@ class Sandy:
             ["machinectl", "status", "--no-pager", "--full", self.container]
         )
 
-    def stub_logs(self, args):
-        """Show container logs"""
-        print("[LOGS] Showing container logs")
-        print(f"  Container: {self.container}")
-        print(f"  Follow: {args.follow}")
-        if args.tail:
-            print(f"  Tail lines: {args.tail}")
-        print("XXX: Not implemented")
-
-    def stub_auth(self, _):
-        """Authenticate with GitHub CLI"""
-        print("[AUTH] Authenticating with GitHub CLI")
-        print(f"  Container: {self.container}")
-        print(f"  User: {self.user}")
-        print("XXX: Not implemented")
-
-    def run_usage(self, args):
-        """Monitor Claude usage"""
-        usage_cmd = [
-            "npx",
-            "ccusage",
-        ]
-        if args.usage_args:
-            # Remove leading '--' if present
-            usage_args = args.usage_args
-            if args.usage_args[0] == "--":
-                usage_args = usage_args[1:]
-
-            if usage_args:
-                usage_cmd += usage_args
-                usage_args = " ".join(usage_cmd)
-        command = " ".join(usage_cmd)
-        self._exec(command)
-
     def run_list(self):
         """List all containers and their status"""
         if not os.path.exists(SYSTEMD_MACHINES):
@@ -4146,16 +4112,6 @@ class Sandy:
         for name, status, path in sorted(containers):
             print(f"{name:<{col_width}} {status:<10} {path}")
 
-    def run_claude(self, skip_permissions=False):
-        """Launch Claude Code (default action)"""
-        cmd = "claude"
-        if skip_permissions:
-            print(
-                "W: running 'claude --dangerously-skip-permissions' (use '--safe' to disable)"
-            )
-            cmd = "claude --dangerously-skip-permissions"
-        self._exec(cmd)
-
 
 def parse_args_custom():
     """Custom argument parser to handle REMAINDER args properly"""
@@ -4168,9 +4124,6 @@ def parse_args_custom():
         "bash",
         "exec",
         "status",
-        "logs",
-        "auth",
-        "usage",
         "list",
     ]
 
@@ -4200,12 +4153,11 @@ def parse_args_custom():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                           # Launch Claude Code
+  %(prog)s                           # Launch shell
   %(prog)s -w myproject              # Launch in workspace subdirectory
   %(prog)s up -d --build             # Build and start detached
   %(prog)s exec -- cargo test        # Run tests in container
   %(prog)s bash -c "echo hello"      # Run bash with arguments
-  %(prog)s logs -f -t 100            # Follow last 100 log lines
 
 Environment Variables:
   CLAUDETTE_NSPAWN_BOOTSTRAP         # Bootstrap method: 'oci' or 'debootstrap'
@@ -4217,9 +4169,6 @@ Environment Variables:
 
     # Add global arguments
     parser.add_argument("-w", "--workspace", help="Workspace subdirectory to use")
-    parser.add_argument(
-        "--safe", action="store_true", help="Run claude with permission checks"
-    )
     parser.add_argument("-c", "--container", help="Container name (default: ai-dev)")
     parser.add_argument(
         "-u", "--user", default="developer", help="User to run as (default: developer)"
@@ -4292,27 +4241,14 @@ Environment Variables:
     # status command
     subparsers.add_parser("status", help="Check container status")
 
-    # logs command
-    logs_parser = subparsers.add_parser("logs", help="Show container logs")
-    logs_parser.add_argument(
-        "-f", "--follow", action="store_true", help="Follow log output"
-    )
-    logs_parser.add_argument("-t", "--tail", type=int, help="Number of lines from end")
-
-    # auth command
-    subparsers.add_parser("auth", help="Authenticate with GitHub CLI")
-
-    # usage command - special handling
-    subparsers.add_parser("usage", help="Monitor Claude usage", add_help=False)
-
     # list command
     subparsers.add_parser("list", help="List all containers and their status")
 
-    # For bash, exec, and usage commands, manually handle the rest
+    # For bash and exec commands, manually handle the rest
     if (
         remaining_args
         and subcommand_idx is not None
-        and remaining_args[0] in ["bash", "exec", "usage"]
+        and remaining_args[0] in ["bash", "exec"]
     ):
         # Parse only up to the command
         args = parser.parse_args(sys.argv[1 : subcommand_idx + 1])
@@ -4326,8 +4262,6 @@ Environment Variables:
             args.bash_args = remainder
         elif remaining_args[0] == "exec":
             args.exec_command = remainder
-        elif remaining_args[0] == "usage":
-            args.usage_args = remainder
     else:
         # Normal parsing for other commands
         args = parser.parse_args()
@@ -4390,17 +4324,11 @@ def main():
         sandy.run_exec(args)
     elif args.command == "status":
         sandy.run_status()
-    elif args.command == "logs":
-        sandy.stub_logs(args)
-    elif args.command == "auth":
-        sandy.stub_auth(args)
-    elif args.command == "usage":
-        sandy.run_usage(args)
     elif args.command == "list":
         sandy.run_list()
     else:
-        # No command specified, run default (launch Claude Code)
-        sandy.run_claude(not args.safe)
+        # No command specified, run default (bash)
+        sandy.run_bash(args)
 
 
 if __name__ == "__main__":
