@@ -1,0 +1,4408 @@
+#!/usr/bin/env python3
+
+import argparse
+import fcntl
+import glob
+import hashlib
+import json
+import ipaddress
+import os
+import platform
+import random
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import threading
+from contextlib import contextmanager
+from typing import Any, Dict, Final, Optional, Tuple
+
+# Set environment variable to disable systemd colors
+os.environ["SYSTEMD_COLORS"] = "0"
+SYSTEMD_MACHINES: Final = "/var/lib/machines"
+CONTAINER_BASE_UID: Final = (
+    1000000  # Fallback base UID for fixed user namespace mapping
+)
+PORT_MAPPINGS_FILENAME: Final = "port_mappings.json"
+
+
+# Input validation functions
+def _validate_container_name(name: str) -> bool:
+    """Validate container name according to RFC hostname standards (for machinectl)"""
+    if not name or len(name) > 63:  # RFC 1123 hostname length limit
+        return False
+    if name.startswith("-") or name.endswith("-"):  # Cannot start or end with hyphen
+        return False
+    # RFC hostname: start with letter, contain only letters, digits, hyphens
+    # No underscores allowed in hostnames (unlike previous version)
+    return (
+        bool(re.match(r"^[a-z][a-z0-9-]*[a-z0-9]$", name))
+        if len(name) > 1
+        else bool(re.match(r"^[a-z]$", name))
+    )
+
+
+def _validate_username(username: str) -> bool:
+    """Validate username according to strict POSIX/Linux standards"""
+    if not username or len(username) > 32:  # Linux USERNAME_MAX is typically 32
+        return False
+    if username.startswith(
+        "-"
+    ):  # Cannot start with hyphen (could be mistaken for option)
+        return False
+    # Strict POSIX username: start with lowercase letter or underscore,
+    # followed by lowercase letters, digits, underscores, or hyphens
+    # Note: $ is allowed as final character for Samba machine accounts, but we exclude it for security
+    return bool(re.match(r"^[a-z_][a-z0-9_-]*$", username))
+
+
+def _validate_workspace_path(path: str) -> bool:
+    """Validate workspace path to prevent directory traversal"""
+    if not path:
+        return False
+    # Prevent path traversal attacks
+    normalized = os.path.normpath(path)
+    if ".." in normalized or normalized.startswith("/"):
+        return False
+    return True
+
+
+def _sanitize_log_output(message: str) -> str:
+    """Sanitize log output to prevent log injection"""
+    # Remove or escape newlines and control characters
+    return re.sub(r"[\r\n\t\x00-\x1f\x7f-\x9f]", "", str(message))
+
+
+def _validate_env_var(
+    value: str, allowed_values: set = set(), max_length: int = 256
+) -> bool:
+    """Validate environment variable value"""
+    if not value:
+        return False
+    if len(value) > max_length:
+        return False
+    if allowed_values and value not in allowed_values:
+        return False
+    # Prevent dangerous characters in env vars
+    if any(char in value for char in ["\x00", "\n", "\r"]):
+        return False
+    return True
+
+
+def _validate_image_name(image: str) -> bool:
+    """Validate container image name"""
+    if not image or len(image) > 128:
+        return False
+    # OCI image name validation (simplified)
+    return bool(re.match(r"^[a-z][a-z0-9._:-]{0,127}$", image))
+
+
+def _validate_network_cidr(cidr: str) -> bool:
+    """Validate network CIDR notation"""
+    try:
+        network = ipaddress.ip_network(cidr, strict=True)
+        # Only allow private networks for security
+        return network.is_private
+    except (ValueError, ipaddress.AddressValueError):
+        return False
+
+
+def _validate_ip_address(ip: str) -> bool:
+    """Validate IP address"""
+    try:
+        addr = ipaddress.ip_address(ip)
+        # Only allow private IP addresses for security
+        return addr.is_private
+    except (ValueError, ipaddress.AddressValueError):
+        return False
+
+
+def _validate_port_mapping(port_spec: str) -> Optional[Tuple[str, int, int]]:
+    """
+    Validate port mapping specification and return parsed tuple.
+
+    Args:
+        port_spec: String in format "proto:host_port:container_port"
+
+    Returns:
+        Tuple of (proto, host_port, container_port) or None if invalid
+    """
+    if not port_spec or not isinstance(port_spec, str):
+        return None
+
+    parts = port_spec.split(":")
+    if len(parts) != 3:
+        return None
+
+    proto, host_port, container_port = parts
+
+    # Validate protocol
+    if proto not in ["tcp", "udp"]:
+        return None
+
+    # Validate ports are integers in valid range
+    try:
+        hport = int(host_port)
+        cport = int(container_port)
+
+        if not (1 <= hport <= 65535):
+            return None
+        if not (1 <= cport <= 65535):
+            return None
+
+        return (proto, hport, cport)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _run_secure_subprocess(cmd: list, **kwargs) -> subprocess.CompletedProcess:
+    """Run subprocess with security hardening"""
+    # Ensure shell=False (default, but explicit for security)
+    kwargs.setdefault("shell", False)
+
+    # Validate command components are strings and not empty
+    if not cmd or not all(isinstance(arg, str) and arg for arg in cmd):
+        raise ValueError("Invalid command arguments")
+
+    # Sanitize any error output for logging
+    try:
+        result = subprocess.run(cmd, **kwargs)
+        return result
+    except subprocess.CalledProcessError as e:
+        # Sanitize error output before logging
+        sanitized_stderr = _sanitize_log_output(str(e.stderr)) if e.stderr else ""
+        raise subprocess.CalledProcessError(
+            e.returncode, e.cmd, sanitized_stderr, e.stdout
+        )
+
+
+def _run_secure_subprocess_popen(cmd: list, **kwargs) -> subprocess.Popen:
+    """Run subprocess.Popen with security hardening"""
+    # Ensure shell=False (default, but explicit for security)
+    kwargs.setdefault("shell", False)
+
+    # Validate command components are strings and not empty
+    if not cmd or not all(isinstance(arg, str) and arg for arg in cmd):
+        raise ValueError("Invalid command arguments")
+
+    return subprocess.Popen(cmd, **kwargs)
+
+
+# Helper functions
+def _verify_safe_dir(dir: str):
+    """Securely verify SYSTEMD_MACHINES directory safety using file descriptors"""
+    dir_rp = os.path.realpath(dir)
+    if dir_rp != SYSTEMD_MACHINES and not dir_rp.startswith(f"{SYSTEMD_MACHINES}/"):
+        raise ValueError(f"'{dir_rp}' does not start with '{SYSTEMD_MACHINES}'")
+
+    # Parse path components, excluding empty strings
+    path_components = [comp for comp in dir.split("/") if comp]
+
+    # Open root directory with O_DIRECTORY flag for security
+    current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+
+    # Verify root directory ownership and permissions
+    root_stat = os.fstat(current_fd)
+    if root_stat.st_uid != 0 or root_stat.st_gid != 0:
+        os.close(current_fd)
+        raise PermissionError("Root directory not owned by root:root")
+    if root_stat.st_mode & stat.S_IWOTH:
+        os.close(current_fd)
+        raise PermissionError("Root directory has world write permission")
+
+    # Traverse each path component using openat for security
+    for component in path_components:
+        # Use openat to open relative to current fd (prevents TOCTOU attacks)
+        next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY, dir_fd=current_fd)
+
+        # Get file stats using the file descriptor
+        dir_stat = os.fstat(next_fd)
+
+        # Security checks
+        if not stat.S_ISDIR(dir_stat.st_mode):
+            os.close(next_fd)
+            os.close(current_fd)
+            raise PermissionError(f"Path component '{component}' is not a directory")
+
+        if dir_stat.st_uid != 0 or dir_stat.st_gid != 0:
+            os.close(next_fd)
+            os.close(current_fd)
+            raise PermissionError(f"Directory '{component}' not owned by root:root")
+
+        if dir_stat.st_mode & stat.S_IWOTH:
+            os.close(next_fd)
+            os.close(current_fd)
+            raise PermissionError(f"Directory '{component}' has world write permission")
+
+        # Close previous fd and move to next
+        os.close(current_fd)
+        current_fd = next_fd
+
+    # Final verification that we reached the expected directory
+    final_stat = os.fstat(current_fd)
+    os.close(current_fd)
+
+    # Double-check by comparing with direct stat (should match)
+    direct_stat = os.stat(dir)
+    if (
+        final_stat.st_dev != direct_stat.st_dev
+        or final_stat.st_ino != direct_stat.st_ino
+    ):
+        raise PermissionError("Path verification mismatch - possible symlink attack")
+
+
+def _rmtree(dir: str):
+    """Safely remove directory under SYSTEMD_MACHINES"""
+    if os.path.realpath(dir) == os.path.realpath(SYSTEMD_MACHINES):
+        # Don't ever remove SYSTEMD_MACHINES
+        raise ValueError(f"'{dir}' does not point to a subdir of '{SYSTEMD_MACHINES}'")
+    _verify_safe_dir(dir)
+
+    # Let the exceptions propagate up
+    shutil.rmtree(dir)
+
+
+def _mkdir(dir: str):
+    """Safely create directory under SYSTEMD_MACHINES"""
+    _verify_safe_dir(os.path.dirname(dir))
+
+    # Let the exceptions propagate up (FileExistsError, FileNotFoundError, etc)
+    os.mkdir(dir, mode=0o700)
+    _verify_safe_dir(dir)
+
+
+def _write(fn: str, content: str, mode=0o0600):
+    """Safely write file under SYSTEMD_MACHINES"""
+    _verify_safe_dir(os.path.dirname(fn))
+
+    with open(fn, "w") as f:
+        f.write(content)
+        f.flush()
+    os.chmod(fn, mode, follow_symlinks=False)
+
+
+def _check_systemd_version():
+    """Check systemd version and return version number"""
+    try:
+        result = _run_secure_subprocess(
+            ["systemd-nspawn", "--version"], capture_output=True, text=True, check=True
+        )
+        # Parse version from output like "systemd 252 (252.19-1~deb12u1)"
+        for line in result.stdout.split("\n"):
+            if line.startswith("systemd "):
+                version_str = line.split()[1]
+                version = int(version_str.split(".")[0])
+                return version
+    except (subprocess.CalledProcessError, ValueError, IndexError) as e:
+        print(f"W: Could not determine systemd version: {_sanitize_log_output(str(e))}")
+
+    print(
+        "W: Could not determine systemd version, assuming older version where --private-users-ownership=auto not supported"
+    )
+    return 0  # Return 0 if version cannot be determined
+
+
+def _create_guest_files(
+    mdir: str,
+    container_name: str,
+    network_cidr: Optional[str] = None,
+    gateway: Optional[str] = None,
+):
+    """Create /etc/hosts file and network initialization script for container"""
+    hosts_path = os.path.join(mdir, "etc", "hosts")
+    hosts_content = f"127.0.0.1 localhost {container_name}\n"
+    print(f"I: Creating /etc/hosts with:\n{hosts_content}")
+    _write(hosts_path, hosts_content, mode=0o0644)
+
+    # nspawn's --timezone=auto is a bit non-deterministic, so unconditionally
+    # create the file in the container so we can always call with
+    # --timezone=bind and have something to bind on
+    localtime_path = os.path.join(mdir, "etc", "localtime")
+    if not os.path.exists(localtime_path):
+        utc_host_path = "/usr/share/zoneinfo/UTC"
+        localtime_content = ""
+        if os.path.exists(utc_host_path):
+            with open(utc_host_path, "r") as f:
+                localtime_content = f.read()
+            print(f"I: Copying {utc_host_path} from host to /etc/localtime in guest")
+        else:
+            print(f"I: Creating empty /etc/localtime in guest")
+        _write(localtime_path, localtime_content, mode=0o0644)
+
+    # Create network initialization script if network configuration is provided
+    if network_cidr and gateway:
+        # Validate network configuration for security
+        if not _validate_network_cidr(network_cidr):
+            print(
+                f"W: Invalid network CIDR '{_sanitize_log_output(network_cidr)}', skipping /init.sh creation"
+            )
+            return
+
+        if not _validate_ip_address(gateway):
+            print(
+                f"W: Invalid gateway IP '{_sanitize_log_output(gateway)}', skipping /init.sh creation"
+            )
+            return
+
+        try:
+            # Parse network to get available IPs
+            network = ipaddress.ip_network(network_cidr)
+        except (ValueError, ipaddress.AddressValueError) as e:
+            print(f"W: Invalid network configuration, skipping /init.sh creation: {e}")
+            return
+
+        # Find used IP addresses by scanning existing init.sh files
+        used_ips = set()
+        if os.path.exists(SYSTEMD_MACHINES):
+            for container_dir in glob.glob(f"{SYSTEMD_MACHINES}/claudette.*"):
+                # Skip cache directory
+                if container_dir.endswith(".__cache"):
+                    continue
+
+                init_script = os.path.join(container_dir, "init.sh")
+                if os.path.exists(init_script):
+                    try:
+                        with open(init_script, "r") as f:
+                            content = f.read()
+                        # Look for CONTAINER_IP variable
+                        match = re.search(
+                            r'CONTAINER_IP="(\d+\.\d+\.\d+\.\d+)"', content
+                        )
+                        if match:
+                            used_ip = ipaddress.ip_address(match.group(1))
+                            if used_ip in network:
+                                used_ips.add(used_ip)
+                    except (OSError, ValueError, ipaddress.AddressValueError):
+                        # Skip files we can't read or parse
+                        continue
+
+        # Find first available IP starting from .10
+        container_ip = None
+        for i in range(
+            10, 254
+        ):  # Skip .1-.9 (reserved for gateway/infrastructure), .255 (broadcast)
+            candidate_ip = network.network_address + i
+            if candidate_ip not in used_ips and candidate_ip != ipaddress.ip_address(
+                gateway
+            ):
+                container_ip = str(candidate_ip)
+                break
+
+        if container_ip is None:
+            print(
+                "W: No available IP addresses in network range, skipping /init.sh creation"
+            )
+            return
+
+        init_script_path = os.path.join(mdir, "init.sh")
+        # Extract network prefix (e.g., "24" from the CIDR)
+        prefix_len = network.prefixlen
+        init_script_content = f"""#!/bin/sh
+set -e
+# Container network initialization script
+# Generated automatically by claudette-nspawn
+
+# Network configuration variables
+CONTAINER_IP="{container_ip}"
+NETWORK_PREFIX="{prefix_len}"
+GATEWAY_IP="{gateway}"
+
+# Wait for host0 interface to appear (max 10 seconds)
+RETRY_COUNT=0
+MAX_RETRIES=10
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    if ip link show host0 >/dev/null 2>&1; then
+        break
+    fi
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+        echo "ERROR: host0 interface not found after $MAX_RETRIES seconds" >&2
+        exit 1
+    fi
+    sleep 1
+done
+
+ip addr add ${{CONTAINER_IP}}/${{NETWORK_PREFIX}} dev host0
+ip link set host0 up
+ip route add default via ${{GATEWAY_IP}}
+echo 'nameserver 1.1.1.1' > /etc/resolv.conf
+echo 'nameserver 1.0.0.1' >> /etc/resolv.conf
+"""
+        print(f"I: Creating /init.sh with:\n{init_script_content}")
+        _write(init_script_path, init_script_content, mode=0o0755)
+
+
+class ClaudetteNet:
+    """Manages network bridge and NAT configuration for containers"""
+
+    # Private networks to block for container isolation
+    PRIVATE_NETWORKS = [
+        "10.0.0.0/8",  # RFC 1918
+        "172.16.0.0/12",  # RFC 1918
+        "192.168.0.0/16",  # RFC 1918
+        "169.254.0.0/16",  # Link-local
+    ]
+
+    # IPv6 private networks to block for container isolation
+    IPV6_PRIVATE_NETWORKS = [
+        "fe80::/10",  # Link-local addresses
+        "fc00::/7",  # Unique local addresses
+    ]
+
+    def __init__(self):
+        self.bridge_name = "cldtbr0"
+        self.network: Optional[str] = None
+        self.network_cidr: Optional[str] = None
+        self.gateway: Optional[str] = None
+        self.configured = False
+
+        # Detect firewall backend: prefer iptables, fallback to nftables
+        self.has_iptables = shutil.which("iptables") is not None
+        self.has_ip6tables = shutil.which("ip6tables") is not None
+        self.has_nft = shutil.which("nft") is not None
+
+        # Determine which firewall backend to use
+        if self.has_iptables:
+            self.firewall_backend = "iptables"
+        elif self.has_nft:
+            self.firewall_backend = "nftables"
+            print("I: iptables not available, using nftables")
+        else:
+            print("E: Neither iptables nor nftables available")
+            self.firewall_backend = None
+
+        # Check if bridge already exists
+        if self._bridge_exists():
+            if self._detect_existing_config():
+                self.configured = True
+            else:
+                print(f"W: Could not detect network config for existing bridge")
+            return
+
+        # Create and configure new bridge
+        if self._setup_bridge():
+            self.configured = True
+            print(
+                f"I: Created bridge with network: {self.network_cidr} gateway: {self.gateway}"
+            )
+        else:
+            print(f"W: Failed to setup bridge network")
+
+    def _bridge_exists(self) -> bool:
+        """Check if the bridge interface already exists"""
+        try:
+            result = _run_secure_subprocess(
+                ["ip", "link", "show", self.bridge_name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.returncode == 0
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
+    def _detect_existing_config(self) -> bool:
+        """Detect network configuration of existing bridge"""
+        return self._ensure_gateway()
+
+    def _ensure_gateway(self) -> bool:
+        """Ensure bridge gateway details are populated."""
+        if self.gateway and self.network_cidr:
+            return True
+
+        try:
+            result = _run_secure_subprocess(
+                ["ip", "-j", "addr", "show", self.bridge_name],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            err_output = e.stderr or e.stdout or str(e)
+            print(
+                f"E: Failed to query bridge '{_sanitize_log_output(self.bridge_name)}' address: {_sanitize_log_output(err_output)}"
+            )
+            return False
+        except Exception as e:
+            print(
+                f"E: Error querying bridge '{_sanitize_log_output(self.bridge_name)}' address: {_sanitize_log_output(str(e))}"
+            )
+            return False
+
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            print(
+                f"E: Could not decode address data for '{_sanitize_log_output(self.bridge_name)}': {_sanitize_log_output(str(e))}"
+            )
+            return False
+
+        for iface in data:
+            if iface.get("ifname") != self.bridge_name:
+                continue
+            for addr in iface.get("addr_info", []):
+                if addr.get("family") != "inet":
+                    continue
+                local = addr.get("local")
+                prefixlen = addr.get("prefixlen")
+                if not local or prefixlen is None:
+                    continue
+                try:
+                    interface = ipaddress.ip_interface(f"{local}/{prefixlen}")
+                except ValueError:
+                    continue
+                self.gateway = str(interface.ip)
+                self.network = str(interface.network.network_address)
+                self.network_cidr = str(interface.network)
+                return True
+
+        print(
+            f"E: No IPv4 gateway detected for bridge '{_sanitize_log_output(self.bridge_name)}'"
+        )
+        return False
+
+    def _get_seed_from_machine_id(self) -> int:
+        """Generate seed from /etc/machine-id"""
+        try:
+            with open("/etc/machine-id", "r") as f:
+                machine_id = f.read().strip()
+            # Use first 8 chars for seed (32-bit value)
+            seed_str = machine_id[:8]
+            return int(seed_str, 16)
+        except (FileNotFoundError, ValueError):
+            # Fallback to a default seed if machine-id is unavailable
+            print("W: Could not read /etc/machine-id, using fallback seed")
+            return 0xDEADBEEF
+
+    def _check_network_conflict(self, network_cidr: str) -> bool:
+        """Check if a network conflicts with existing routes or addresses"""
+
+        try:
+            test_net = ipaddress.ip_network(network_cidr)
+        except Exception as e:
+            print(f"W: Error checking network conflict: {e}")
+            return True  # Assume conflict on error
+
+        # Check routing table
+        result = _run_secure_subprocess(
+            ["ip", "route", "show"], capture_output=True, text=True, check=True
+        )
+
+        for line in result.stdout.split("\n"):
+            if line.strip():
+                # Parse network from route entry
+                parts = line.split()
+                if parts:
+                    try:
+                        # First part is usually the network
+                        existing_net = ipaddress.ip_network(parts[0], strict=False)
+                        if existing_net.overlaps(test_net):
+                            return True
+                    except ValueError:
+                        # Not a valid network, skip
+                        continue
+
+        # Check existing addresses
+        result = _run_secure_subprocess(
+            ["ip", "addr", "show"], capture_output=True, text=True, check=True
+        )
+
+        for line in result.stdout.split("\n"):
+            if "inet " in line:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    try:
+                        existing_if = ipaddress.ip_interface(parts[1])
+                        if existing_if.network.overlaps(test_net):
+                            return True
+                    except ValueError:
+                        continue
+
+        return False
+
+    def _find_unused_network(self) -> Optional[Tuple[str, str, str]]:
+        """Find an unused /24 network in 10.0.0.0/8 range"""
+        seed = self._get_seed_from_machine_id()
+        rng = random.Random(seed)
+
+        # Try up to 100 different networks
+        for _ in range(100):
+            # Generate 10.{128-255}.{0-255}.0/24
+            octet2 = rng.randint(128, 255)
+            octet3 = rng.randint(0, 255)
+
+            network = f"10.{octet2}.{octet3}.0"
+            network_cidr = f"{network}/24"
+            gateway = f"10.{octet2}.{octet3}.1"
+
+            if not self._check_network_conflict(network_cidr):
+                return (network, network_cidr, gateway)
+
+        return None
+
+    def _create_bridge(self) -> bool:
+        """Create the bridge interface"""
+        try:
+            # Create bridge
+            result = _run_secure_subprocess(
+                ["ip", "link", "add", "name", self.bridge_name, "type", "bridge"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                print(f"E: Failed to create bridge: {result.stderr}")
+                return False
+
+            # Bring bridge up
+            result = _run_secure_subprocess(
+                ["ip", "link", "set", self.bridge_name, "up"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                print(f"E: Failed to bring bridge up: {result.stderr}")
+                return False
+
+            return True
+        except Exception as e:
+            print(f"E: Error creating bridge: {e}")
+            return False
+
+    def _configure_bridge_ip(self, gateway: str) -> bool:
+        """Add IP address to the bridge"""
+        try:
+            # Add IP address
+            result = _run_secure_subprocess(
+                ["ip", "addr", "add", f"{gateway}/24", "dev", self.bridge_name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                print(f"E: Failed to add IP to bridge: {result.stderr}")
+                return False
+
+            return True
+        except Exception as e:
+            print(f"E: Error configuring bridge IP: {e}")
+            return False
+
+    def _enable_ip_forwarding(self) -> bool:
+        """Enable IP forwarding"""
+        try:
+            result = _run_secure_subprocess(
+                ["sysctl", "-w", "net.ipv4.ip_forward=1"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                print(f"W: Failed to enable IP forwarding: {result.stderr}")
+                return False
+            return True
+        except Exception as e:
+            print(f"W: Error enabling IP forwarding: {e}")
+            return False
+
+    def _enable_route_localnet(self) -> bool:
+        """Enable routing the localnet for this bridge"""
+        try:
+            result = _run_secure_subprocess(
+                ["sysctl", "-w", f"net.ipv4.conf.{self.bridge_name}.route_localnet=1"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                print(
+                    f"W: Failed to enable route_localnet for '{self.bridge_name}': {result.stderr}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"W: Error enabling route_localnet for '{self.bridge_name}': {e}")
+            return False
+
+    def _run_iptables(
+        self,
+        *args,
+        table: Optional[str] = None,
+        error_prefix: str = "iptables operation",
+    ) -> bool:
+        """Helper method to run iptables commands with consistent error handling"""
+        cmd = ["iptables"]
+        if table:
+            cmd.extend(["-t", table])
+        cmd.extend(args)
+
+        try:
+            result = _run_secure_subprocess(
+                cmd, capture_output=True, text=True, check=False
+            )
+            if result.returncode != 0:
+                print(f"W: {error_prefix} failed: {result.stderr}")
+                return False
+            return True
+        except Exception as e:
+            print(f"W: Error running {error_prefix}: {e}")
+            return False
+
+    def _run_ip6tables(
+        self,
+        *args,
+        table: Optional[str] = None,
+        error_prefix: str = "ip6tables operation",
+    ) -> bool:
+        """Helper method to run ip6tables commands with consistent error handling"""
+        cmd = ["ip6tables"]
+        if table:
+            cmd.extend(["-t", table])
+        cmd.extend(args)
+
+        try:
+            result = _run_secure_subprocess(
+                cmd, capture_output=True, text=True, check=False
+            )
+            if result.returncode != 0:
+                print(f"W: {error_prefix} failed: {result.stderr}")
+                return False
+            return True
+        except Exception as e:
+            print(f"W: Error running {error_prefix}: {e}")
+            return False
+
+    def _iptables_chain_exists(self, chain: str, table: Optional[str] = None) -> bool:
+        """Check if an iptables chain exists"""
+        cmd = ["iptables"]
+        if table:
+            cmd.extend(["-t", table])
+        cmd.extend(["-L", chain, "-n"])
+
+        try:
+            result = _run_secure_subprocess(
+                cmd, capture_output=True, text=True, check=False
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _ip6tables_chain_exists(self, chain: str, table: Optional[str] = None) -> bool:
+        """Check if an ip6tables chain exists"""
+        cmd = ["ip6tables"]
+        if table:
+            cmd.extend(["-t", table])
+        cmd.extend(["-L", chain, "-n"])
+
+        try:
+            result = _run_secure_subprocess(
+                cmd, capture_output=True, text=True, check=False
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _run_nft(self, *args, error_prefix: str = "nft operation") -> bool:
+        """Helper method to run nft commands with consistent error handling"""
+        cmd = ["nft"] + list(args)
+
+        try:
+            result = _run_secure_subprocess(
+                cmd, capture_output=True, text=True, check=False
+            )
+            if result.returncode != 0:
+                print(f"W: {error_prefix} failed: {result.stderr}")
+                return False
+            return True
+        except Exception as e:
+            print(f"W: Error running {error_prefix}: {e}")
+            return False
+
+    def _nft_table_exists(self, family: str, table: str) -> bool:
+        """Check if an nftables table exists"""
+        try:
+            result = _run_secure_subprocess(
+                ["nft", "list", "table", family, table],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _nft_chain_exists(self, family: str, table: str, chain: str) -> bool:
+        """Check if an nftables chain exists"""
+        try:
+            result = _run_secure_subprocess(
+                ["nft", "list", "chain", family, table, chain],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _setup_nftables_base(self) -> bool:
+        """Create base nftables tables and chains"""
+        try:
+            # Create table if it doesn't exist
+            if not self._nft_table_exists("ip", "claudette"):
+                self._run_nft(
+                    "add", "table", "ip", "claudette", error_prefix="Create IPv4 table"
+                )
+
+            # Create chains for NAT
+            if not self._nft_chain_exists("ip", "claudette", "postrouting"):
+                self._run_nft(
+                    "add",
+                    "chain",
+                    "ip",
+                    "claudette",
+                    "postrouting",
+                    "{",
+                    "type",
+                    "nat",
+                    "hook",
+                    "postrouting",
+                    "priority",
+                    "srcnat",
+                    ";",
+                    "}",
+                    error_prefix="Create postrouting chain",
+                )
+
+            # Create chains for PREROUTING (for port forwarding DNAT)
+            if not self._nft_chain_exists("ip", "claudette", "prerouting"):
+                self._run_nft(
+                    "add",
+                    "chain",
+                    "ip",
+                    "claudette",
+                    "prerouting",
+                    "{",
+                    "type",
+                    "nat",
+                    "hook",
+                    "prerouting",
+                    "priority",
+                    "dstnat",
+                    ";",
+                    "}",
+                    error_prefix="Create prerouting chain",
+                )
+
+            # Create chains for OUTPUT NAT (for host-generated traffic DNAT)
+            if not self._nft_chain_exists("ip", "claudette", "output"):
+                self._run_nft(
+                    "add",
+                    "chain",
+                    "ip",
+                    "claudette",
+                    "output",
+                    "{",
+                    "type",
+                    "nat",
+                    "hook",
+                    "output",
+                    "priority",
+                    "dstnat",
+                    ";",
+                    "}",
+                    error_prefix="Create output NAT chain",
+                )
+
+            # Create chains for forwarding
+            if not self._nft_chain_exists("ip", "claudette", "forward"):
+                self._run_nft(
+                    "add",
+                    "chain",
+                    "ip",
+                    "claudette",
+                    "forward",
+                    "{",
+                    "type",
+                    "filter",
+                    "hook",
+                    "forward",
+                    "priority",
+                    "filter",
+                    ";",
+                    "}",
+                    error_prefix="Create forward chain",
+                )
+
+            # Create chains for OUTPUT filter (host->container traffic control)
+            if not self._nft_chain_exists("ip", "claudette", "output_filter"):
+                self._run_nft(
+                    "add",
+                    "chain",
+                    "ip",
+                    "claudette",
+                    "output_filter",
+                    "{",
+                    "type",
+                    "filter",
+                    "hook",
+                    "output",
+                    "priority",
+                    "filter",
+                    ";",
+                    "}",
+                    error_prefix="Create output filter chain",
+                )
+
+            # Create IPv6 table if ip6 support is needed
+            if not self._nft_table_exists("ip6", "claudette"):
+                self._run_nft(
+                    "add", "table", "ip6", "claudette", error_prefix="Create IPv6 table"
+                )
+
+            # Create IPv6 forward chain
+            if not self._nft_chain_exists("ip6", "claudette", "forward"):
+                self._run_nft(
+                    "add",
+                    "chain",
+                    "ip6",
+                    "claudette",
+                    "forward",
+                    "{",
+                    "type",
+                    "filter",
+                    "hook",
+                    "forward",
+                    "priority",
+                    "filter",
+                    ";",
+                    "}",
+                    error_prefix="Create IPv6 forward chain",
+                )
+
+            return True
+        except Exception as e:
+            print(f"E: Error setting up nftables base: {e}")
+            return False
+
+    def _setup_iptables_chains(self, network_cidr) -> bool:
+        """Create or flush iptables chains"""
+        if not self._ensure_gateway():
+            print(
+                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.bridge_name)}'"
+            )
+            return False
+
+        if not self.gateway:
+            print(
+                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.bridge_name)}'"
+            )
+            return False
+
+        try:
+            # Handle cldt-nat-post chain in NAT table
+            if self._iptables_chain_exists("cldt-nat-post", "nat"):
+                # Chain exists, flush and zero it
+                self._run_iptables(
+                    "-F",
+                    "cldt-nat-post",
+                    table="nat",
+                    error_prefix="Flush cldt-nat-post chain",
+                )
+                self._run_iptables(
+                    "-Z",
+                    "cldt-nat-post",
+                    table="nat",
+                    error_prefix="Zero cldt-nat-post chain",
+                )
+            else:
+                # Create new chain
+                self._run_iptables(
+                    "-N",
+                    "cldt-nat-post",
+                    table="nat",
+                    error_prefix="Create cldt-nat-post chain",
+                )
+
+                # Insert jump rule for -s network_cidr at top of POSTROUTING
+                self._run_iptables(
+                    "-I",
+                    "POSTROUTING",
+                    "-s",
+                    network_cidr,
+                    "-j",
+                    "cldt-nat-post",
+                    table="nat",
+                    error_prefix="Insert POSTROUTING jump rule",
+                )
+
+                # Insert jump rule for -o bridge_name -s 127.0.0.1/8 at top of
+                # POSTROUTING for localhost
+                self._run_iptables(
+                    "-I",
+                    "POSTROUTING",
+                    "-o",
+                    self.bridge_name,
+                    "-s",
+                    "127.0.0.1/8",
+                    "-j",
+                    "cldt-nat-post",
+                    table="nat",
+                    error_prefix="Insert POSTROUTING jump rule",
+                )
+
+            # Handle cldt-nat-out chain in NAT table (for OUTPUT DNAT)
+            if self._iptables_chain_exists("cldt-nat-out", "nat"):
+                # Chain exists, flush and zero it
+                self._run_iptables(
+                    "-F",
+                    "cldt-nat-out",
+                    table="nat",
+                    error_prefix="Flush cldt-nat-out chain",
+                )
+                self._run_iptables(
+                    "-Z",
+                    "cldt-nat-out",
+                    table="nat",
+                    error_prefix="Zero cldt-nat-out chain",
+                )
+            else:
+                # Create new chain
+                self._run_iptables(
+                    "-N",
+                    "cldt-nat-out",
+                    table="nat",
+                    error_prefix="Create cldt-nat-out chain",
+                )
+
+                # Insert jump rule at top of OUTPUT
+                self._run_iptables(
+                    "-I",
+                    "OUTPUT",
+                    "-j",
+                    "cldt-nat-out",
+                    table="nat",
+                    error_prefix="Insert OUTPUT jump rule for NAT",
+                )
+
+            # Handle cldt-nat-pre chain in NAT table (for PREROUTING DNAT)
+            if self._iptables_chain_exists("cldt-nat-pre", "nat"):
+                # Chain exists, flush and zero it
+                self._run_iptables(
+                    "-F",
+                    "cldt-nat-pre",
+                    table="nat",
+                    error_prefix="Flush cldt-nat-pre chain",
+                )
+                self._run_iptables(
+                    "-Z",
+                    "cldt-nat-pre",
+                    table="nat",
+                    error_prefix="Zero cldt-nat-pre chain",
+                )
+            else:
+                # Create new chain
+                self._run_iptables(
+                    "-N",
+                    "cldt-nat-pre",
+                    table="nat",
+                    error_prefix="Create cldt-nat-pre chain",
+                )
+
+                # Insert jump rule at top of PREROUTING
+                self._run_iptables(
+                    "-I",
+                    "PREROUTING",
+                    "-j",
+                    "cldt-nat-pre",
+                    table="nat",
+                    error_prefix="Insert PREROUTING jump rule for NAT",
+                )
+
+            # Handle cldt-rej chain in filter table (for logging and rejecting)
+            if self._iptables_chain_exists("cldt-rej"):
+                # Chain exists, flush and zero it
+                self._run_iptables(
+                    "-F", "cldt-rej", error_prefix="Flush cldt-rej chain"
+                )
+                self._run_iptables("-Z", "cldt-rej", error_prefix="Zero cldt-rej chain")
+            else:
+                # Create new chain
+                self._run_iptables(
+                    "-N", "cldt-rej", error_prefix="Create cldt-rej chain"
+                )
+
+            # Add LOG and REJECT rules to cldt-rej chain
+            self._run_iptables(
+                "-A",
+                "cldt-rej",
+                "-j",
+                "LOG",
+                "--log-prefix",
+                "[CLDT-BLOCK] ",
+                error_prefix="Add LOG rule to cldt-rej",
+            )
+            self._run_iptables(
+                "-A",
+                "cldt-rej",
+                "-j",
+                "REJECT",
+                error_prefix="Add REJECT rule to cldt-rej",
+            )
+
+            # Handle cldt-fwd chain in filter table
+            if self._iptables_chain_exists("cldt-fwd"):
+                # Chain exists, flush and zero it
+                self._run_iptables(
+                    "-F", "cldt-fwd", error_prefix="Flush cldt-fwd chain"
+                )
+                self._run_iptables("-Z", "cldt-fwd", error_prefix="Zero cldt-fwd chain")
+            else:
+                # Create new chain
+                self._run_iptables(
+                    "-N", "cldt-fwd", error_prefix="Create cldt-fwd chain"
+                )
+
+                # Insert jump rule at top of FORWARD
+                self._run_iptables(
+                    "-I",
+                    "FORWARD",
+                    "-i",
+                    self.bridge_name,
+                    "-s",
+                    network_cidr,
+                    "-j",
+                    "cldt-fwd",
+                    error_prefix="Insert FORWARD jump rule",
+                )
+
+            # Handle cldt-out chain in filter table (for host->container traffic control)
+            if self._iptables_chain_exists("cldt-out"):
+                # Chain exists, flush and zero it
+                self._run_iptables(
+                    "-F", "cldt-out", error_prefix="Flush cldt-out chain"
+                )
+                self._run_iptables("-Z", "cldt-out", error_prefix="Zero cldt-out chain")
+            else:
+                # Create new chain
+                self._run_iptables(
+                    "-N", "cldt-out", error_prefix="Create cldt-out chain"
+                )
+
+                # Insert jump rule to OUTPUT
+                # Rule for bridge interface (gateway -> container network)
+                self._run_iptables(
+                    "-I",
+                    "OUTPUT",
+                    "-o",
+                    self.bridge_name,
+                    "-s",
+                    self.gateway,
+                    "-d",
+                    network_cidr,
+                    "-j",
+                    "cldt-out",
+                    error_prefix="Append OUTPUT jump rule (bridge)",
+                )
+
+            return True
+        except Exception as e:
+            print(f"E: Error setting up iptables chains: {e}")
+            return False
+
+    # TODO: currently we setup private networking with a bridge, then add
+    # firewall rules to the bridge for isolation. Currently:
+    # - deny to RFC1918 networks travelling through the bridge
+    # - allow everything leaving the bridge
+    #
+    # This provides reasonable host and local network protection, but doesn't
+    # limit what claude can talk to. Eventually add some sort of configuration
+    # for this (perhaps use systemd-nspawn's IPAllowList and IPDenyList,
+    # perhaps not). This might look like:
+    #
+    # 1. creating a per-container chain named cldt-hostN (where 'N' is the
+    #    last octet of the ip address
+    # 2. adding per-container rules (eg, -j REJECT rule at the end with
+    #    whatever ACCEPT rules are desired)
+    # 3. managing cldt-fwd to '-I cldt-fwd -s 10.x.y.N -j cldt-hostN' when the
+    #    container is brought up, remove it when removed, etc
+    def _setup_ipv4_firewall_ipt(self, network_cidr: str) -> bool:
+        """Configure NAT and forwarding rules"""
+        try:
+            # Add MASQUERADE rule
+            # Note: The original requirement had "-o cldtbr0" but for NAT we typically
+            # want to masquerade on the outbound interface (not the bridge).
+            # Using ! -o cldtbr0 to masquerade on all interfaces except the bridge
+            self._run_iptables(
+                "-A",
+                "cldt-nat-post",
+                "-s",
+                network_cidr,
+                "!",
+                "-d",
+                network_cidr,
+                "!",
+                "-o",
+                self.bridge_name,
+                "-j",
+                "MASQUERADE",
+                table="nat",
+                error_prefix="Add MASQUERADE rule",
+            )
+
+            # Block access to private IP ranges (insert at beginning of chain)
+            rule_number = 1
+            for net in self.PRIVATE_NETWORKS:
+                # Jump to cldt-rej chain for logging and rejecting
+                self._run_iptables(
+                    "-I",
+                    "cldt-fwd",
+                    str(rule_number),
+                    "-i",
+                    self.bridge_name,
+                    "-d",
+                    net,
+                    "-j",
+                    "cldt-rej",
+                    error_prefix=f"Block access to {net}",
+                )
+                rule_number += 1
+
+            # Add FORWARD rules for established connections
+            self._run_iptables(
+                "-A",
+                "cldt-fwd",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-i",
+                self.bridge_name,
+                "-j",
+                "ACCEPT",
+                error_prefix="Add conntrack FORWARD rule",
+            )
+
+            # Add FORWARD rule for new connections from bridge (to public IPs only)
+            self._run_iptables(
+                "-A",
+                "cldt-fwd",
+                "-i",
+                self.bridge_name,
+                "-s",
+                network_cidr,
+                "-j",
+                "ACCEPT",
+                error_prefix="Add bridge FORWARD rule",
+            )
+
+            # Add OUTPUT rules for host->container traffic control
+            # Allow all ICMP out for ping, errors, REJECT responses, etc
+            self._run_iptables(
+                "-A",
+                "cldt-out",
+                "-p",
+                "icmp",
+                "-j",
+                "ACCEPT",
+                error_prefix="Allow ICMP echo-request in cldt-out",
+            )
+
+            # Allow established/related connections
+            self._run_iptables(
+                "-A",
+                "cldt-out",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+                error_prefix="Add conntrack OUTPUT rule to cldt-out",
+            )
+
+            # Log blocked host->container traffic
+            self._run_iptables(
+                "-A",
+                "cldt-out",
+                "-j",
+                "LOG",
+                "--log-prefix",
+                "[CLDT-OUT-BLOCK] ",
+                error_prefix="Add LOG rule to cldt-out",
+            )
+
+            # Reject all other host->container traffic
+            self._run_iptables(
+                "-A",
+                "cldt-out",
+                "-j",
+                "REJECT",
+                error_prefix="Add REJECT rule to cldt-out",
+            )
+
+            return True
+        except Exception as e:
+            print(f"E: Error configuring NAT rules: {e}")
+            return False
+
+    def _setup_ipv6_firewall_ipt(self) -> bool:
+        """Setup IPv6 firewall rules to block container IPv6 traffic"""
+        # Only proceed if ip6tables is available
+        if not shutil.which("ip6tables"):
+            return True  # Not an error, just skip IPv6 setup
+
+        try:
+            # Handle cldt-rej6 chain for IPv6 in filter table (for logging and rejecting)
+            if self._ip6tables_chain_exists("cldt-rej6"):
+                # Chain exists, flush and zero it
+                self._run_ip6tables(
+                    "-F", "cldt-rej6", error_prefix="Flush cldt-rej6 chain"
+                )
+                self._run_ip6tables(
+                    "-Z", "cldt-rej6", error_prefix="Zero cldt-rej6 chain"
+                )
+            else:
+                # Create new chain
+                self._run_ip6tables(
+                    "-N", "cldt-rej6", error_prefix="Create cldt-rej6 chain"
+                )
+
+                # Add LOG and REJECT rules to cldt-rej6 chain
+                self._run_ip6tables(
+                    "-A",
+                    "cldt-rej6",
+                    "-j",
+                    "LOG",
+                    "--log-prefix",
+                    "[CLDT-BLOCK] ",
+                    error_prefix="Add LOG rule to cldt-rej6",
+                )
+                self._run_ip6tables(
+                    "-A",
+                    "cldt-rej6",
+                    "-j",
+                    "REJECT",
+                    error_prefix="Add REJECT rule to cldt-rej6",
+                )
+
+            # Handle cldt-fwd6 chain for IPv6 in filter table
+            if self._ip6tables_chain_exists("cldt-fwd6"):
+                # Chain exists, flush and zero it
+                self._run_ip6tables(
+                    "-F", "cldt-fwd6", error_prefix="Flush cldt-fwd6 chain"
+                )
+                self._run_ip6tables(
+                    "-Z", "cldt-fwd6", error_prefix="Zero cldt-fwd6 chain"
+                )
+            else:
+                # Create new chain and insert jump rule
+                self._run_ip6tables(
+                    "-N", "cldt-fwd6", error_prefix="Create cldt-fwd6 chain"
+                )
+                # Insert jump rule at top of FORWARD
+                self._run_ip6tables(
+                    "-I",
+                    "FORWARD",
+                    "-i",
+                    self.bridge_name,
+                    "-j",
+                    "cldt-fwd6",
+                    error_prefix="Insert IPv6 FORWARD jump rule",
+                )
+
+            # Block access to IPv6 private ranges (insert at beginning of chain)
+            rule_number = 1
+            for net in self.IPV6_PRIVATE_NETWORKS:
+                # Jump to cldt-rej6 chain for logging and rejecting
+                self._run_ip6tables(
+                    "-I",
+                    "cldt-fwd6",
+                    str(rule_number),
+                    "-i",
+                    self.bridge_name,
+                    "-d",
+                    net,
+                    "-j",
+                    "cldt-rej6",
+                    error_prefix=f"Block access to IPv6 {net}",
+                )
+                rule_number += 1
+
+            # Add rule to reject all remaining IPv6 traffic from bridge (container isolation)
+            self._run_ip6tables(
+                "-A",
+                "cldt-fwd6",
+                "-i",
+                self.bridge_name,
+                "-j",
+                "cldt-rej6",
+                error_prefix="Add IPv6 bridge REJECT rule",
+            )
+
+            return True
+        except Exception as e:
+            print(f"W: Error setting up IPv6 firewall rules: {e}")
+            return False
+
+    def _setup_ipv4_firewall_nft(self, network_cidr: str) -> bool:
+        """Configure NAT and forwarding rules using nftables"""
+        if not self._ensure_gateway():
+            print(
+                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.bridge_name)}'"
+            )
+            return False
+
+        if not self.gateway:
+            print(
+                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.bridge_name)}'"
+            )
+            return False
+
+        try:
+            # Ensure base tables and chains exist
+            if not self._setup_nftables_base():
+                return False
+
+            # Flush existing rules in our chains
+            self._run_nft(
+                "flush",
+                "chain",
+                "ip",
+                "claudette",
+                "postrouting",
+                error_prefix="Flush postrouting chain",
+            )
+            self._run_nft(
+                "flush",
+                "chain",
+                "ip",
+                "claudette",
+                "forward",
+                error_prefix="Flush forward chain",
+            )
+
+            # Add MASQUERADE rule for NAT
+            self._run_nft(
+                "add",
+                "rule",
+                "ip",
+                "claudette",
+                "postrouting",
+                "ip",
+                "saddr",
+                network_cidr,
+                "ip",
+                "daddr",
+                "!=",
+                network_cidr,
+                "oifname",
+                "!=",
+                f'"{self.bridge_name}"',
+                "masquerade",
+                error_prefix="Add MASQUERADE rule",
+            )
+
+            # Block access to private IP ranges (with logging)
+            for net in self.PRIVATE_NETWORKS:
+                # Add logging rule
+                self._run_nft(
+                    "add",
+                    "rule",
+                    "ip",
+                    "claudette",
+                    "forward",
+                    "iifname",
+                    f'"{self.bridge_name}"',
+                    "ip",
+                    "daddr",
+                    net,
+                    "log",
+                    "prefix",
+                    '"[CLDT-BLOCK] "',
+                    error_prefix=f"Log access to {net}",
+                )
+                # Add reject rule
+                self._run_nft(
+                    "add",
+                    "rule",
+                    "ip",
+                    "claudette",
+                    "forward",
+                    "iifname",
+                    f'"{self.bridge_name}"',
+                    "ip",
+                    "daddr",
+                    net,
+                    "reject",
+                    error_prefix=f"Block access to {net}",
+                )
+
+            # Add FORWARD rules for established connections
+            self._run_nft(
+                "add",
+                "rule",
+                "ip",
+                "claudette",
+                "forward",
+                "ct",
+                "state",
+                "established,related",
+                "iifname",
+                f'"{self.bridge_name}"',
+                "accept",
+                error_prefix="Add conntrack FORWARD rule",
+            )
+
+            # Add FORWARD rule for new connections from bridge
+            self._run_nft(
+                "add",
+                "rule",
+                "ip",
+                "claudette",
+                "forward",
+                "iifname",
+                f'"{self.bridge_name}"',
+                "ip",
+                "saddr",
+                network_cidr,
+                "accept",
+                error_prefix="Add bridge FORWARD rule",
+            )
+
+            # Setup OUTPUT firewall rules for host->container traffic control
+            if not self._setup_output_firewall_nft(network_cidr):
+                return False
+
+            return True
+        except Exception as e:
+            print(f"E: Error configuring nftables NAT rules: {e}")
+            return False
+
+    def _setup_output_firewall_nft(self, network_cidr: str) -> bool:
+        """Configure OUTPUT firewall rules using nftables for host->container traffic control"""
+        if not self._ensure_gateway():
+            print(
+                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.bridge_name)}'"
+            )
+            return False
+
+        if not self.gateway:
+            print(
+                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.bridge_name)}'"
+            )
+            return False
+
+        try:
+            # Ensure base tables and chains exist
+            if not self._setup_nftables_base():
+                return False
+
+            # Flush existing rules in output_filter chain
+            self._run_nft(
+                "flush",
+                "chain",
+                "ip",
+                "claudette",
+                "output_filter",
+                error_prefix="Flush output_filter chain",
+            )
+
+            # Use detected gateway IP for host traffic controls
+
+            # Rules for gateway IP traffic (bridge interface only, destination network_cidr)
+            # Allow all ICMP out for ping, errors, REJECT responses, etc
+            self._run_nft(
+                "add",
+                "rule",
+                "ip",
+                "claudette",
+                "output_filter",
+                "oifname",
+                f'"{self.bridge_name}"',
+                "ip",
+                "saddr",
+                self.gateway,
+                "ip",
+                "daddr",
+                network_cidr,
+                "ip",
+                "protocol",
+                "icmp",
+                "accept",
+                error_prefix="Allow ICMP in output_filter",
+            )
+
+            # Allow established/related connections
+            self._run_nft(
+                "add",
+                "rule",
+                "ip",
+                "claudette",
+                "output_filter",
+                "oifname",
+                f'"{self.bridge_name}"',
+                "ip",
+                "saddr",
+                self.gateway,
+                "ip",
+                "daddr",
+                network_cidr,
+                "ct",
+                "state",
+                "established,related",
+                "accept",
+                error_prefix="Add conntrack OUTPUT rule",
+            )
+
+            # Log blocked host->container traffic
+            self._run_nft(
+                "add",
+                "rule",
+                "ip",
+                "claudette",
+                "output_filter",
+                "oifname",
+                f'"{self.bridge_name}"',
+                "ip",
+                "saddr",
+                self.gateway,
+                "ip",
+                "daddr",
+                network_cidr,
+                "log",
+                "prefix",
+                '"[CLDT-OUT-BLOCK] "',
+                error_prefix="Add LOG rule to output_filter",
+            )
+
+            # Reject all other host->container traffic
+            self._run_nft(
+                "add",
+                "rule",
+                "ip",
+                "claudette",
+                "output_filter",
+                "oifname",
+                f'"{self.bridge_name}"',
+                "ip",
+                "saddr",
+                self.gateway,
+                "ip",
+                "daddr",
+                network_cidr,
+                "reject",
+                error_prefix="Add REJECT rule to output_filter",
+            )
+
+            return True
+        except Exception as e:
+            print(f"E: Error configuring nftables OUTPUT rules: {e}")
+            return False
+
+    def _setup_ipv6_firewall_nft(self) -> bool:
+        """Setup IPv6 firewall rules using nftables to block container IPv6 traffic"""
+        try:
+            # Ensure base tables exist
+            if not self._setup_nftables_base():
+                return False
+
+            # Flush existing rules
+            self._run_nft(
+                "flush",
+                "chain",
+                "ip6",
+                "claudette",
+                "forward",
+                error_prefix="Flush IPv6 forward chain",
+            )
+
+            # Block access to IPv6 private ranges
+            for net in self.IPV6_PRIVATE_NETWORKS:
+                # Add logging rule
+                self._run_nft(
+                    "add",
+                    "rule",
+                    "ip6",
+                    "claudette",
+                    "forward",
+                    "iifname",
+                    f'"{self.bridge_name}"',
+                    "ip6",
+                    "daddr",
+                    net,
+                    "log",
+                    "prefix",
+                    '"[CLDT-BLOCK] "',
+                    error_prefix=f"Log IPv6 access to {net}",
+                )
+                # Add reject rule
+                self._run_nft(
+                    "add",
+                    "rule",
+                    "ip6",
+                    "claudette",
+                    "forward",
+                    "iifname",
+                    f'"{self.bridge_name}"',
+                    "ip6",
+                    "daddr",
+                    net,
+                    "reject",
+                    error_prefix=f"Block IPv6 access to {net}",
+                )
+
+            # Reject all remaining IPv6 traffic from bridge (container isolation)
+            self._run_nft(
+                "add",
+                "rule",
+                "ip6",
+                "claudette",
+                "forward",
+                "iifname",
+                f'"{self.bridge_name}"',
+                "log",
+                "prefix",
+                '"[CLDT-BLOCK] "',
+                error_prefix="Log remaining IPv6 traffic",
+            )
+            self._run_nft(
+                "add",
+                "rule",
+                "ip6",
+                "claudette",
+                "forward",
+                "iifname",
+                f'"{self.bridge_name}"',
+                "reject",
+                error_prefix="Add IPv6 bridge REJECT rule",
+            )
+
+            return True
+        except Exception as e:
+            print(f"W: Error setting up nftables IPv6 firewall rules: {e}")
+            return False
+
+    def _setup_bridge(self) -> bool:
+        """Setup new bridge with networking"""
+        # Find unused network
+        network_info = self._find_unused_network()
+        if not network_info:
+            print("E: Could not find unused network in 10.0.0.0/8 range")
+            return False
+
+        network, network_cidr, gateway = network_info
+        print(f"I: Selected network: {network_cidr}")
+
+        # Create bridge
+        if not self._create_bridge():
+            return False
+
+        # Enable IP forwarding
+        self._enable_ip_forwarding()
+
+        # Enable net.ipv4.conf.<bridge>.route_localnet
+        self._enable_route_localnet()
+
+        # Configure bridge IP
+        if not self._configure_bridge_ip(gateway):
+            return False
+
+        # Setup firewall rules based on available backend
+        if self.firewall_backend == "iptables":
+            # Setup iptables chains
+            if not self._setup_iptables_chains(network_cidr):
+                return False
+
+            # Configure NAT rules
+            if not self._setup_ipv4_firewall_ipt(network_cidr):
+                return False
+
+            # Setup IPv6 firewall (container isolation)
+            self._setup_ipv6_firewall_ipt()
+
+        elif self.firewall_backend == "nftables":
+            # Setup nftables IPv4 firewall
+            if not self._setup_ipv4_firewall_nft(network_cidr):
+                return False
+
+            # Setup nftables IPv6 firewall
+            self._setup_ipv6_firewall_nft()
+
+        else:
+            print("W: No firewall backend available, network isolation disabled")
+            # Continue without firewall rules - basic connectivity will work
+
+        # Store configuration
+        self.network = network
+        self.network_cidr = network_cidr
+        self.gateway = gateway
+
+        return True
+
+    def cleanup(self):
+        """Remove bridge and firewall rules"""
+        if not self._bridge_exists():
+            print("I: Bridge does not exist, nothing to clean up")
+            return
+
+        success = True
+
+        # Remove firewall rules first
+        if self.firewall_backend == "iptables":
+            print("I: Removing iptables rules...")
+            # Remove chains from filter and nat tables
+            if self._iptables_chain_exists("cldt-fwd"):
+                # Remove jump rule from FORWARD chain
+                _run_secure_subprocess(
+                    [
+                        "iptables",
+                        "-D",
+                        "FORWARD",
+                        "-i",
+                        self.bridge_name,
+                        "-s",
+                        self.network_cidr,
+                        "-j",
+                        "cldt-fwd",
+                    ],
+                    capture_output=True,
+                    check=False,
+                )
+                # Flush and delete the chain
+                self._run_iptables("-F", "cldt-fwd", error_prefix="Flush cldt-fwd")
+                self._run_iptables("-X", "cldt-fwd", error_prefix="Delete cldt-fwd")
+
+            # Remove cldt-rej chain if it exists
+            if self._iptables_chain_exists("cldt-rej"):
+                # Flush and delete the chain
+                self._run_iptables("-F", "cldt-rej", error_prefix="Flush cldt-rej")
+                self._run_iptables("-X", "cldt-rej", error_prefix="Delete cldt-rej")
+
+            # Remove cldt-out chain if it exists
+            if self._iptables_chain_exists("cldt-out"):
+                # Remove jump rules from OUTPUT chain
+                if self.gateway:
+                    # Remove bridge interface rule
+                    _run_secure_subprocess(
+                        [
+                            "iptables",
+                            "-D",
+                            "OUTPUT",
+                            "-o",
+                            self.bridge_name,
+                            "-s",
+                            self.gateway,
+                            "-d",
+                            self.network_cidr,
+                            "-j",
+                            "cldt-out",
+                        ],
+                        capture_output=True,
+                        check=False,
+                    )
+                # Flush and delete the chain
+                self._run_iptables("-F", "cldt-out", error_prefix="Flush cldt-out")
+                self._run_iptables("-X", "cldt-out", error_prefix="Delete cldt-out")
+
+            if self._iptables_chain_exists("cldt-nat-post", "nat"):
+                # Remove jump rule from POSTROUTING chain
+                if self.network_cidr:
+                    _run_secure_subprocess(
+                        [
+                            "iptables",
+                            "-t",
+                            "nat",
+                            "-D",
+                            "POSTROUTING",
+                            "-s",
+                            self.network_cidr,
+                            "-j",
+                            "cldt-nat-post",
+                        ],
+                        capture_output=True,
+                        check=False,
+                    )
+
+                    _run_secure_subprocess(
+                        [
+                            "iptables",
+                            "-t",
+                            "nat",
+                            "-D",
+                            "POSTROUTING",
+                            "-o",
+                            self.bridge_name,
+                            "-s",
+                            "127.0.0.1/8",
+                            "-j",
+                            "cldt-nat-post",
+                        ],
+                        capture_output=True,
+                        check=False,
+                    )
+
+                # Flush and delete the chain
+                self._run_iptables(
+                    "-F",
+                    "cldt-nat-post",
+                    table="nat",
+                    error_prefix="Flush cldt-nat-post",
+                )
+                self._run_iptables(
+                    "-X",
+                    "cldt-nat-post",
+                    table="nat",
+                    error_prefix="Delete cldt-nat-post",
+                )
+
+            # Remove cldt-nat-out chain if it exists
+            if self._iptables_chain_exists("cldt-nat-out", "nat"):
+                # Remove jump rule from OUTPUT chain
+                _run_secure_subprocess(
+                    [
+                        "iptables",
+                        "-t",
+                        "nat",
+                        "-D",
+                        "OUTPUT",
+                        "-j",
+                        "cldt-nat-out",
+                    ],
+                    capture_output=True,
+                    check=False,
+                )
+                # Flush and delete the chain
+                self._run_iptables(
+                    "-F", "cldt-nat-out", table="nat", error_prefix="Flush cldt-nat-out"
+                )
+                self._run_iptables(
+                    "-X",
+                    "cldt-nat-out",
+                    table="nat",
+                    error_prefix="Delete cldt-nat-out",
+                )
+
+            # Remove cldt-nat-pre chain if it exists
+            if self._iptables_chain_exists("cldt-nat-pre", "nat"):
+                # Remove jump rule from PREROUTING chain
+                _run_secure_subprocess(
+                    [
+                        "iptables",
+                        "-t",
+                        "nat",
+                        "-D",
+                        "PREROUTING",
+                        "-j",
+                        "cldt-nat-pre",
+                    ],
+                    capture_output=True,
+                    check=False,
+                )
+                # Flush and delete the chain
+                self._run_iptables(
+                    "-F", "cldt-nat-pre", table="nat", error_prefix="Flush cldt-nat-pre"
+                )
+                self._run_iptables(
+                    "-X",
+                    "cldt-nat-pre",
+                    table="nat",
+                    error_prefix="Delete cldt-nat-pre",
+                )
+
+            # Remove IPv6 rules if they exist
+            if self.has_ip6tables:
+                if self._ip6tables_chain_exists("cldt-fwd6"):
+                    # Remove jump rule from FORWARD chain
+                    _run_secure_subprocess(
+                        [
+                            "ip6tables",
+                            "-D",
+                            "FORWARD",
+                            "-i",
+                            self.bridge_name,
+                            "-j",
+                            "cldt-fwd6",
+                        ],
+                        capture_output=True,
+                        check=False,
+                    )
+                    # Flush and delete the chain
+                    self._run_ip6tables(
+                        "-F", "cldt-fwd6", error_prefix="Flush cldt-fwd6"
+                    )
+                    self._run_ip6tables(
+                        "-X", "cldt-fwd6", error_prefix="Delete cldt-fwd6"
+                    )
+
+                # Remove cldt-rej6 chain if it exists
+                if self._ip6tables_chain_exists("cldt-rej6"):
+                    # Flush and delete the chain
+                    self._run_ip6tables(
+                        "-F", "cldt-rej6", error_prefix="Flush cldt-rej6"
+                    )
+                    self._run_ip6tables(
+                        "-X", "cldt-rej6", error_prefix="Delete cldt-rej6"
+                    )
+
+        elif self.firewall_backend == "nftables":
+            print("I: Removing nftables rules...")
+            # Remove nftables tables
+            if self._nft_table_exists("ip", "claudette"):
+                self._run_nft(
+                    "delete",
+                    "table",
+                    "ip",
+                    "claudette",
+                    error_prefix="Delete IPv4 table",
+                )
+            if self._nft_table_exists("ip6", "claudette"):
+                self._run_nft(
+                    "delete",
+                    "table",
+                    "ip6",
+                    "claudette",
+                    error_prefix="Delete IPv6 table",
+                )
+
+        # Remove the bridge interface
+        print(f"I: Removing bridge {self.bridge_name}...")
+        result = _run_secure_subprocess(
+            ["ip", "link", "delete", self.bridge_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            print(f"W: Failed to remove bridge: {result.stderr}")
+            success = False
+        else:
+            print(f"I: Bridge {self.bridge_name} removed successfully")
+
+        if success:
+            self.configured = False
+            self.network = None
+            self.network_cidr = None
+            self.gateway = None
+
+
+class Claudette:
+    def __init__(self):
+        self.container = "ai-dev"
+        self.workspace = "workspace"
+        self.user = "developer"
+        self.user_home = f"/home/{self.user}"
+
+        # Set script directory and tool availability
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.has_debootstrap = shutil.which("debootstrap") is not None
+        self.has_skopeo = shutil.which("skopeo") is not None
+        self.has_umoci = shutil.which("umoci") is not None
+
+        # Check if running as root
+        if os.getuid() != 0:
+            print("E: Must run as root")
+            sys.exit(1)
+
+        # Initialize network as None - will be setup in run_up if needed
+        self.network = None
+
+        # Port mappings: list of (proto, host_port, container_port) tuples
+        self.port_mappings = []
+
+        # Check systemd version for feature support
+        self.systemd_version = _check_systemd_version()
+
+        # Check required scripts and tools
+        self._check_required_scripts()
+        self._check_required_tools()
+
+        # Determine bootstrap method
+        self._set_bootstrap_method()
+
+    def _check_required_tools(self):
+        """Check that required systemd tools are available"""
+        required_tools = [
+            "ip",
+            "machinectl",
+            "nsenter",
+            "sysctl",
+            "systemd-machine-id-setup",
+            "systemd-nspawn",
+        ]
+
+        # Add setfacl for systemd < 250
+        if self.systemd_version < 250:
+            required_tools.append("setfacl")
+            required_tools.append("setpriv")
+
+        missing_tools = []
+        for tool in required_tools:
+            if not shutil.which(tool):
+                missing_tools.append(tool)
+
+        if missing_tools:
+            print(f"E: Missing required tools: {', '.join(missing_tools)}")
+            sys.exit(1)
+
+        # Check for firewall tools (iptables preferred, nftables as fallback)
+        has_iptables = shutil.which("iptables") is not None
+        has_nft = shutil.which("nft") is not None
+
+        if not has_iptables and not has_nft:
+            print(
+                "W: Neither iptables nor nftables available - network isolation will be disabled"
+            )
+            # Continue without error - basic networking will still work
+
+        # Check for container image creation tools
+        if not self.has_debootstrap and not (self.has_skopeo and self.has_umoci):
+            print(
+                "E: Need either 'debootstrap' or both 'skopeo' and 'umoci' for container creation"
+            )
+            sys.exit(1)
+
+    def _check_required_scripts(self):
+        """Check that required cn-* scripts are available and set paths"""
+        # Check cn-debootstrap.sh
+        self.cn_debootstrap = os.path.join(self.script_dir, "cn-debootstrap.sh")
+        if not os.path.exists(self.cn_debootstrap):
+            print("E: Missing required script: cn-debootstrap.sh")
+            sys.exit(1)
+
+        # Check cn-oci.sh
+        self.cn_oci = os.path.join(self.script_dir, "cn-oci.sh")
+        if not os.path.exists(self.cn_oci):
+            print("E: Missing required script: cn-oci.sh")
+            sys.exit(1)
+
+        # Check cn-setup-container.sh
+        self.cn_setup_container = os.path.join(self.script_dir, "cn-setup-container.sh")
+        if not os.path.exists(self.cn_setup_container):
+            print("E: Missing required script: cn-setup-container.sh")
+            sys.exit(1)
+
+    def _set_bootstrap_method(self):
+        """Determine bootstrap method based on environment variable or auto-detection"""
+        method_raw = os.environ.get("CLAUDETTE_NSPAWN_BOOTSTRAP", "")
+
+        # Validate environment variable
+        if method_raw and not _validate_env_var(
+            method_raw, {"oci", "debootstrap", ""}, 16
+        ):
+            print(f"E: Invalid bootstrap method environment variable")
+            sys.exit(1)
+
+        method = method_raw.lower()
+
+        if method == "oci":
+            if not (self.has_skopeo and self.has_umoci):
+                print("E: OCI method requested but skopeo and/or umoci not available")
+                sys.exit(1)
+            self.bootstrap_method = "OCI"
+            self.bootstrap_script = self.cn_oci
+            self.base_image = "debian:trixie-slim"
+        elif method == "debootstrap":
+            if not self.has_debootstrap:
+                print("E: debootstrap method requested but debootstrap not available")
+                sys.exit(1)
+            self.bootstrap_method = "debootstrap"
+            self.bootstrap_script = self.cn_debootstrap
+            self.base_image = "debian:trixie"
+        elif method == "":
+            # Auto-detect: prefer OCI if available
+            if self.has_skopeo and self.has_umoci:
+                self.bootstrap_method = "OCI"
+                self.bootstrap_script = self.cn_oci
+                self.base_image = "debian:trixie-slim"
+            else:
+                self.bootstrap_method = "debootstrap"
+                self.bootstrap_script = self.cn_debootstrap
+                self.base_image = "debian:trixie"
+        else:
+            print(
+                f"E: Invalid bootstrap method '{_sanitize_log_output(method)}'. Use 'oci' or 'debootstrap'"
+            )
+            sys.exit(1)
+
+        # Check for base image override with validation
+        base_override = os.environ.get("CLAUDETTE_NSPAWN_BOOTSTRAP_BASE", "")
+        if base_override:
+            if not _validate_image_name(base_override):
+                print(
+                    f"E: Invalid base image '{_sanitize_log_output(base_override)}' - must be valid image name"
+                )
+                sys.exit(1)
+            self.base_image = base_override
+
+    def _confirm(self, prompt_text):
+        """Prompt user for confirmation. Returns True if user confirms."""
+        try:
+            response = input(f"{prompt_text}? [y/N]: ")
+            return response.lower() in ["y", "yes"]
+        except (EOFError, KeyboardInterrupt):
+            print()  # Add newline after Ctrl+C
+            return False
+
+    def _get_host_uid(self, container_name):
+        """Get the mapped host UID for the container user"""
+        # For systemd < 250, we use fixed UID mapping: CONTAINER_BASE_UID:65536
+        # So container UID maps directly: container_uid + CONTAINER_BASE_UID = host_uid
+
+        # Get the actual UID for self.user from container's /etc/passwd
+        container_uid = None
+        mdir = os.path.join(SYSTEMD_MACHINES, f"claudette.{container_name}")
+        passwd_path = os.path.join(mdir, "etc", "passwd")
+
+        if not os.path.exists(passwd_path):
+            raise ValueError(f"Container passwd file not found at {passwd_path}")
+
+        with open(passwd_path, "r") as f:
+            for line in f:
+                fields = line.strip().split(":")
+                if len(fields) >= 3 and fields[0] == self.user:
+                    container_uid = int(fields[2])
+                    break
+
+        if container_uid is None:
+            raise ValueError(
+                f"Cannot find user '{self.user}' in container's /etc/passwd at {passwd_path}"
+            )
+
+        # With fixed mapping, host UID = CONTAINER_BASE_UID + container UID
+        return CONTAINER_BASE_UID + container_uid
+
+    def _setfacl(self, path, container_name):
+        """Add ACLs for workspace access when idmap is not available"""
+        if not path or not os.path.exists(path):
+            return
+
+        # For systemd < 250, we use fixed UID mapping
+        if self.systemd_version >= 250:
+            # Shouldn't be called for systemd >= 250, but handle it anyway
+            return
+
+        try:
+            host_uid = self._get_host_uid(container_name)
+        except ValueError as e:
+            print(f"W: {e}")
+            return
+
+        # Check if ACLs are already applied to the workspace directory (without -R)
+        check_cmd = ["getfacl", "-n", path]
+        try:
+            result = _run_secure_subprocess(
+                check_cmd, capture_output=True, text=True, check=True
+            )
+            # while we created with 'u:...:rwX', get facl shows 'user:...:rwx'
+            if f"user:{host_uid}:rwx" in result.stdout:
+                # print(f"I: ACLs for uid={host_uid} already in {path}")
+                return
+        except subprocess.CalledProcessError:
+            # getfacl failed, continue with applying ACLs
+            pass
+
+        # Base setfacl commands
+        base_acl_cmd = ["setfacl", "-R", "-m", f"u:{host_uid}:rwX", path]
+        base_acl_default_cmd = ["setfacl", "-R", "-d", "-m", f"u:{host_uid}:rwX", path]
+        remove_acl_cmd = ["setfacl", "-b", "-R", path]
+
+        # Check if SUDO_UID is set and valid
+        sudo_uid = os.environ.get("SUDO_UID", "")
+        try:
+            sudo_uid_int = int(sudo_uid) if sudo_uid else 0
+        except ValueError:
+            sudo_uid_int = 0
+
+        if sudo_uid_int == 0:
+            # SUDO_UID not set properly - show manual instructions
+            print(
+                f"W: SUDO_UID not set. To properly manage ACLs, run these commands as your regular user:"
+            )
+            print()
+            print(f"   {' '.join(base_acl_cmd)}")
+            print(f"   {' '.join(base_acl_default_cmd)}")
+            print()
+            print(f"   Undo with: {' '.join(remove_acl_cmd)}")
+            return
+
+        # Build commands with setpriv to drop privileges
+        acl_cmd = [
+            "setpriv",
+            f"--reuid={sudo_uid_int}",
+            f"--regid={sudo_uid_int}",
+            "--clear-groups",
+            "--",
+        ] + base_acl_cmd
+        acl_default_cmd = [
+            "setpriv",
+            f"--reuid={sudo_uid_int}",
+            f"--regid={sudo_uid_int}",
+            "--clear-groups",
+            "--",
+        ] + base_acl_default_cmd
+
+        # Show what will be executed and confirm
+        print(f"I: ACL commands to execute as non-root (uid={sudo_uid_int}):")
+        print(f"   {' '.join(base_acl_cmd)}")
+        print(f"   {' '.join(base_acl_default_cmd)}")
+        print()
+
+        if not self._confirm("Apply ACLs for container workspace access"):
+            print("I: Skipped ACL setup")
+            return
+
+        # Execute ACL commands
+        result = _run_secure_subprocess(acl_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"W: Failed to add ACL: {result.stderr}")
+
+        # Set default ACLs for new files
+        result_default = _run_secure_subprocess(
+            acl_default_cmd, capture_output=True, text=True
+        )
+        if result_default.returncode != 0:
+            print(f"W: Failed to add default ACL: {result_default.stderr}")
+
+        print(f"I: Finished setting ACLs. Undo with '{' '.join(remove_acl_cmd)}'")
+
+    def _machine_poweroff(self, container_name=None):
+        """Stop the container if it's running"""
+        if container_name is None:
+            container_name = self.container
+
+        pid = self._is_container_running(container_name)
+        if not pid:
+            print(f"W: Container '{container_name}' not found or not running")
+            return
+
+        # Clean up port forwarding rules before stopping container
+        self._cleanup_port_mappings_for_container(container_name)
+
+        # Actually stop the container
+        _run_secure_subprocess(["machinectl", "poweroff", container_name])
+        _run_secure_subprocess(
+            ["machinectl", "terminate", container_name], stderr=subprocess.DEVNULL
+        )
+
+    def _get_machine_dir(self):
+        return os.path.join(SYSTEMD_MACHINES, f"claudette.{self.container}")
+
+    def _remove_machine_dir(self, mdir, prompt=True):
+        """Remove a machine directory with safety checks"""
+        con = os.path.basename(mdir).split(".", maxsplit=1)[1]
+
+        # Prompt for confirmation unless disabled
+        if prompt:
+            if not self._confirm(f"Remove container '{con}' ('{mdir}')"):
+                print(f"I: Skipped removal of '{con}'")
+                return
+
+        try:
+            _rmtree(mdir)  # calls _verify_safe_dir()
+            print(f"I: Removed container '{con}' ('{mdir}')")
+        except Exception as e:
+            print(f"E: Problem removing '{con}': {e}")
+
+    def _is_container_running(self, container_name=None):
+        """Check if container is running and return PID if so, None otherwise"""
+        if container_name is None:
+            container_name = self.container
+
+        try:
+            result = _run_secure_subprocess(
+                ["machinectl", "show", container_name, "-p", "Leader", "--value"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            pid = result.stdout.strip()
+            return pid if pid else None
+        except subprocess.CalledProcessError:
+            return None
+
+    def _get_running_claudette_containers(self):
+        """Get list of all running claudette containers"""
+        running = []
+
+        # Check all claudette.* directories
+        if os.path.exists(SYSTEMD_MACHINES):
+            for mdir in glob.glob(f"{SYSTEMD_MACHINES}/claudette.*"):
+                # Skip cache directory
+                if mdir.endswith(".__cache"):
+                    continue
+
+                # Extract container name from directory
+                container_name = os.path.basename(mdir).replace("claudette.", "")
+
+                # Check if this container is running
+                if self._is_container_running(container_name):
+                    running.append(container_name)
+
+        return running
+
+    def _get_cache_dir(self):
+        """Get the cache directory path"""
+        cache_dir = os.path.join(SYSTEMD_MACHINES, "claudette.__cache")
+        if os.path.exists(cache_dir):
+            _verify_safe_dir(cache_dir)
+
+        return cache_dir
+
+    def _get_port_mappings_path(self):
+        """Return the path to the persistent port mapping state file."""
+        return os.path.join(self._get_cache_dir(), PORT_MAPPINGS_FILENAME)
+
+    def _ensure_cache_dir(self):
+        """Ensure the cache directory exists with restrictive permissions."""
+        cache_dir = self._get_cache_dir()
+        if not os.path.exists(cache_dir):
+            _mkdir(cache_dir)  # calls _verify_safe_dir()
+        else:
+            _verify_safe_dir(cache_dir)
+        os.chmod(cache_dir, 0o700, follow_symlinks=False)
+        return cache_dir
+
+    @contextmanager  # ensures flock acquisition/release is paired at the call site
+    def _port_mapping_lock(self, exclusive: bool, create: bool = False):
+        """
+        Acquire an advisory lock around the port mapping state file.
+
+        Args:
+            exclusive: When True, take an exclusive lock suitable for writes.
+            create: When True, create the file if it does not exist.
+        """
+        path = self._get_port_mappings_path()
+        handle = None
+        try:
+            if create:
+                self._ensure_cache_dir()
+                handle = open(path, "a+", encoding="utf-8")
+            else:
+                try:
+                    handle = open(path, "r+", encoding="utf-8")
+                except FileNotFoundError:
+                    yield None
+                    return
+
+            lock_type = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(handle.fileno(), lock_type)
+            handle.seek(0)
+            yield handle
+        finally:
+            if handle is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                handle.close()
+
+    def _serialize_port_mapping_state(self, state: Dict[str, Any]) -> str:
+        """Serialize the in-memory state to JSON."""
+        return json.dumps(state, separators=(",", ":")) + "\n"
+
+    def _load_port_mapping_state(
+        self, handle: Optional[Any]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Load and sanitize persisted port mapping state."""
+        if handle is None:
+            return {}
+        handle.seek(0)
+        raw_state = self._parse_port_mapping_state(handle.read())
+        sanitized_state: Dict[str, Dict[str, Any]] = {}
+        for key, entry in raw_state.items():
+            sanitized_entry = self._sanitize_state_entry(key, entry)
+            if sanitized_entry:
+                sanitized_state[key] = sanitized_entry
+        return sanitized_state
+
+    def _serialize_port_state_for_storage(
+        self, state: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        serialized: Dict[str, Dict[str, Any]] = {}
+        for key, entry in state.items():
+            sanitized_entry = self._sanitize_state_entry(key, entry)
+            if not sanitized_entry:
+                continue
+            stored_entry: Dict[str, Any] = {
+                "container": sanitized_entry["container"],
+                "container_port": sanitized_entry["container_port"],
+            }
+            if sanitized_entry["ip"]:
+                stored_entry["ip"] = sanitized_entry["ip"]
+            serialized[key] = stored_entry
+        return serialized
+
+    def _persist_port_mapping_state(self, state: Dict[str, Dict[str, Any]]):
+        """Persist state to disk or remove the file when empty."""
+        path = self._get_port_mappings_path()
+        serialized_state = self._serialize_port_state_for_storage(state)
+        if serialized_state:
+            self._ensure_cache_dir()
+            serialized = self._serialize_port_mapping_state(serialized_state)
+            _write(path, serialized, mode=0o0600)
+        else:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def _sanitize_state_entry(
+        self, key: str, entry: object
+    ) -> Optional[Dict[str, Any]]:
+        """Validate a persisted flat entry and return canonical dict."""
+        if not isinstance(key, str) or ":" not in key:
+            return None
+        if not isinstance(entry, dict):
+            return None
+
+        proto, host_port_str = key.split(":", 1)
+        container_name = entry.get("container")
+        container_port = entry.get("container_port")
+
+        if not isinstance(container_name, str) or not _validate_container_name(
+            container_name
+        ):
+            return None
+
+        mapping_spec = f"{proto}:{host_port_str}:{container_port}"
+        validated = _validate_port_mapping(mapping_spec)
+        if validated is None:
+            return None
+
+        proto_val, host_port_val, container_port_val = validated
+        ip_value = entry.get("ip", "")
+        if isinstance(ip_value, str) and _validate_ip_address(ip_value):
+            sanitized_ip = ip_value
+        else:
+            sanitized_ip = ""
+
+        return {
+            "proto": proto_val,
+            "host_port": host_port_val,
+            "container_port": container_port_val,
+            "container": container_name,
+            "ip": sanitized_ip,
+        }
+
+    def _extract_ports_from_state(self, entries):
+        """Return sanitized tuples and preferred IP from stored entries."""
+        sanitized = []
+        container_ip = ""
+        for entry in entries or []:
+            proto = entry.get("proto")
+            host_port = entry.get("host_port")
+            container_port = entry.get("container_port")
+            ip_value = entry.get("ip", "")
+            if proto and isinstance(host_port, int) and isinstance(container_port, int):
+                sanitized.append((proto, host_port, container_port))
+                if not container_ip and ip_value:
+                    container_ip = ip_value
+        return sanitized, container_ip
+
+    def _parse_port_mapping_state(self, raw: str) -> dict:
+        """Parse state content."""
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            print(
+                f"W: Port mapping state is invalid JSON: {_sanitize_log_output(str(exc))}"
+            )
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return data
+
+    def _remove_port_mappings_from_state(self, container_name: str) -> list:
+        """Remove a container's entry from state and return its ports."""
+        with self._port_mapping_lock(exclusive=True, create=False) as handle:
+            if handle is None:
+                return []
+
+            state = self._load_port_mapping_state(handle)
+            targeted = [
+                entry.copy()
+                for entry in state.values()
+                if entry.get("container") == container_name
+            ]
+            if not targeted and not state:
+                return []
+
+            # Drop any entries for this container.
+            state = {
+                key: entry
+                for key, entry in state.items()
+                if entry.get("container") != container_name
+            }
+
+            self._persist_port_mapping_state(state)
+        return targeted
+
+    def _clear_port_mapping_state(self):
+        """Remove the entire port mapping state file, if present."""
+        path = self._get_port_mappings_path()
+        if not os.path.exists(path):
+            return
+        with self._port_mapping_lock(exclusive=True, create=False) as handle:
+            if handle is None:
+                return
+            self._persist_port_mapping_state({})
+
+    def _dedupe_port_mappings(self, mappings):
+        """Remove duplicate host port mappings while preserving order."""
+        deduped = []
+        seen = set()
+        for proto, host_port, container_port in mappings:
+            key = (proto, host_port)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append((proto, host_port, container_port))
+        return deduped
+
+    def _ensure_network_ready(self) -> bool:
+        """Ensure the network helper is available and configured."""
+        if self.network and self.network.configured:
+            return True
+        self.network = ClaudetteNet()
+        return bool(self.network and self.network.configured)
+
+    def _update_port_mapping_state(self, container_name: str, container_ip: str):
+        """Update persistent state for the container, aborting on port conflicts."""
+        deduped = self._dedupe_port_mappings(self.port_mappings)
+        sanitized_ip = ""
+        if container_ip and _validate_ip_address(container_ip):
+            sanitized_ip = container_ip
+
+        create_file = bool(deduped)
+        with self._port_mapping_lock(exclusive=True, create=create_file) as handle:
+            if handle is None and not deduped:
+                return
+
+            state = self._load_port_mapping_state(handle)
+
+            # Remove stale or invalid entries owned by this container so we can rewrite them cleanly.
+            keys_to_clear = [
+                key
+                for key, entry in state.items()
+                if entry.get("container") == container_name
+            ]
+            for key in keys_to_clear:
+                state.pop(key, None)
+
+            if not deduped:
+                self._persist_port_mapping_state(state)
+                return
+
+            for proto, host_port, container_port in deduped:
+                key = f"{proto}:{host_port}"
+                existing = state.get(key)
+                if existing and existing.get("container") != container_name:
+                    print(
+                        "E: Port "
+                        f"{_sanitize_log_output(proto)}:{_sanitize_log_output(str(host_port))} "
+                        f"is already allocated to container "
+                        f"'{_sanitize_log_output(existing['container'])}'"
+                    )
+                    print("   Stop the existing container or choose a different port")
+                    sys.exit(1)
+
+                state[key] = {
+                    "proto": proto,
+                    "host_port": host_port,
+                    "container_port": container_port,
+                    "container": container_name,
+                }
+                if sanitized_ip:
+                    state[key]["ip"] = sanitized_ip
+
+            self._persist_port_mapping_state(state)
+
+    def _cleanup_port_mappings_for_container(self, container_name: str):
+        """Remove firewall rules and state for a specific container."""
+        saved_container = self.container
+        saved_mappings = list(self.port_mappings)
+        try:
+            self.container = container_name
+            state_ports = self._remove_port_mappings_from_state(container_name)
+            if not state_ports:
+                return
+
+            sanitized, container_ip = self._extract_ports_from_state(state_ports)
+            if not sanitized:
+                return
+
+            if not container_ip:
+                container_ip = self._get_container_ip()
+
+            if not container_ip:
+                print(
+                    f"W: Could not determine IP for '{_sanitize_log_output(container_name)}' during cleanup"
+                )
+                return
+
+            self.port_mappings = sanitized
+            if not self._ensure_network_ready():
+                print("W: Could not initialize network while removing port mappings")
+                return
+
+            backend = self.network.firewall_backend if self.network else None
+            if backend == "iptables":
+                self._cleanup_port_forwarding_ipt(container_ip)
+            elif backend == "nftables":
+                self._cleanup_port_forwarding_nft(container_ip)
+        finally:
+            self.container = saved_container
+            self.port_mappings = saved_mappings
+
+    def _create_manifest_content(self):
+        """Create manifest content for cache identification"""
+        return [
+            f"bootstrap_method={self.bootstrap_method}",
+            f"base_image={self.base_image}",
+            f"user={self.user}",
+            f"bootstrap_script_hash={self._hash_file(self.bootstrap_script)}",
+            f"setup_script_hash={self._hash_file(self._get_setup_script_path())}",
+        ]
+
+    def _compute_cache_key(self):
+        """Compute cache key by hashing manifest content"""
+        manifest_content = "\n".join(self._create_manifest_content()) + "\n"
+        return hashlib.sha256(manifest_content.encode("utf-8")).hexdigest()
+
+    def _hash_file(self, filepath):
+        """Compute SHA256 hash of a file"""
+        hasher = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            hasher.update(f.read())
+        return hasher.hexdigest()
+
+    def _get_setup_script_path(self):
+        """Get path to setup script (custom or default)"""
+        custom_setup = os.environ.get("CLAUDETTE_NSPAWN_SETUP_SCRIPT", "")
+        if custom_setup and os.path.exists(custom_setup):
+            return custom_setup
+        else:
+            return self.cn_setup_container
+
+    def _get_cache_path(self):
+        """Get full path to cache file"""
+        cache_dir = self._get_cache_dir()
+        cache_key = self._compute_cache_key()
+        return os.path.join(cache_dir, f"{cache_key}.tar")
+
+    def _create_cache(self, srcdir):
+        """Create cache tar file from built container directory"""
+        _verify_safe_dir(srcdir)
+
+        # Ensure cache directory exists
+        self._ensure_cache_dir()
+        cache_path = self._get_cache_path()
+
+        # Create manifest with all cached parameters
+        manifest_path = os.path.join(srcdir, ".claudette.manifest")
+        assert not os.path.exists(manifest_path)  # should never happen
+        manifest_content = "\n".join(self._create_manifest_content()) + "\n"
+        print(f"I: Creating cache '{cache_path}' with manifest:\n{manifest_content}")
+
+        _write(manifest_path, manifest_content)
+
+        # Create tar with full preservation of all attributes
+        # --numeric-owner preserves exact uid/gid
+        # --preserve-permissions preserves all permission bits
+        # --xattrs preserves extended attributes (including SELinux)
+        # --acls preserves POSIX ACLs
+        # --sparse handles sparse files efficiently
+        # Exclude machine-id and hosts since they need to be unique per container
+        cmd = [
+            "tar",
+            "--create",
+            "--file",
+            cache_path,
+            "--directory",
+            srcdir,
+            "--numeric-owner",
+            "--preserve-permissions",
+            "--xattrs",
+            "--acls",
+            "--sparse",
+            "--exclude=etc/machine-id",
+            "--exclude=etc/hosts",
+            ".",
+        ]
+
+        result = _run_secure_subprocess(cmd)
+        if result.returncode != 0:
+            print(f"W: Failed to create cache file")
+            # Remove partial cache file
+            if os.path.exists(cache_path):
+                os.unlink(cache_path)
+
+        # Clean up manifest file
+        if os.path.exists(manifest_path):
+            os.unlink(manifest_path)
+
+    def _clear_cache_contents(self, preserve_state: bool = True) -> bool:
+        """Remove cache directory contents, optionally preserving port state file."""
+        cache_dir = self._get_cache_dir()
+        if not os.path.exists(cache_dir):
+            return False
+
+        port_state_path = self._get_port_mappings_path()
+        removed_any = False
+        for entry in os.listdir(cache_dir):
+            entry_path = os.path.join(cache_dir, entry)
+            try:
+                if (
+                    preserve_state
+                    and os.path.exists(port_state_path)
+                    and os.path.samefile(entry_path, port_state_path)
+                ):
+                    continue
+            except FileNotFoundError:
+                continue
+
+            if os.path.isdir(entry_path):
+                _rmtree(entry_path)
+            else:
+                try:
+                    os.remove(entry_path)
+                except FileNotFoundError:
+                    continue
+            removed_any = True
+        return removed_any
+
+    def _new_machine_from_cache(self, cache_path, mdir):
+        """Create new machine from cache template"""
+        _verify_safe_dir(os.path.dirname(cache_path))
+
+        print(f"I: Creating new machine from cache: {cache_path}")
+
+        # we need to create the directory to untar to it with -C/--directory
+        _mkdir(mdir)  # calls _verify_safe_dir()
+
+        # Extract tar with full preservation of all attributes
+        cmd = [
+            "tar",
+            "--extract",
+            "--file",
+            cache_path,
+            "--directory",
+            mdir,
+            "--numeric-owner",
+            "--preserve-permissions",
+            "--xattrs",
+            "--acls",
+            "--sparse",
+        ]
+
+        result = _run_secure_subprocess(cmd)
+        if result.returncode != 0:
+            print(f"E: Failed to create new machine from cache")
+            sys.exit(1)
+
+        # Generate new machine ID for the new container instance
+        _run_secure_subprocess(["systemd-machine-id-setup", f"--root={mdir}"])
+
+        # Create fresh /etc/hosts file with container name
+        network_cidr = None
+        gateway = None
+        if self.network and self.network.configured:
+            if self.network._ensure_gateway():
+                network_cidr = self.network.network_cidr
+                gateway = self.network.gateway
+            else:
+                print(
+                    f"W: Could not refresh network configuration for '{_sanitize_log_output(self.network.bridge_name)}', creating guest files without network init"
+                )
+        _create_guest_files(mdir, self.container, network_cidr, gateway)
+
+        print(f"I: Successfully created new machine from cache")
+
+    def _new_machine_from_scratch(self, mdir, cache_enabled=False):
+        """Build new machine from scratch using bootstrap method"""
+        print(
+            f"I: Using {self.bootstrap_method} method to create '{self.base_image}' container"
+        )
+        cmd = [self.bootstrap_script, mdir, self.base_image]
+        result = _run_secure_subprocess(cmd)
+        if result.returncode != 0:
+            print(f"E: Bootstrap script failed, cleaning up '{mdir}'")
+            self._remove_machine_dir(mdir, prompt=False)
+            sys.exit(1)
+        _verify_safe_dir(mdir)
+
+        _run_secure_subprocess(["systemd-machine-id-setup", f"--root={mdir}"])
+
+        setup_script = os.path.join(mdir, "root", "setup-container.sh")
+        if os.path.exists(setup_script):
+            print(f"W: '{setup_script}' exists, skipping setup")
+        else:
+            source_script = self._get_setup_script_path()
+
+            # Copy and substitute placeholders
+            with open(source_script, "r") as f:
+                content = f.read()
+
+            # Substitute placeholders
+            content = content.replace("%%MACHINE_USER%%", self.user)
+
+            _write(setup_script, content, mode=0o0755)
+
+            # run without --ephemeral, --private-users and restrictive
+            # networking (need to do this at least once without --private-users
+            # to setup the container properly). Also run with:
+            # --directory=/var/lib/machines/claudette.foo
+            # --machine=foo  # this makes it show up as 'foo', not 'claudette.foo'
+            # --timezone=off # needed if self.cn_setup_container upgrades
+            #                # tzdata since nspawn otherwise bind mounts this
+            #                # file into the container. Omitting this allows
+            #                # the upgrade to work (up will omit this)
+            cmd = [
+                "systemd-nspawn",
+                f"--directory={mdir}",
+                f"--machine={self.container}",
+                "--tmpfs=/tmp:mode=1777",
+                "--as-pid2",
+                "--timezone=off",
+                "--user=root",
+                os.path.join("/root", os.path.basename(setup_script)),
+            ]
+            _run_secure_subprocess(cmd)
+
+            # Create fresh /etc/hosts file with container name
+            network_cidr = None
+            gateway = None
+            if self.network and self.network.configured:
+                if self.network._ensure_gateway():
+                    network_cidr = self.network.network_cidr
+                    gateway = self.network.gateway
+                else:
+                    print(
+                        f"W: Could not refresh network configuration for '{_sanitize_log_output(self.network.bridge_name)}', creating guest files without network init"
+                    )
+            _create_guest_files(mdir, self.container, network_cidr, gateway)
+
+            # Create cache if enabled and setup completed successfully
+            if cache_enabled:
+                self._create_cache(mdir)
+
+    def _purge_cache(self):
+        """Remove entire cache directory"""
+        cache_dir = self._get_cache_dir()
+        if os.path.exists(cache_dir):
+            if self._clear_cache_contents(preserve_state=True):
+                print(
+                    f"I: Purged cache directory ('{cache_dir}') except port mapping state"
+                )
+            elif not os.path.exists(self._get_port_mappings_path()):
+                _rmtree(cache_dir)  # calls _verify_safe_dir()
+                print(f"I: Purged cache directory ('{cache_dir}')")
+            else:
+                print(
+                    f"I: Cache directory retained only port mapping state ('{cache_dir}')"
+                )
+        else:
+            print(f"I: No cache directory to purge")
+
+    def _exec(self, command):
+        """Execute command in container using nsenter"""
+        # Get container PID
+        pid = self._is_container_running()
+        if not pid:
+            print(f"E: Container '{self.container}' not found or not running")
+            sys.exit(1)
+
+        # Build command
+        cmd = command
+        intp = f"{self.user_home}/workspace"
+        mdir = self._get_machine_dir()
+        extp = os.path.join(mdir, intp[1:])
+        if self.workspace and os.path.isdir(extp):
+            cmd = f"cd {self.user_home}/workspace && {command}"
+
+        # Execute using nsenter ('machinectl shell' can only be used if
+        # systemd running in the container)
+        nsenter_cmd = [
+            "nsenter",
+            "-t",
+            pid,
+            "-a",
+            "--",
+            "su",
+            "-l",
+            self.user,
+            "-c",
+            f"script -qec \"bash -i -c '{cmd}'\" /dev/null",
+        ]
+
+        _run_secure_subprocess(nsenter_cmd)
+
+    def _exec_as_root(self, command):
+        """Execute command in container as root using nsenter"""
+        # Validate command for basic security
+        if not command or len(command) > 1024:
+            print("E: Invalid command for container execution")
+            sys.exit(1)
+
+        # Get container PID
+        pid = self._is_container_running()
+        if not pid:
+            print(f"E: Container '{self.container}' not found or not running")
+            sys.exit(1)
+
+        # Execute using nsenter as root
+        nsenter_cmd = [
+            "nsenter",
+            "-t",
+            pid,
+            "-a",
+            "--",
+            "sh",
+            "-c",
+            command,
+        ]
+
+        return _run_secure_subprocess(nsenter_cmd)
+
+    def _wait_for_container_ready(self, timeout=30):
+        """Wait for container to be ready for nsenter commands"""
+        import time
+
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            pid = self._is_container_running()
+            if pid:
+                # Test if we can execute a simple command
+                try:
+                    result = _run_secure_subprocess(
+                        ["nsenter", "-t", pid, "-a", "--", "true"],
+                        capture_output=True,
+                        timeout=5,
+                    )
+                    if result.returncode == 0:
+                        return True
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    pass
+            time.sleep(1)
+        return False
+
+    def _get_container_ip(self) -> Optional[str]:
+        """Extract container IP from /init.sh file"""
+        mdir = self._get_machine_dir()
+        init_script_path = os.path.join(mdir, "init.sh")
+
+        if not os.path.exists(init_script_path):
+            return None
+
+        try:
+            with open(init_script_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                match = re.search(r'CONTAINER_IP="(\d+\.\d+\.\d+\.\d+)"', content)
+                if match:
+                    return match.group(1)
+        except Exception as e:
+            print(f"W: Could not read container IP from init script: {e}")
+
+        return None
+
+    def _setup_port_forwarding_rules(self):
+        """Setup port forwarding rules after container starts"""
+        if not self.port_mappings:
+            return
+
+        assert (
+            self.network is not None
+        ), "Network must be configured for port forwarding"
+
+        container_ip = self._get_container_ip()
+        if not container_ip:
+            print("E: Could not determine container IP for port forwarding")
+            return
+
+        self._update_port_mapping_state(self.container, container_ip)
+
+        # Setup rules based on firewall backend
+        if self.network.firewall_backend == "iptables":
+            self._setup_port_forwarding_ipt(container_ip)
+        elif self.network.firewall_backend == "nftables":
+            self._setup_port_forwarding_nft(container_ip)
+        else:
+            print("W: No firewall backend available, port forwarding disabled")
+
+    def _setup_port_forwarding_ipt(self, container_ip: str) -> bool:
+        """Setup port forwarding rules for iptables - called from Claudette"""
+        if not self.port_mappings:
+            return True
+
+        assert (
+            self.network is not None
+        ), "Network must be configured for port forwarding"
+        assert self.network.network_cidr is not None, "Network CIDR must be configured"
+
+        if not self.network._ensure_gateway():
+            print(
+                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+            )
+            return False
+
+        if not self.network.gateway:
+            print(
+                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+            )
+            return False
+
+        try:
+            for proto, host_port, container_port in self.port_mappings:
+                # DNAT in OUTPUT chain (for host-generated traffic to 127.0.0.1)
+                self.network._run_iptables(
+                    "-A",
+                    "cldt-nat-out",
+                    "-p",
+                    proto,
+                    "-d",
+                    "127.0.0.1",
+                    "--dport",
+                    str(host_port),
+                    "-j",
+                    "DNAT",
+                    "--to-destination",
+                    f"{container_ip}:{container_port}",
+                    table="nat",
+                    error_prefix=f"Add OUTPUT DNAT for {proto}:{host_port}→{container_port}",
+                )
+
+                # DNAT in PREROUTING chain (for forwarded traffic)
+                self.network._run_iptables(
+                    "-A",
+                    "cldt-nat-pre",
+                    "-p",
+                    proto,
+                    "-d",
+                    "127.0.0.1",
+                    "--dport",
+                    str(host_port),
+                    "-j",
+                    "DNAT",
+                    "--to-destination",
+                    f"{container_ip}:{container_port}",
+                    table="nat",
+                    error_prefix=f"Add PREROUTING DNAT for {proto}:{host_port}→{container_port}",
+                )
+
+                # SNAT in POSTROUTING chain (rewrite source from 127.0.0.1 to gateway)
+                # This is necessary so the container can route the response back
+                self.network._run_iptables(
+                    "-A",
+                    "cldt-nat-post",
+                    "-p",
+                    proto,
+                    "-s",
+                    "127.0.0.1/8",
+                    "-d",
+                    container_ip,
+                    "--dport",
+                    str(container_port),
+                    "-j",
+                    "SNAT",
+                    "--to-source",
+                    self.network.gateway,
+                    table="nat",
+                    error_prefix=f"Add SNAT for {proto}:{host_port} forwarding",
+                )
+
+                # FORWARD acceptance rule (insert at beginning for priority)
+                self.network._run_iptables(
+                    "-I",
+                    "cldt-fwd",
+                    "1",
+                    "-p",
+                    proto,
+                    "-d",
+                    container_ip,
+                    "--dport",
+                    str(container_port),
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "NEW,ESTABLISHED,RELATED",
+                    "-j",
+                    "ACCEPT",
+                    error_prefix=f"Add FORWARD rule for {proto}:{container_port}",
+                )
+
+                # Allow direct access to container IP from host (insert at beginning for priority)
+                self.network._run_iptables(
+                    "-I",
+                    "cldt-out",
+                    "1",
+                    "-o",
+                    self.network.bridge_name,
+                    "-p",
+                    proto,
+                    "-s",
+                    self.network.gateway,
+                    "-d",
+                    container_ip,
+                    "--dport",
+                    str(container_port),
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "NEW",
+                    "-j",
+                    "ACCEPT",
+                    error_prefix=f"Add cldt-out rule for direct access to {proto}:{container_port}",
+                )
+
+                print(
+                    f"I: Port forwarding: 127.0.0.1:{host_port} → {container_ip}:{container_port} ({proto})"
+                )
+
+            return True
+        except Exception as e:
+            print(f"E: Error setting up port forwarding: {e}")
+            return False
+
+    def _nft_dnat_rule_args(
+        self, chain: str, proto: str, host_port: int, destination: str
+    ) -> list[str]:
+        return [
+            "rule",
+            "ip",
+            "claudette",
+            chain,
+            proto,
+            "dport",
+            str(host_port),
+            "ip",
+            "daddr",
+            "127.0.0.1",
+            "dnat",
+            "to",
+            destination,
+        ]
+
+    def _nft_snat_rule_args(
+        self, gateway: str, proto: str, container_ip: str, container_port: int
+    ) -> list[str]:
+        return [
+            "rule",
+            "ip",
+            "claudette",
+            "postrouting",
+            proto,
+            "dport",
+            str(container_port),
+            "ip",
+            "saddr",
+            "127.0.0.1/8",
+            "ip",
+            "daddr",
+            container_ip,
+            "snat",
+            "to",
+            gateway,
+        ]
+
+    def _nft_forward_accept_args(
+        self, proto: str, container_ip: str, container_port: int
+    ) -> list[str]:
+        return [
+            "rule",
+            "ip",
+            "claudette",
+            "forward",
+            proto,
+            "dport",
+            str(container_port),
+            "ip",
+            "daddr",
+            container_ip,
+            "ct",
+            "state",
+            "new,established,related",
+            "accept",
+        ]
+
+    def _nft_output_allow_args(
+        self,
+        bridge_name: str,
+        gateway: str,
+        proto: str,
+        container_ip: str,
+        container_port: int,
+    ) -> list[str]:
+        return [
+            "rule",
+            "ip",
+            "claudette",
+            "output_filter",
+            "oifname",
+            f'"{bridge_name}"',
+            "ip",
+            "saddr",
+            gateway,
+            "ip",
+            "daddr",
+            container_ip,
+            proto,
+            "dport",
+            str(container_port),
+            "ct",
+            "state",
+            "new",
+            "accept",
+        ]
+
+    def _setup_port_forwarding_nft(self, container_ip: str) -> bool:
+        """Setup port forwarding rules for nftables - called from Claudette"""
+        if not self.port_mappings:
+            return True
+
+        assert (
+            self.network is not None
+        ), "Network must be configured for port forwarding"
+        assert self.network.network_cidr is not None, "Network CIDR must be configured"
+
+        if not self.network._ensure_gateway():
+            print(
+                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+            )
+            return False
+
+        if not self.network.gateway:
+            print(
+                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+            )
+            return False
+
+        assert self.network is not None
+        network = self.network
+        gateway = network.gateway
+        if gateway is None:
+            return False
+        bridge_name = network.bridge_name
+
+        try:
+            for proto, host_port, container_port in self.port_mappings:
+                # DNAT in output chain (for host-generated traffic to 127.0.0.1)
+                destination = f"{container_ip}:{container_port}"
+                self.network._run_nft(
+                    "add",
+                    *self._nft_dnat_rule_args("output", proto, host_port, destination),
+                    error_prefix=f"Add OUTPUT DNAT for {proto}:{host_port}→{container_port}",
+                )
+
+                # DNAT in prerouting chain (for forwarded traffic)
+                self.network._run_nft(
+                    "add",
+                    *self._nft_dnat_rule_args(
+                        "prerouting", proto, host_port, destination
+                    ),
+                    error_prefix=f"Add PREROUTING DNAT for {proto}:{host_port}→{container_port}",
+                )
+
+                # SNAT in postrouting chain (rewrite source from 127.0.0.1 to gateway)
+                # This is necessary so the container can route the response back
+                self.network._run_nft(
+                    "add",
+                    *self._nft_snat_rule_args(
+                        gateway, proto, container_ip, container_port
+                    ),
+                    error_prefix=f"Add SNAT for {proto}:{host_port} forwarding",
+                )
+
+                # FORWARD acceptance rule
+                self.network._run_nft(
+                    "insert",
+                    *self._nft_forward_accept_args(proto, container_ip, container_port),
+                    error_prefix=f"Add FORWARD rule for {proto}:{container_port}",
+                )
+
+                # Allow direct access to container IP from host (insert at beginning for priority)
+                self.network._run_nft(
+                    "insert",
+                    *self._nft_output_allow_args(
+                        bridge_name, gateway, proto, container_ip, container_port
+                    ),
+                    error_prefix=f"Add output_filter rule for direct access to {proto}:{container_port}",
+                )
+
+                print(
+                    f"I: Port forwarding: 127.0.0.1:{host_port} → {container_ip}:{container_port} ({proto})"
+                )
+
+            return True
+        except Exception as e:
+            print(f"E: Error setting up nftables port forwarding: {e}")
+            return False
+
+    def _cleanup_port_forwarding_rules(
+        self, container_ip_override: Optional[str] = None
+    ):
+        """Clean up port forwarding rules when container exits"""
+        if not self.port_mappings:
+            return
+
+        assert self.network is not None, "Network must be configured for cleanup"
+
+        container_ip = container_ip_override or self._get_container_ip()
+        if not container_ip:
+            # Container not running, rules should already be gone or will fail silently
+            return
+
+        # Cleanup rules based on firewall backend
+        if self.network.firewall_backend == "iptables":
+            self._cleanup_port_forwarding_ipt(container_ip)
+        elif self.network.firewall_backend == "nftables":
+            self._cleanup_port_forwarding_nft(container_ip)
+
+    def _cleanup_port_forwarding_ipt(self, container_ip: str) -> bool:
+        """Remove port forwarding rules for iptables - called when container stops"""
+        if not self.port_mappings:
+            return True
+
+        assert self.network is not None, "Network must be configured for cleanup"
+        assert self.network.network_cidr is not None, "Network CIDR must be configured"
+
+        if not self.network._ensure_gateway():
+            print(
+                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+            )
+            return False
+
+        if not self.network.gateway:
+            print(
+                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+            )
+            return False
+        try:
+            for proto, host_port, container_port in self.port_mappings:
+                # Remove DNAT in OUTPUT chain (for host-generated traffic to 127.0.0.1)
+                self.network._run_iptables(
+                    "-D",
+                    "cldt-nat-out",
+                    "-p",
+                    proto,
+                    "-d",
+                    "127.0.0.1",
+                    "--dport",
+                    str(host_port),
+                    "-j",
+                    "DNAT",
+                    "--to-destination",
+                    f"{container_ip}:{container_port}",
+                    table="nat",
+                    error_prefix=f"Remove OUTPUT DNAT for {proto}:{host_port}→{container_port}",
+                )
+                # Remove DNAT in PREROUTING chain (for forwarded traffic)
+                self.network._run_iptables(
+                    "-D",
+                    "cldt-nat-pre",
+                    "-p",
+                    proto,
+                    "-d",
+                    "127.0.0.1",
+                    "--dport",
+                    str(host_port),
+                    "-j",
+                    "DNAT",
+                    "--to-destination",
+                    f"{container_ip}:{container_port}",
+                    table="nat",
+                    error_prefix=f"Remove PREROUTING DNAT for {proto}:{host_port}→{container_port}",
+                )
+                # Remove SNAT in POSTROUTING chain
+                self.network._run_iptables(
+                    "-D",
+                    "cldt-nat-post",
+                    "-p",
+                    proto,
+                    "-s",
+                    "127.0.0.1/8",
+                    "-d",
+                    container_ip,
+                    "--dport",
+                    str(container_port),
+                    "-j",
+                    "SNAT",
+                    "--to-source",
+                    self.network.gateway,
+                    table="nat",
+                    error_prefix=f"Remove SNAT for {proto}:{host_port} forwarding",
+                )
+                # Remove FORWARD acceptance rule
+                self.network._run_iptables(
+                    "-D",
+                    "cldt-fwd",
+                    "-p",
+                    proto,
+                    "-d",
+                    container_ip,
+                    "--dport",
+                    str(container_port),
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "NEW,ESTABLISHED,RELATED",
+                    "-j",
+                    "ACCEPT",
+                    error_prefix=f"Remove FORWARD rule for {proto}:{container_port}",
+                )
+                # Remove direct access rule from host
+                self.network._run_iptables(
+                    "-D",
+                    "cldt-out",
+                    "-o",
+                    self.network.bridge_name,
+                    "-p",
+                    proto,
+                    "-s",
+                    self.network.gateway,
+                    "-d",
+                    container_ip,
+                    "--dport",
+                    str(container_port),
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "NEW",
+                    "-j",
+                    "ACCEPT",
+                    error_prefix=f"Remove cldt-out rule for direct access to {proto}:{container_port}",
+                )
+                print(
+                    f"I: Removed port forwarding: 127.0.0.1:{host_port} → {container_ip}:{container_port} ({proto})"
+                )
+            return True
+        except Exception as e:
+            print(f"E: Error cleaning up iptables port forwarding: {e}")
+            return False
+
+    def _cleanup_port_forwarding_nft(self, container_ip: str) -> bool:
+        """Remove port forwarding rules for nftables - called when container stops"""
+        if not self.port_mappings:
+            return True
+
+        assert self.network is not None, "Network must be configured for cleanup"
+        assert self.network.network_cidr is not None, "Network CIDR must be configured"
+
+        if not self.network._ensure_gateway():
+            print(
+                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+            )
+            return False
+
+        if not self.network.gateway:
+            print(
+                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+            )
+            return False
+        gateway = self.network.gateway
+        if gateway is None:
+            return False
+        bridge_name = self.network.bridge_name
+        try:
+            for proto, host_port, container_port in self.port_mappings:
+                # For nftables, we need to delete rules by matching their exact specification
+                # This is more complex than iptables -D, so we use handle-based deletion
+                # Remove DNAT in output chain (for host-generated traffic to 127.0.0.1)
+                destination = f"{container_ip}:{container_port}"
+                self.network._run_nft(
+                    "delete",
+                    *self._nft_dnat_rule_args("output", proto, host_port, destination),
+                    error_prefix=f"Remove OUTPUT DNAT for {proto}:{host_port}→{container_port}",
+                )
+                # Remove DNAT in prerouting chain (for forwarded traffic)
+                self.network._run_nft(
+                    "delete",
+                    *self._nft_dnat_rule_args(
+                        "prerouting", proto, host_port, destination
+                    ),
+                    error_prefix=f"Remove PREROUTING DNAT for {proto}:{host_port}→{container_port}",
+                )
+                # Remove SNAT in postrouting chain
+                self.network._run_nft(
+                    "delete",
+                    *self._nft_snat_rule_args(
+                        gateway, proto, container_ip, container_port
+                    ),
+                    error_prefix=f"Remove SNAT for {proto}:{host_port} forwarding",
+                )
+                # Remove FORWARD acceptance rule
+                self.network._run_nft(
+                    "delete",
+                    *self._nft_forward_accept_args(proto, container_ip, container_port),
+                    error_prefix=f"Remove FORWARD rule for {proto}:{container_port}",
+                )
+                # Remove direct access to container IP from host
+                self.network._run_nft(
+                    "delete",
+                    *self._nft_output_allow_args(
+                        bridge_name, gateway, proto, container_ip, container_port
+                    ),
+                    error_prefix=f"Remove output_filter rule for direct access to {proto}:{container_port}",
+                )
+                print(
+                    f"I: Removed port forwarding: 127.0.0.1:{host_port} → {container_ip}:{container_port} ({proto})"
+                )
+            return True
+        except Exception as e:
+            print(f"E: Error cleaning up nftables port forwarding: {e}")
+            return False
+
+    def _run_init_script(self, silent=False, network_mode="lenient"):
+        """Execute /init.sh as root if it exists and network is configured"""
+        if network_mode == "host":
+            # Skip init script in host networking mode
+            return
+        if not (self.network and self.network.configured):
+            return
+
+        mdir = self._get_machine_dir()
+        init_script_path = os.path.join(mdir, "init.sh")
+
+        if os.path.exists(init_script_path):
+            if not silent:
+                print("I: Waiting for container to be ready...")
+            if not self._wait_for_container_ready():
+                if not silent:
+                    print("W: Container not ready for network initialization")
+                return
+
+            if not silent:
+                print("I: Executing network initialization script as root")
+            result = self._exec_as_root("/init.sh")
+            if result.returncode != 0:
+                if not silent:
+                    print("W: Network initialization script failed")
+            else:
+                if not silent:
+                    print("I: Network initialization completed")
+
+    def _build(self):
+        """Build container"""
+        mdir = self._get_machine_dir()
+        if os.path.exists(mdir):
+            print(f"W: '{mdir}' exists, skipping container creation")
+            return
+
+        # Check if caching is disabled (enabled by default)
+        cache_disabled = os.environ.get(
+            "CLAUDETTE_NSPAWN_CONTAINER_CACHE", ""
+        ).lower() in [
+            "n",
+            "no",
+            "0",
+            "false",
+        ]
+        cache_enabled = not cache_disabled
+
+        if cache_enabled:
+            cache_path = self._get_cache_path()
+            if os.path.exists(cache_path):
+                print(f"I: Using cached container")
+                self._new_machine_from_cache(cache_path, mdir)
+                return
+
+        # Build container from scratch
+        self._new_machine_from_scratch(mdir, cache_enabled)
+
+    def run_up(self, args):
+        """Build and start container"""
+        # Check if container is already running
+        if self._is_container_running():
+            print(f"E: Container '{self.container}' is already running")
+            sys.exit(1)
+
+        # Parse and validate port mappings
+        if hasattr(args, "ports") and args.ports:
+            if args.network == "host":
+                print(
+                    "E: Port forwarding (--port) is not compatible with --network=host"
+                )
+                sys.exit(1)
+
+            for port_spec in args.ports:
+                validated = _validate_port_mapping(port_spec)
+                if validated is None:
+                    print(
+                        f"E: Invalid port specification '{_sanitize_log_output(port_spec)}'"
+                    )
+                    print(
+                        "   Format: proto:host_port:container_port (e.g., tcp:8080:80)"
+                    )
+                    sys.exit(1)
+                self.port_mappings.append(validated)
+            self.port_mappings = self._dedupe_port_mappings(self.port_mappings)
+        else:
+            self._remove_port_mappings_from_state(self.container)
+
+        # Setup networking based on network mode
+        if args.network == "lenient":
+            # Setup networking (bridge and NAT) if not already done
+            if self.network is None:
+                self.network = ClaudetteNet()
+        elif args.network == "host":
+            # Host networking - don't initialize network bridge
+            if self.network is None:
+                print("I: Using host networking mode (no bridge setup)")
+            else:
+                print("I: Using host networking mode (ignoring existing bridge)")
+
+        if args.build:
+            self._build()
+
+        mdir = self._get_machine_dir()
+        if not os.path.exists(mdir):
+            print(f"E: '{mdir}' does not exist. Use --build")
+            sys.exit(1)
+
+        # --directory=/var/lib/machines/claudette.foo
+        # --machine=foo           # show up as 'foo', not 'claudette.foo'
+        # --tmpfs=/tmp:mode=1777  # memory tmpfs
+        # --private-users         # user namespace - pick for >=250, fixed for <250
+        # --as-pid2               # emulate docker app container (no init)
+        # --timezone=bind         # bind mount host localetime into container
+        # --user=self.user        # change to this user within the container
+        cmd = [
+            "systemd-nspawn",
+            f"--directory={mdir}",
+            f"--machine={self.container}",
+            "--tmpfs=/tmp:mode=1777",
+            "--as-pid2",
+            "--timezone=bind",
+            f"--user={self.user}",
+        ]
+
+        # Use bridge network if configured and not in host mode
+        if args.network != "host" and self.network and self.network.configured:
+            # --network-bridge implies --network-veth (which implies
+            # --private-network). We currently setup a single bridge (cldtbr0)
+            # and configure it with an unused IP address in a /24 network. The
+            # container's network interface shows up as 'host0' while the
+            # host's side of the veth shows up as vb-<container>@ifN. Firewall
+            # rules are then setup up on the bridge, external to the constainer
+            # (see above).
+            cmd.append(f"--network-bridge={self.network.bridge_name}")
+
+            # Setup port forwarding if configured
+            if self.port_mappings and self.network and self.network.configured:
+                self._setup_port_forwarding_rules()
+        else:
+            print("W: Using host networking (no restrictions)")
+
+        # Use fixed UID range for older systemd to make ACLs predictable
+        if self.systemd_version >= 250:
+            # XXX: Can this slow startup?
+            cmd.append("--private-users=pick")  # implies --private-users-ownership=auto
+        else:
+            cmd.append(f"--private-users={CONTAINER_BASE_UID}:65536")
+            cmd.append(f"--private-users-ownership=auto")
+
+        # codex' sandbox needs these landlock calls: landlock_create_ruleset,
+        # landlock_add_rule, landlock_restrict_self. It was observed that both
+        # the syscall names and the syscall numbers were required (Ubuntu 24.04
+        # host with Debian trixie-based container). These syscall numbers were
+        # confirmed to be the same number on all of these architectures:
+        # $ for a in x86_64 x86 arm aarch64 ppc64 ppc64le s390x riscv64 ; do
+        #     for sc in landlock_create_ruleset landlock_add_rule landlock_restrict_self ; do
+        #       scmp_sys_resolver -a $a $sc
+        #     done
+        #   done
+        if platform.machine() not in [
+            "x86_64",
+            "x86",
+            "arm",
+            "aarch64",
+            "ppc64",
+            "ppc64le",
+            "s390x",
+            "riscv64",
+        ]:
+            print(
+                "W: unknown architecture '%s'; hard-coded landlock syscall numbers may be incorrect"
+                % platform.machine()
+            )
+        cmd.append(
+            "--system-call-filter='@default landlock_create_ruleset landlock_add_rule landlock_restrict_self 444 445 446'"
+        )
+
+        if not args.persistent:
+            # --ephemeral affects the root namespace and not submounts. When
+            # specified, all changes to the system (excepting workspace, below)
+            # are discarded.
+            cmd.append("--ephemeral")
+
+        if self.workspace:
+            # If the workspace directory exists on both the host and the guest,
+            # bind mount it into the container and chdir into it. Otherwise,
+            # chdir into the user's home
+            realp = os.path.realpath(self.workspace)
+            if not os.path.isdir(realp):
+                print(
+                    f"W: Could not find '{self.workspace}' on the host, skipping mount"
+                )
+                cmd.append(f"--chdir={self.user_home}")
+            else:
+                intp = f"{self.user_home}/workspace"
+                extp = os.path.join(mdir, intp[1:])
+                if os.path.isdir(extp):
+                    # Use :idmap if supported
+                    if self.systemd_version >= 250:
+                        cmd.append(f"--bind={realp}:{intp}:idmap")
+                    else:
+                        cmd.append(f"--bind={realp}:{intp}")
+                    cmd.append(f"--chdir={intp}")
+                    print(f"I: Mounting '{realp}' on '{intp}'")
+                else:
+                    print(
+                        f"W: Could not find '{intp}' in the container. Skipping workspace mount"
+                    )
+                    cmd.append(f"--chdir={self.user_home}")
+
+        # Add ACLs if using fallback method (systemd < 250)
+        if self.systemd_version < 250 and self.workspace:
+            realp = os.path.realpath(self.workspace)
+            if os.path.isdir(realp):
+                self._setfacl(realp, self.container)
+
+        # Bind mount init.sh as read-only to protect it from modification
+        init_script_path = os.path.join(mdir, "init.sh")
+        if os.path.exists(init_script_path):
+            cmd.append(f"--bind-ro={init_script_path}:/init.sh")
+            print(f"I: Bind mounting /init.sh as read-only")
+
+        # XXX: probably should create a systemd unit for this
+        if args.detach:
+            print(f"I: Starting '{self.container}' in detached state")
+            _run_secure_subprocess_popen(
+                cmd,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Run network initialization after detached start
+            self._run_init_script(silent=True, network_mode=args.network)
+        else:
+            print(f"I: Starting '{self.container}'")
+            # Start container in background thread and run network init silently
+            container_thread = threading.Thread(
+                target=lambda: _run_secure_subprocess(cmd)
+            )
+            container_thread.daemon = True
+            container_thread.start()
+
+            # Run network initialization silently
+            self._run_init_script(silent=True, network_mode=args.network)
+
+            # Wait for container to complete
+            container_thread.join()
+
+            # Clean up port forwarding rules after container exits
+            if self.port_mappings and self.network and self.network.configured:
+                self._cleanup_port_forwarding_rules()
+                self._remove_port_mappings_from_state(self.container)
+
+    def run_rm(self, args, all=False, cache=False, network=False):
+        """Remove container(s)"""
+        # Check for incompatible options
+        if cache:
+            if all:
+                print("E: --cache cannot be used with --all")
+                sys.exit(1)
+            if args.container:
+                print("E: --cache cannot be used with --container")
+                sys.exit(1)
+            if network:
+                print("E: --cache cannot be used with --network")
+                sys.exit(1)
+
+            # Just remove the cache
+            cache_dir = self._get_cache_dir()
+            if os.path.exists(cache_dir):
+                if args.force or self._confirm(
+                    f"Remove container cache ('{cache_dir}')"
+                ):
+                    self._purge_cache()
+                else:
+                    print("I: Skipped cache removal")
+            else:
+                print("I: No cache to remove")
+            return
+
+        if network:
+            if all:
+                print("E: --network cannot be used with --all")
+                sys.exit(1)
+            if args.container:
+                print("E: --network cannot be used with --container")
+                sys.exit(1)
+
+            # Setup networking if not already done (needed for cleanup)
+            if self.network is None:
+                self.network = ClaudetteNet()
+
+            # Check if any claudette containers are running
+            running_containers = self._get_running_claudette_containers()
+            if running_containers:
+                container_list = ", ".join(running_containers)
+                print(
+                    f"E: Cannot remove network while containers are running: {container_list}"
+                )
+                print("Stop all containers first with 'claudette down'")
+                sys.exit(1)
+
+            # Remove network bridge and firewall rules
+            if args.force or self._confirm("Remove network bridge and firewall rules"):
+                if self.network:
+                    self.network.cleanup()
+                    print("I: Network cleanup complete")
+                else:
+                    print("I: No network to clean up")
+                self._clear_port_mapping_state()
+            else:
+                print("I: Skipped network removal")
+            return
+
+        # Build list of machine directories to remove
+        mdirs_to_remove = []
+
+        if all:
+            if os.path.exists(SYSTEMD_MACHINES):
+                for mdir in glob.glob(f"{SYSTEMD_MACHINES}/claudette.*"):
+                    # Skip cache directory
+                    if mdir != self._get_cache_dir():
+                        mdirs_to_remove.append(mdir)
+        else:
+            # Single container
+            mdir = self._get_machine_dir()
+            if not os.path.exists(mdir):
+                print(f"E: Container '{self.container}' not found")
+                sys.exit(1)
+            mdirs_to_remove.append(mdir)
+
+        # Process each container directory
+        for mdir in mdirs_to_remove:
+            # Extract container name from directory path
+            con_name = os.path.basename(mdir).split(".", maxsplit=1)[1]
+
+            container_was_powered_off = False
+            if self._is_container_running(con_name):
+                # Container is running, ask to power off
+                if args.force or self._confirm(
+                    f"Container '{con_name}' is running. Power off and remove the container"
+                ):
+                    self._machine_poweroff(con_name)
+                    container_was_powered_off = True
+                else:
+                    print(f"I: Skipping removal of running container '{con_name}'")
+                    continue
+
+            # If user already confirmed poweroff, don't prompt again for removal
+            skip_removal_prompt = args.force or container_was_powered_off
+
+            # Ensure port forwarding rules are removed before deleting files
+            self._cleanup_port_mappings_for_container(con_name)
+
+            self._remove_machine_dir(mdir, prompt=not skip_removal_prompt)
+
+    def run_down(self, args):
+        """Stop and remove container"""
+        # Check for incompatible options
+        if args.rmi and args.container:
+            print("E: --rmi cannot be used with --container option")
+            sys.exit(1)
+
+        # this is meant to simulate '--rmi all' with docker
+        if args.rmi:
+            print(f"I: '--rmi' is deprecated. Use 'rm --all' instead")
+            self.run_rm(args, all=True)
+        else:
+            if args.volumes:
+                pass  # this happens automatically when the container is shut down
+            self._machine_poweroff()
+
+    def run_bash(self, args):
+        """Launch bash shell in container"""
+        # Remove leading '--' if present (argparse REMAINDER captures it)
+        bash_cmd = args.bash_args
+        if args.bash_args and args.bash_args[0] == "--":
+            bash_cmd = args.bash_args[1:]
+
+        if not bash_cmd:
+            command = "bash"
+        else:
+            # _exec() already launches under bash -c for nsenter, so just
+            # append the args without -c
+            # FIXME: this works different than 'bash ...'
+            if "-c" in bash_cmd:
+                bash_cmd = list(filter(lambda x: x != "-c", bash_cmd))
+                if not bash_cmd:
+                    print("E: bash requires a command")
+                    sys.exit(1)
+            command = " ".join(bash_cmd)
+
+        self._exec(command)
+
+    def run_exec(self, args):
+        """Execute command in container"""
+        # Remove leading '--' if present (argparse REMAINDER captures it)
+        exec_cmd = args.exec_command
+        if exec_cmd and exec_cmd[0] == "--":
+            exec_cmd = exec_cmd[1:]
+
+        if not exec_cmd:
+            print("E: exec requires a command")
+            sys.exit(1)
+
+        command = " ".join(exec_cmd)
+        self._exec(command)
+
+    def run_status(self):
+        """Check container status"""
+        _run_secure_subprocess(
+            ["machinectl", "status", "--no-pager", "--full", self.container]
+        )
+
+    def stub_logs(self, args):
+        """Show container logs"""
+        print("[LOGS] Showing container logs")
+        print(f"  Container: {self.container}")
+        print(f"  Follow: {args.follow}")
+        if args.tail:
+            print(f"  Tail lines: {args.tail}")
+        print("XXX: Not implemented")
+
+    def stub_auth(self, _):
+        """Authenticate with GitHub CLI"""
+        print("[AUTH] Authenticating with GitHub CLI")
+        print(f"  Container: {self.container}")
+        print(f"  User: {self.user}")
+        print("XXX: Not implemented")
+
+    def run_usage(self, args):
+        """Monitor Claude usage"""
+        usage_cmd = [
+            "npx",
+            "ccusage",
+        ]
+        if args.usage_args:
+            # Remove leading '--' if present
+            usage_args = args.usage_args
+            if args.usage_args[0] == "--":
+                usage_args = usage_args[1:]
+
+            if usage_args:
+                usage_cmd += usage_args
+                usage_args = " ".join(usage_cmd)
+        command = " ".join(usage_cmd)
+        self._exec(command)
+
+    def run_list(self):
+        """List all containers and their status"""
+        if not os.path.exists(SYSTEMD_MACHINES):
+            print("No containers found")
+            return
+
+        containers = []
+        for mdir in glob.glob(f"{SYSTEMD_MACHINES}/claudette.*"):
+            # Skip cache directory
+            if mdir == self._get_cache_dir():
+                continue
+
+            # Extract container name from directory path
+            con_name = os.path.basename(mdir).split(".", maxsplit=1)[1]
+
+            # Check if container is running
+            is_running = self._is_container_running(con_name) is not None
+            status = "running" if is_running else "stopped"
+
+            containers.append((con_name, status, mdir))
+
+        if not containers:
+            print("No containers found")
+            return
+
+        # Calculate dynamic column width (longest name + 3, max 32, min 10)
+        max_name_len = max(len(name) for name, _, _ in containers)
+        col_width = max(10, min(max_name_len + 3, 32))
+
+        # Find longest path for proper dash line length
+        max_path_len = max(len(path) for _, _, path in containers)
+        total_width = col_width + 1 + 10 + 1 + max_path_len  # spaces between columns
+
+        # Print header
+        print(f"{'CONTAINER':<{col_width}} {'STATUS':<10} {'PATH'}")
+        print("-" * total_width)
+
+        # Print containers
+        for name, status, path in sorted(containers):
+            print(f"{name:<{col_width}} {status:<10} {path}")
+
+    def run_claude(self, skip_permissions=False):
+        """Launch Claude Code (default action)"""
+        cmd = "claude"
+        if skip_permissions:
+            print(
+                "W: running 'claude --dangerously-skip-permissions' (use '--safe' to disable)"
+            )
+            cmd = "claude --dangerously-skip-permissions"
+        self._exec(cmd)
+
+
+def parse_args_custom():
+    """Custom argument parser to handle REMAINDER args properly"""
+
+    # Find if there's a subcommand and where it is
+    subcommands = [
+        "up",
+        "down",
+        "rm",
+        "bash",
+        "exec",
+        "status",
+        "logs",
+        "auth",
+        "usage",
+        "list",
+    ]
+
+    # Manually parse global args first
+    global_parser = argparse.ArgumentParser(add_help=False)
+    global_parser.add_argument("-w", "--workspace", default="workspace")
+    global_parser.add_argument("--container")
+    global_parser.add_argument("--user", default="developer")
+
+    # Find the subcommand position
+    subcommand_idx = None
+    for i, arg in enumerate(sys.argv[1:]):
+        if arg in subcommands:
+            subcommand_idx = i + 1
+            break
+
+    # Parse global args up to the subcommand
+    if subcommand_idx:
+        global_parser.parse_known_args(sys.argv[1:subcommand_idx])
+        remaining_args = sys.argv[subcommand_idx:]
+    else:
+        _, remaining_args = global_parser.parse_known_args()
+
+    # Now parse the full command
+    parser = argparse.ArgumentParser(
+        description="Claudette CLI - Container management for Claude development",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                           # Launch Claude Code
+  %(prog)s -w myproject              # Launch in workspace subdirectory
+  %(prog)s up -d --build             # Build and start detached
+  %(prog)s exec -- cargo test        # Run tests in container
+  %(prog)s bash -c "echo hello"      # Run bash with arguments
+  %(prog)s logs -f -t 100            # Follow last 100 log lines
+
+Environment Variables:
+  CLAUDETTE_NSPAWN_BOOTSTRAP         # Bootstrap method: 'oci' or 'debootstrap'
+  CLAUDETTE_NSPAWN_BOOTSTRAP_BASE    # Base image override (eg 'debian:bookworm' or 'ubuntu:noble')
+  CLAUDETTE_NSPAWN_SETUP_SCRIPT      # Custom setup script (default: ./scripts/ch-setup-container.sh)
+  CLAUDETTE_NSPAWN_CONTAINER_CACHE   # Disable container caching: 'n' (enabled by default)
+        """,
+    )
+
+    # Add global arguments
+    parser.add_argument("-w", "--workspace", help="Workspace subdirectory to use")
+    parser.add_argument(
+        "--safe", action="store_true", help="Run claude with permission checks"
+    )
+    parser.add_argument("-c", "--container", help="Container name (default: ai-dev)")
+    parser.add_argument(
+        "-u", "--user", default="developer", help="User to run as (default: developer)"
+    )
+
+    # Create subparsers for commands
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # up command
+    up_parser = subparsers.add_parser("up", help="Build and start container")
+    up_parser.add_argument(
+        "-b", "--build", action="store_true", help="Build even if exists"
+    )
+    up_parser.add_argument(
+        "-d", "--detach", action="store_true", help="Run in detached mode"
+    )
+    up_parser.add_argument(
+        "--persistent", action="store_true", help="Run in persistent mode"
+    )
+    up_parser.add_argument(
+        "--network",
+        choices=["host", "lenient"],
+        default="lenient",
+        help="Network mode: 'lenient' (default, isolated bridge) or 'host' (direct host networking)",
+    )
+    up_parser.add_argument(
+        "-p",
+        "--port",
+        action="append",
+        dest="ports",
+        help="Port forwarding from host to container (format: proto:host_port:container_port, e.g., tcp:8080:80)",
+    )
+
+    # down command
+    down_parser = subparsers.add_parser("down", help="Stop and remove container")
+    down_parser.add_argument(
+        "-v", "--volumes", action="store_true", help="Remove volumes"
+    )
+    down_parser.add_argument("--rmi", action="store_true", help="Remove images")
+    down_parser.add_argument(
+        "--force", action="store_true", help="Force removal without confirmation"
+    )
+    down_parser.add_argument(
+        "--purge", action="store_true", help="Purge container cache (use with --rmi)"
+    )
+
+    # rm command
+    rm_parser = subparsers.add_parser("rm", help="Remove container(s)")
+    rm_parser.add_argument("--all", action="store_true", help="Remove all containers")
+    rm_parser.add_argument(
+        "--force", action="store_true", help="Force removal without confirmation"
+    )
+    rm_parser.add_argument(
+        "--cache",
+        action="store_true",
+        help="Remove container cache only (incompatible with --all and --container)",
+    )
+    rm_parser.add_argument(
+        "--network",
+        action="store_true",
+        help="Remove network bridge and firewall rules only",
+    )
+
+    # bash command - special handling
+    subparsers.add_parser("bash", help="Launch bash shell", add_help=False)
+
+    # exec command - special handling
+    subparsers.add_parser("exec", help="Execute command in container", add_help=False)
+
+    # status command
+    subparsers.add_parser("status", help="Check container status")
+
+    # logs command
+    logs_parser = subparsers.add_parser("logs", help="Show container logs")
+    logs_parser.add_argument(
+        "-f", "--follow", action="store_true", help="Follow log output"
+    )
+    logs_parser.add_argument("-t", "--tail", type=int, help="Number of lines from end")
+
+    # auth command
+    subparsers.add_parser("auth", help="Authenticate with GitHub CLI")
+
+    # usage command - special handling
+    subparsers.add_parser("usage", help="Monitor Claude usage", add_help=False)
+
+    # list command
+    subparsers.add_parser("list", help="List all containers and their status")
+
+    # For bash, exec, and usage commands, manually handle the rest
+    if (
+        remaining_args
+        and subcommand_idx is not None
+        and remaining_args[0] in ["bash", "exec", "usage"]
+    ):
+        # Parse only up to the command
+        args = parser.parse_args(sys.argv[1 : subcommand_idx + 1])
+
+        # Get everything after the command as remainder
+        remainder = (
+            sys.argv[subcommand_idx + 1 :] if len(sys.argv) > subcommand_idx + 1 else []
+        )
+
+        if remaining_args[0] == "bash":
+            args.bash_args = remainder
+        elif remaining_args[0] == "exec":
+            args.exec_command = remainder
+        elif remaining_args[0] == "usage":
+            args.usage_args = remainder
+    else:
+        # Normal parsing for other commands
+        args = parser.parse_args()
+
+    return args
+
+
+def main():
+    # Parse arguments with custom handling
+    args = parse_args_custom()
+
+    # Create Claudette instance
+    claudette = Claudette()
+
+    # Set global options with proper validation
+    if args.workspace:
+        if not _validate_workspace_path(args.workspace):
+            print(f"E: Invalid workspace path '{_sanitize_log_output(args.workspace)}'")
+            sys.exit(1)
+        claudette.workspace = args.workspace
+
+    if args.container:
+        if not _validate_container_name(args.container):
+            print(f"E: Invalid container name '{_sanitize_log_output(args.container)}'")
+            sys.exit(1)
+        claudette.container = args.container
+    else:
+        # Validate default container name too
+        if not _validate_container_name(claudette.container):
+            print(
+                f"E: Invalid default container name '{_sanitize_log_output(claudette.container)}'"
+            )
+            sys.exit(1)
+
+    if args.user:
+        if not _validate_username(args.user):
+            print(f"E: Invalid username '{_sanitize_log_output(args.user)}'")
+            sys.exit(1)
+        claudette.user = args.user
+        if claudette.user == "root":
+            claudette.user_home = "/root"
+    else:
+        # Validate default username too
+        if not _validate_username(claudette.user):
+            print(
+                f"E: Invalid default username '{_sanitize_log_output(claudette.user)}'"
+            )
+            sys.exit(1)
+
+    # Execute command
+    if args.command == "up":
+        claudette.run_up(args)
+    elif args.command == "down":
+        claudette.run_down(args)
+    elif args.command == "rm":
+        claudette.run_rm(args, all=args.all, cache=args.cache, network=args.network)
+    elif args.command == "bash":
+        claudette.run_bash(args)
+    elif args.command == "exec":
+        claudette.run_exec(args)
+    elif args.command == "status":
+        claudette.run_status()
+    elif args.command == "logs":
+        claudette.stub_logs(args)
+    elif args.command == "auth":
+        claudette.stub_auth(args)
+    elif args.command == "usage":
+        claudette.run_usage(args)
+    elif args.command == "list":
+        claudette.run_list()
+    else:
+        # No command specified, run default (launch Claude Code)
+        claudette.run_claude(not args.safe)
+
+
+if __name__ == "__main__":
+    _verify_safe_dir(SYSTEMD_MACHINES)
+    main()
