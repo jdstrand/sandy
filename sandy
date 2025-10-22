@@ -4015,19 +4015,7 @@ class Sandy:
 
     def run_down(self, args):
         """Stop and remove container"""
-        # Check for incompatible options
-        if args.rmi and args.container:
-            print("E: --rmi cannot be used with --container option")
-            sys.exit(1)
-
-        # this is meant to simulate '--rmi all' with docker
-        if args.rmi:
-            print(f"I: '--rmi' is deprecated. Use 'rm --all' instead")
-            self.run_rm(args, all=True)
-        else:
-            if args.volumes:
-                pass  # this happens automatically when the container is shut down
-            self._machine_poweroff()
+        self._machine_poweroff()
 
     def run_bash(self, args):
         """Launch bash shell in container"""
@@ -4205,14 +4193,10 @@ Environment Variables:
     # down command
     down_parser = subparsers.add_parser("down", help="Stop and remove container")
     down_parser.add_argument(
-        "-v", "--volumes", action="store_true", help="Remove volumes"
-    )
-    down_parser.add_argument("--rmi", action="store_true", help="Remove images")
-    down_parser.add_argument(
         "--force", action="store_true", help="Force removal without confirmation"
     )
     down_parser.add_argument(
-        "--purge", action="store_true", help="Purge container cache (use with --rmi)"
+        "--purge", action="store_true", help="Purge container cache"
     )
 
     # rm command
