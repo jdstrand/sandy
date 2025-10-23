@@ -5,8 +5,8 @@
 work.
 
 Disclaimer: While `sandy` was written with security in mind, it is a side
-project intended to explore AI sandboxing using `systemd-nspawn` and should not
-be used on production systems.
+project intended to explore AI sandboxing using `systemd-nspawn`, should be
+considered experimental and should not be used on production systems.
 
 `sandy` originally started as a python reimplementation of the CLI for a docker
 wrapper written by Trevor Hilton (@hiltontj).
