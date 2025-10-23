@@ -87,6 +87,17 @@ I: Bind mounting /init.sh as read-only
 I: Starting 'ai-dev'
 ...
 developer@ai-dev:~/workspace$
+...
+$ developer@ai-dev:~/workspace$ exit
+
+# create a chat session with an AI agent
+$ mkdir workspace/chat && cd workspace
+$ sudo sandy -c chat -w chat up -b --persistent  # once, create 'chat'
+$ developer@ai-dev:~/workspace$ claude
+... <login> /quit ...
+$ developer@ai-dev:~/workspace$ exit
+$ sudo sandy -c chat -w chat up -d               # if needed, start detached
+$ sudo sandy -c chat -w chat exec claude         # run a command
 ```
 
 The general invocation is:
