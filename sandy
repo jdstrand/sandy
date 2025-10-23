@@ -4312,7 +4312,7 @@ def main():
         sandy.run_list()
     else:
         # No command specified, run default (bash)
-        sandy.run_bash(args)
+        sandy._exec("bash")
 
 
 if __name__ == "__main__":
