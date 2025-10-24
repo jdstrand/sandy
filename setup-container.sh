@@ -103,12 +103,15 @@ apt-get install -y \
 # cleanup
 apt-get clean
 
+TMPDIR=$(mktemp -d)
+chmod 1777 "$TMPDIR"
+
 # Install rust
 echo -e "\nI: Install rust"
-cd /tmp
+cd "$TMPDIR"
 curl -L --proto "=https" --tlsv1.2 -sSf "https://raw.githubusercontent.com/rust-lang/rustup/${RUSTUP_VERSION}/rustup-init.sh" -o ./rustup-init.sh
 echo "$RUSTUP_SHA256  rustup-init.sh" | sha256sum -c -- || exit 1
-mv /tmp/rustup-init.sh /usr/local/bin
+mv "$TMPDIR"/rustup-init.sh /usr/local/bin
 chmod 755 /usr/local/bin/rustup-init.sh
 su -l "$AI_USER" -c "rustup-init.sh -y"
 su -l "$AI_USER" -c "rustc --version"
@@ -116,17 +119,19 @@ cd - > /dev/null
 
 # Install golang
 echo -e "\nI: Install golang"
-cd /tmp
+cd "$TMPDIR"
 GOLANG_TARBALL="go${GOLANG_VERSION}.linux-${GOLANG_ARCH}.tar.gz"
 curl -L --proto "=https" --tlsv1.2 -sSf "https://go.dev/dl/${GOLANG_TARBALL}" -o "$GOLANG_TARBALL"
 echo "$GOLANG_SHA256  $GOLANG_TARBALL" | sha256sum -c -- || exit 1
-tar -C /usr/local -zxf "/tmp/$GOLANG_TARBALL"
+tar -C /usr/local -zxf "$TMPDIR/$GOLANG_TARBALL"
 su -l "$AI_USER" -c "/usr/local/go/bin/go version"
 cd - > /dev/null
 
 # install yq
-echo -e "\nI: Install yq"
-su -l "$AI_USER" -c "/usr/local/go/bin/go install github.com/mikefarah/yq/v4@v4.47.2"
+if ! test -e "/home/$AI_USER"/go/bin/yq ; then
+  echo -e "\nI: Install yq"
+  su -l "$AI_USER" -c "/usr/local/go/bin/go install github.com/mikefarah/yq/v4@v4.47.2"
+fi
 
 # adjust path for go
 echo -e "\nI: Adjust PATH for go"
@@ -135,12 +140,17 @@ echo "export PATH=\"\$PATH:/usr/local/go/bin:\$HOME/go/bin\"" >> "/home/$AI_USER
 # Install node
 if [ ! -e "/home/$AI_USER/.nvm" ]; then
   echo -e "\nI: Install node"
-  cd /tmp
+  cd "$TMPDIR"
   curl -o install.sh https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh
   echo "2d8359a64a3cb07c02389ad88ceecd43f2fa469c06104f92f98df5b6f315275f  install.sh" sha256sum --check -- || exit 1
-  su -l "$AI_USER" -c "bash /tmp/install.sh"
+  su -l "$AI_USER" -c "bash $TMPDIR/install.sh"
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && nvm install \"$AI_NODEJS_VERSION\""
 fi
+
+#
+# AI tools
+#
+ai_tools=()
 
 # Install claude code
 if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/claude ; then
@@ -152,24 +162,15 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/claude ; then
   echo '{"autoUpdates": false}' > "/home/$AI_USER/.claude.json"
   chown "$AI_USER:$AI_USER" "/home/$AI_USER/.claude.json"
   chmod 600 "/home/$AI_USER/.claude.json"
-  echo "I: run with 'claude' (https://www.claude.com/product/claude-code)"
-  echo "I: see usage with 'ccusage'"
+  ai_tools+=("claude (https://www.claude.com/product/claude-code)")
 fi
 
-# Install copilot cli
-if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/copilot ; then
-  echo -e "\nI: Install copilot-cli"
-  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @github/copilot"
-  echo "I: run with 'copilot' (https://github.com/github/copilot-cli)"
-fi
-
-# Install gemini-cli
-if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/gemini ; then
-  echo -e "\nI: Install gemini-cli"
+if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/ccusage ; then
+  echo -e "\nI: Install ccusage (for claude)"
   # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
   # PATH as part of nvm install
-  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @google/gemini-cli"
-  echo "I: run with 'gemini' (https://github.com/google-gemini/gemini-cli)"
+  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g ccusage@latest"
+  ai_tools+=("ccusage (for claude code; https://www.npmjs.com/package/ccusage)")
 fi
 
 # Install openai codex
@@ -178,10 +179,58 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/codex ; then
   # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
   # PATH as part of nvm install
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @openai/codex"
-  echo "I: run with 'codex' (https://github.com/openai/codex)"
+  ai_tools+=("codex (https://github.com/openai/codex)")
 fi
 
-echo -e "\nI: Cleaning up /tmp"
-rm -f /tmp/*
+# Install copilot cli
+if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/copilot ; then
+  echo -e "\nI: Install copilot-cli"
+  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @github/copilot"
+  ai_tools+=("copilot (https://github.com/github/copilot-cli)")
+fi
+
+# Install gemini-cli
+if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/gemini ; then
+  echo -e "\nI: Install gemini-cli"
+  # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
+  # PATH as part of nvm install
+  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @google/gemini-cli"
+  ai_tools+=("gemini (https://github.com/google-gemini/gemini-cli)")
+fi
+
+# install mcp-grafana
+if ! test -e "/home/$AI_USER"/go/bin/mcp-grafana ; then
+  echo -e "\nI: Install mcp-grafana"
+  su -l "$AI_USER" -c "/usr/local/go/bin/go install github.com/grafana/mcp-grafana/cmd/mcp-grafana@v0.7.8"
+  ai_tools+=("mcp-grafana (https://github.com/grafana/mcp-grafana)")
+fi
+
+# install influxdb3_mcp_server
+if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/influxdb-mcp-server ; then
+  echo -e "\nI: Install influxdb-mcp-server"
+  # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
+  # PATH as part of nvm install
+  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && git clone https://github.com/influxdata/influxdb3_mcp_server.git .influxdb3_mcp_server && cd ./.influxdb3_mcp_server && npm install && npm run build && npm link"
+  ai_tools+=("influxdb-mcp-server (https://github.com/influxdata/influxdb3_mcp_server)")
+fi
+
+# do this last so all the tools are listed
+if ! grep -q "AI tools:" "/home/$AI_USER/.bashrc" ; then
+  {
+    echo ""
+    echo 'cat <<EOM'
+    echo
+    echo "AI Tools:"
+    printf -- '- %s\n' "${ai_tools[@]}"
+    echo 'EOM'
+  } >> "/home/$AI_USER/.bashrc"
+fi
+
+#
+# end AI tools
+#
+
+echo -e "\nI: Cleaning up $TMPDIR"
+rm -rf "${TMPDIR:?}"/*
 
 echo "Done!!"
