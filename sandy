@@ -3068,7 +3068,7 @@ class Sandy:
 
         return _run_secure_subprocess(nsenter_cmd)
 
-    def _wait_for_container_ready(self, timeout=30):
+    def _wait_for_container_ready(self, timeout=300):
         """Wait for container to be ready for nsenter commands"""
         import time
 
