@@ -162,7 +162,7 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/claude ; then
   echo '{"autoUpdates": false}' > "/home/$AI_USER/.claude.json"
   chown "$AI_USER:$AI_USER" "/home/$AI_USER/.claude.json"
   chmod 600 "/home/$AI_USER/.claude.json"
-  ai_tools+=("claude (https://www.claude.com/product/claude-code)")
+  ai_tools+=("claude (https://www.claude.com/product/claude-code; newline: shift+enter or '\')")
 fi
 
 if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/ccusage ; then
@@ -179,14 +179,14 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/codex ; then
   # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
   # PATH as part of nvm install
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @openai/codex"
-  ai_tools+=("codex (https://github.com/openai/codex)")
+  ai_tools+=("codex (https://github.com/openai/codex; newline: ctrl+j or alt+enter)")
 fi
 
 # Install copilot cli
 if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/copilot ; then
   echo -e "\nI: Install copilot-cli"
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @github/copilot"
-  ai_tools+=("copilot (https://github.com/github/copilot-cli)")
+  ai_tools+=("copilot (https://github.com/github/copilot-cli; ctrl+enter or shift+enter)")
 fi
 
 # Install gemini-cli
@@ -195,7 +195,7 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/gemini ; then
   # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
   # PATH as part of nvm install
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @google/gemini-cli"
-  ai_tools+=("gemini (https://github.com/google-gemini/gemini-cli)")
+  ai_tools+=("gemini (https://github.com/google-gemini/gemini-cli; newline: ctrl+j or alt+enter)")
 fi
 
 # install mcp-grafana
