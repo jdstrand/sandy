@@ -3889,7 +3889,9 @@ class Sandy:
         # --machine=foo           # show up as 'foo', not 'sandy.foo'
         # --tmpfs=/tmp:mode=1777  # memory tmpfs
         # --private-users         # user namespace - pick for >=250, fixed for <250
-        # --as-pid2               # emulate docker app container (no init)
+        # --as-pid2               # emulate docker app container (no init
+        #                         # process; just minimal systemd stub init for
+        #                         # signal forwarding and zombies only)
         # --timezone=bind         # bind mount host localetime into container
         # --user=self.user        # change to this user within the container
         cmd = [
