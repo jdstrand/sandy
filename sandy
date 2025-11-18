@@ -11,6 +11,7 @@ import platform
 import pty
 import random
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -3056,21 +3057,41 @@ class Sandy:
         else:
             print(f"I: No cache directory to purge")
 
-    def _exec(self, command):
-        """Execute command in container using nsenter"""
+    def _exec(self, command: Optional[str], *, login_shell: bool = False):
+        """Execute command in container using nsenter.
+
+        When login_shell is True, spawn a single interactive login shell so that
+        startup files execute only once (mirrors `ssh -tt` behaviour).
+        """
         # Get container PID
         pid = self._is_container_running()
         if not pid:
             print(f"E: Container '{self.container}' not found or not running")
             sys.exit(1)
 
-        # Build command
-        cmd = command
+        if not login_shell and not command:
+            print("E: Command required for container execution")
+            sys.exit(1)
+
+        # Determine workspace inside container
+        cmd_fragment = command or ""
+        workdir = None
         intp = f"{self.user_home}/workspace"
         mdir = self._get_machine_dir()
         extp = os.path.join(mdir, intp[1:])
         if self.workspace and os.path.isdir(extp):
-            cmd = f"cd {self.user_home}/workspace && {command}"
+            workdir = intp
+
+        if login_shell:
+            exec_cmd = "exec bash --login"
+        else:
+            exec_cmd = cmd_fragment
+
+        if workdir:
+            exec_cmd = f"cd {shlex.quote(workdir)} && {exec_cmd}"
+
+        # Allocate a controlling TTY so interactive shells (bash, top, etc.) behave normally
+        script_wrapped_cmd = f"script -qec {shlex.quote(exec_cmd)} /dev/null"
 
         # Execute using nsenter ('machinectl shell' can only be used if
         # systemd running in the container)
@@ -3081,10 +3102,11 @@ class Sandy:
             "-a",
             "--",
             "su",
-            "-l",
             self.user,
+            "-s",
+            "/bin/bash",
             "-c",
-            f"script -qec \"bash -i -c '{cmd}'\" /dev/null",
+            script_wrapped_cmd,
         ]
 
         _run_secure_subprocess(nsenter_cmd)
@@ -4144,11 +4166,11 @@ class Sandy:
             bash_cmd = args.bash_args[1:]
 
         if not bash_cmd:
-            command = "bash"
+            # Drop user into a login shell that behaves like ssh -tt
+            self._exec(None, login_shell=True)
+            return
         else:
-            # _exec() already launches under bash -c for nsenter, so just
-            # append the args without -c
-            # FIXME: this works different than 'bash ...'
+            # _exec() handles executing commands directly, so strip -c flags
             if "-c" in bash_cmd:
                 bash_cmd = list(filter(lambda x: x != "-c", bash_cmd))
                 if not bash_cmd:
@@ -4429,7 +4451,7 @@ def main():
         sandy.run_list()
     else:
         # No command specified, run default (bash)
-        sandy._exec("bash")
+        sandy._exec(None, login_shell=True)
 
 
 if __name__ == "__main__":
