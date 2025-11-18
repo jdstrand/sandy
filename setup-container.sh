@@ -233,4 +233,12 @@ fi
 echo -e "\nI: Cleaning up $TMPDIR"
 rm -rf "${TMPDIR:?}"/*
 
+echo -e "\nI: Cleaning up cache files, etc"
+rm -rf "/home/$AI_USER"/.cache/*
+rm -rf "/home/$AI_USER"/.cargo/git
+rm -rf "/home/$AI_USER"/.cargo/registry
+rm -rf "/home/$AI_USER"/.rustup   # rustup still in ~/.cargo/bin
+rm -rf "/home/$AI_USER"/go/pkg/*
+su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm cache clean --force"
+
 echo "Done!!"
