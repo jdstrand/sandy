@@ -8,6 +8,7 @@ import json
 import ipaddress
 import os
 import platform
+import pty
 import random
 import re
 import shutil
@@ -72,6 +73,20 @@ def _sanitize_log_output(message: str) -> str:
     """Sanitize log output to prevent log injection"""
     # Remove or escape newlines and control characters
     return re.sub(r"[\r\n\t\x00-\x1f\x7f-\x9f]", "", str(message))
+
+
+def _finish_spinner_line(spinner_event: Optional[threading.Event], suffix: str = ""):
+    """Ensure spinner line is closed exactly once with CRLF, optionally adding suffix."""
+    if spinner_event and spinner_event.is_set():
+        return
+
+    if suffix:
+        sys.stdout.write(suffix)
+    sys.stdout.write("\r\n")
+    sys.stdout.flush()
+
+    if spinner_event:
+        spinner_event.set()
 
 
 def _validate_env_var(
@@ -161,9 +176,7 @@ def _run_secure_subprocess(cmd: list, **kwargs) -> subprocess.CompletedProcess:
     # Ensure shell=False (default, but explicit for security)
     kwargs.setdefault("shell", False)
 
-    # Validate command components are strings and not empty
-    if not cmd or not all(isinstance(arg, str) and arg for arg in cmd):
-        raise ValueError("Invalid command arguments")
+    _validate_command_args(cmd)
 
     # Sanitize any error output for logging
     try:
@@ -182,11 +195,34 @@ def _run_secure_subprocess_popen(cmd: list, **kwargs) -> subprocess.Popen:
     # Ensure shell=False (default, but explicit for security)
     kwargs.setdefault("shell", False)
 
-    # Validate command components are strings and not empty
+    _validate_command_args(cmd)
+
+    return subprocess.Popen(cmd, **kwargs)
+
+
+def _validate_command_args(cmd: list):
+    """Validate subprocess command arguments."""
     if not cmd or not all(isinstance(arg, str) and arg for arg in cmd):
         raise ValueError("Invalid command arguments")
 
-    return subprocess.Popen(cmd, **kwargs)
+
+def _run_secure_subprocess_pty(
+    cmd: list,
+    *,
+    master_read: Optional[Any] = None,
+    stdin_read: Optional[Any] = None,
+) -> int:
+    """Run a subprocess inside a PTY with argument validation."""
+    _validate_command_args(cmd)
+    if master_read and not callable(master_read):
+        raise ValueError("master_read must be callable")
+    if stdin_read and not callable(stdin_read):
+        raise ValueError("stdin_read must be callable")
+
+    try:
+        return pty.spawn(cmd, master_read=master_read, stdin_read=stdin_read)
+    except OSError as exc:
+        raise subprocess.SubprocessError(f"Failed to execute command: {exc}") from exc
 
 
 # Helper functions
@@ -1126,7 +1162,9 @@ class SandyNet:
                 self._run_iptables(
                     "-F", "sandy-rej", error_prefix="Flush sandy-rej chain"
                 )
-                self._run_iptables("-Z", "sandy-rej", error_prefix="Zero sandy-rej chain")
+                self._run_iptables(
+                    "-Z", "sandy-rej", error_prefix="Zero sandy-rej chain"
+                )
             else:
                 # Create new chain
                 self._run_iptables(
@@ -1157,7 +1195,9 @@ class SandyNet:
                 self._run_iptables(
                     "-F", "sandy-fwd", error_prefix="Flush sandy-fwd chain"
                 )
-                self._run_iptables("-Z", "sandy-fwd", error_prefix="Zero sandy-fwd chain")
+                self._run_iptables(
+                    "-Z", "sandy-fwd", error_prefix="Zero sandy-fwd chain"
+                )
             else:
                 # Create new chain
                 self._run_iptables(
@@ -1183,7 +1223,9 @@ class SandyNet:
                 self._run_iptables(
                     "-F", "sandy-out", error_prefix="Flush sandy-out chain"
                 )
-                self._run_iptables("-Z", "sandy-out", error_prefix="Zero sandy-out chain")
+                self._run_iptables(
+                    "-Z", "sandy-out", error_prefix="Zero sandy-out chain"
+                )
             else:
                 # Create new chain
                 self._run_iptables(
@@ -1975,7 +2017,10 @@ class SandyNet:
                 )
                 # Flush and delete the chain
                 self._run_iptables(
-                    "-F", "sandy-nat-out", table="nat", error_prefix="Flush sandy-nat-out"
+                    "-F",
+                    "sandy-nat-out",
+                    table="nat",
+                    error_prefix="Flush sandy-nat-out",
                 )
                 self._run_iptables(
                     "-X",
@@ -2002,7 +2047,10 @@ class SandyNet:
                 )
                 # Flush and delete the chain
                 self._run_iptables(
-                    "-F", "sandy-nat-pre", table="nat", error_prefix="Flush sandy-nat-pre"
+                    "-F",
+                    "sandy-nat-pre",
+                    table="nat",
+                    error_prefix="Flush sandy-nat-pre",
                 )
                 self._run_iptables(
                     "-X",
@@ -3068,13 +3116,48 @@ class Sandy:
 
         return _run_secure_subprocess(nsenter_cmd)
 
-    def _wait_for_container_ready(self, timeout=300):
-        """Wait for container to be ready for nsenter commands"""
+    def _run_container_interactive(
+        self, cmd, spinner_line_event: Optional[threading.Event] = None
+    ):
+        """Run systemd-nspawn interactively while monitoring output for spinner."""
+        newline_injected = False
+
+        def master_read(fd: int) -> bytes:
+            nonlocal newline_injected
+            try:
+                data = os.read(fd, 1024)
+            except OSError:
+                return b""
+            if data and not newline_injected:
+                newline_injected = True
+                if spinner_line_event:
+                    _finish_spinner_line(spinner_line_event)
+            return data
+
+        def stdin_read(fd: int) -> bytes:
+            try:
+                return os.read(fd, 1024)
+            except OSError:
+                return b""
+
+        try:
+            return_code = _run_secure_subprocess_pty(
+                cmd, master_read=master_read, stdin_read=stdin_read
+            )
+        finally:
+            if spinner_line_event and not spinner_line_event.is_set():
+                spinner_line_event.set()
+        return return_code
+
+    def _wait_for_container_ready(
+        self, spinner_line_event: Optional[threading.Event] = None
+    ):
+        """Wait for container readiness; show spinner dots only when requested."""
         import time
 
-        start_time = time.time()
+        spinner_active = bool(spinner_line_event) and not spinner_line_event.is_set()
 
-        while time.time() - start_time < timeout:
+        while True:
             pid = self._is_container_running()
             if pid:
                 # Test if we can execute a simple command
@@ -3088,8 +3171,12 @@ class Sandy:
                         return True
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                     pass
+            if spinner_active:
+                if spinner_line_event.is_set():
+                    spinner_active = False
+                else:
+                    print(".", end="", flush=True)
             time.sleep(1)
-        return False
 
     def _get_container_ip(self) -> Optional[str]:
         """Extract container IP from /init.sh file"""
@@ -3656,24 +3743,36 @@ class Sandy:
             print(f"E: Error cleaning up nftables port forwarding: {e}")
             return False
 
-    def _run_init_script(self, silent=False, network_mode="lenient"):
-        """Execute /init.sh as root if it exists and network is configured"""
+    def _run_init_script(
+        self,
+        silent=False,
+        network_mode="lenient",
+        spinner_line_event: Optional[threading.Event] = None,
+    ):
+        """Execute /init.sh as root if it exists and network is configured.
+
+        Returns True if readiness wait was performed, False otherwise.
+        """
+        wait_attempted = False
         if network_mode == "host":
             # Skip init script in host networking mode
-            return
+            return wait_attempted
         if not (self.network and self.network.configured):
-            return
+            return wait_attempted
 
         mdir = self._get_machine_dir()
         init_script_path = os.path.join(mdir, "init.sh")
 
         if os.path.exists(init_script_path):
+            wait_attempted = True
             if not silent:
                 print("I: Waiting for container to be ready...")
-            if not self._wait_for_container_ready():
+            if not self._wait_for_container_ready(
+                spinner_line_event=spinner_line_event
+            ):
                 if not silent:
                     print("W: Container not ready for network initialization")
-                return
+                return wait_attempted
 
             if not silent:
                 print("I: Executing network initialization script as root")
@@ -3684,6 +3783,9 @@ class Sandy:
             else:
                 if not silent:
                     print("I: Network initialization completed")
+            return wait_attempted
+
+        return wait_attempted
 
     def _build(self):
         """Build container"""
@@ -3693,9 +3795,7 @@ class Sandy:
             return
 
         # Check if caching is disabled (enabled by default)
-        cache_disabled = os.environ.get(
-            "SANDY_CONTAINER_CACHE", ""
-        ).lower() in [
+        cache_disabled = os.environ.get("SANDY_CONTAINER_CACHE", "").lower() in [
             "n",
             "no",
             "0",
@@ -3880,7 +3980,10 @@ class Sandy:
 
         # XXX: probably should create a systemd unit for this
         if args.detach:
-            print(f"I: Starting '{self.container}' in detached state")
+            spinner_line_event = threading.Event()
+            print(
+                f"I: Starting '{self.container}' in detached state ", end="", flush=True
+            )
             _run_secure_subprocess_popen(
                 cmd,
                 start_new_session=True,
@@ -3889,18 +3992,34 @@ class Sandy:
                 stderr=subprocess.DEVNULL,
             )
             # Run network initialization after detached start
-            self._run_init_script(silent=True, network_mode=args.network)
+            waited_for_readiness = self._run_init_script(
+                silent=True,
+                network_mode=args.network,
+                spinner_line_event=spinner_line_event,
+            )
+            if waited_for_readiness:
+                _finish_spinner_line(spinner_line_event, suffix=" done")
+            else:
+                _finish_spinner_line(spinner_line_event)
         else:
-            print(f"I: Starting '{self.container}'")
+            spinner_line_event = threading.Event()
+            print(f"I: Starting '{self.container}' ", end="", flush=True)
             # Start container in background thread and run network init silently
             container_thread = threading.Thread(
-                target=lambda: _run_secure_subprocess(cmd)
+                target=lambda: self._run_container_interactive(
+                    cmd, spinner_line_event=spinner_line_event
+                )
             )
             container_thread.daemon = True
             container_thread.start()
 
             # Run network initialization silently
-            self._run_init_script(silent=True, network_mode=args.network)
+            waited_for_readiness = self._run_init_script(
+                silent=True,
+                network_mode=args.network,
+                spinner_line_event=spinner_line_event,
+            )
+            _finish_spinner_line(spinner_line_event)
 
             # Wait for container to complete
             container_thread.join()
@@ -4290,9 +4409,7 @@ def main():
     else:
         # Validate default username too
         if not _validate_username(sandy.user):
-            print(
-                f"E: Invalid default username '{_sanitize_log_output(sandy.user)}'"
-            )
+            print(f"E: Invalid default username '{_sanitize_log_output(sandy.user)}'")
             sys.exit(1)
 
     # Execute command
