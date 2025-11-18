@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 from contextlib import contextmanager
-from typing import Any, Dict, Final, Optional, Tuple
+from typing import Any, Callable, Dict, Final, Optional, Tuple
 
 # Set environment variable to disable systemd colors
 os.environ["SYSTEMD_COLORS"] = "0"
@@ -210,18 +210,25 @@ def _validate_command_args(cmd: list):
 def _run_secure_subprocess_pty(
     cmd: list,
     *,
-    master_read: Optional[Any] = None,
-    stdin_read: Optional[Any] = None,
+    master_read: Optional[Callable[[int], bytes]] = None,
+    stdin_read: Optional[Callable[[int], bytes]] = None,
 ) -> int:
     """Run a subprocess inside a PTY with argument validation."""
     _validate_command_args(cmd)
-    if master_read and not callable(master_read):
+
+    if master_read is None:
         raise ValueError("master_read must be callable")
-    if stdin_read and not callable(stdin_read):
+    if stdin_read is None:
         raise ValueError("stdin_read must be callable")
 
+    spawn_kwargs: Dict[str, Callable[[int], bytes]] = {}
+    if master_read:
+        spawn_kwargs["master_read"] = master_read
+    if stdin_read:
+        spawn_kwargs["stdin_read"] = stdin_read
+
     try:
-        return pty.spawn(cmd, master_read=master_read, stdin_read=stdin_read)
+        return pty.spawn(cmd, **spawn_kwargs)
     except OSError as exc:
         raise subprocess.SubprocessError(f"Failed to execute command: {exc}") from exc
 
@@ -3177,7 +3184,9 @@ class Sandy:
         """Wait for container readiness; show spinner dots only when requested."""
         import time
 
-        spinner_active = bool(spinner_line_event) and not spinner_line_event.is_set()
+        spinner_active = False
+        if spinner_line_event:
+            spinner_active = not spinner_line_event.is_set()
 
         while True:
             pid = self._is_container_running()
@@ -3193,7 +3202,7 @@ class Sandy:
                         return True
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                     pass
-            if spinner_active:
+            if spinner_active and spinner_line_event:
                 if spinner_line_event.is_set():
                     spinner_active = False
                 else:
@@ -4158,6 +4167,7 @@ class Sandy:
 
     def run_down(self, args):
         """Stop and remove container"""
+        _ = args
         self._machine_poweroff()
 
     def run_bash(self, args):
