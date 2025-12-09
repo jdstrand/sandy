@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import array
 import fcntl
 import glob
 import hashlib
@@ -11,6 +12,7 @@ import platform
 import pty
 import random
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -20,6 +22,7 @@ import subprocess
 import sys
 import termios
 import threading
+import tty
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Final, Optional, Tuple
 
@@ -224,8 +227,6 @@ def _run_secure_subprocess_pty(
     if stdin_read is None:
         raise ValueError("stdin_read must be callable")
 
-    master_fd: Optional[int] = None
-
     def set_winsize(fd: int):
         """Set PTY window size from current terminal size."""
         try:
@@ -236,17 +237,65 @@ def _run_secure_subprocess_pty(
         winsize = struct.pack("HHHH", rows, cols, 0, 0)
         fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
 
-    def handle_sigwinch(signum, frame):
-        """Handle terminal resize."""
-        if master_fd is not None:
-            set_winsize(master_fd)
+    # Fork with PTY
+    pid, master_fd = pty.fork()
 
-    def wrapped_master_read(fd: int) -> bytes:
-        nonlocal master_fd
-        if master_fd is None:
-            master_fd = fd
-            set_winsize(fd)
-        return master_read(fd)
+    if pid == 0:
+        # Child process - exec the command
+        try:
+            os.execvp(cmd[0], cmd)
+        except OSError as exc:
+            sys.stderr.write(f"Failed to execute {cmd[0]}: {exc}\n")
+            os._exit(1)
+
+    # Parent process - get slave path for signaling on resize
+    slave_path: Optional[str] = None
+    try:
+        buf = array.array("i", [0])
+        fcntl.ioctl(master_fd, 0x80045430, buf)  # TIOCGPTN
+        slave_path = f"/dev/pts/{buf[0]}"
+    except OSError:
+        # Resize still works for outer PTY; just can't propagate to container
+        pass
+
+    def signal_slave_processes():
+        """Find and signal all processes using the PTY slave (best-effort).
+
+        Safe across containers: slave_path is in host's devpts namespace,
+        so only processes with our specific host PTY are signaled.
+        """
+        if slave_path is None:
+            return
+        for proc_pid in os.listdir("/proc"):
+            if not proc_pid.isdigit():
+                continue
+            try:
+                fd_dir = f"/proc/{proc_pid}/fd"
+                for fd in os.listdir(fd_dir):
+                    if os.readlink(f"{fd_dir}/{fd}") == slave_path:
+                        os.kill(int(proc_pid), signal.SIGWINCH)
+                        break
+            except (OSError, PermissionError):
+                continue
+
+    sigwinch_received = False
+
+    def handle_sigwinch(signum, frame):
+        _ = signum
+        _ = frame
+        nonlocal sigwinch_received
+        sigwinch_received = True
+
+    # Set initial window size
+    set_winsize(master_fd)
+
+    # Save and set terminal to raw mode
+    old_settings = None
+    try:
+        old_settings = termios.tcgetattr(sys.stdin.fileno())
+        tty.setraw(sys.stdin.fileno())
+    except termios.error:
+        pass
 
     # Only install SIGWINCH handler in main thread
     in_main_thread = threading.current_thread() is threading.main_thread()
@@ -255,12 +304,53 @@ def _run_secure_subprocess_pty(
         old_handler = signal.signal(signal.SIGWINCH, handle_sigwinch)
 
     try:
-        return pty.spawn(cmd, master_read=wrapped_master_read, stdin_read=stdin_read)
-    except OSError as exc:
-        raise subprocess.SubprocessError(f"Failed to execute command: {exc}") from exc
+        stdin_fd = sys.stdin.fileno()
+        while True:
+            # Handle any pending SIGWINCH
+            if sigwinch_received:
+                sigwinch_received = False
+                set_winsize(master_fd)
+                signal_slave_processes()
+
+            # Wait for data from stdin or master
+            try:
+                rfds, _, _ = select.select([stdin_fd, master_fd], [], [])
+            except InterruptedError:
+                continue
+
+            if stdin_fd in rfds:
+                data = stdin_read(stdin_fd)
+                if data:
+                    os.write(master_fd, data)
+
+            if master_fd in rfds:
+                try:
+                    data = master_read(master_fd)
+                    if data:
+                        os.write(sys.stdout.fileno(), data)
+                    else:
+                        break
+                except OSError:
+                    break
     finally:
+        if old_settings is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSAFLUSH, old_settings)
+            except termios.error:
+                pass
+
         if in_main_thread and old_handler is not None:
             signal.signal(signal.SIGWINCH, old_handler)
+
+        os.close(master_fd)
+
+    # Wait for child and return exit status
+    _, status = os.waitpid(pid, 0)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    elif os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    return -1
 
 
 # Helper functions
@@ -3127,7 +3217,7 @@ class Sandy:
         if workdir:
             exec_cmd = f"cd {shlex.quote(workdir)} && {exec_cmd}"
 
-        # Allocate a controlling TTY so interactive shells (bash, top, etc.) behave normally
+        # Use script to allocate a proper controlling terminal for job control
         script_wrapped_cmd = f"script -qec {shlex.quote(exec_cmd)} /dev/null"
 
         # Execute using nsenter ('machinectl shell' can only be used if
@@ -3146,7 +3236,8 @@ class Sandy:
             script_wrapped_cmd,
         ]
 
-        _run_secure_subprocess(nsenter_cmd)
+        # Use _run_container_interactive for proper PTY with terminal size
+        self._run_container_interactive(nsenter_cmd)
 
     def _exec_as_root(self, command):
         """Execute command in container as root using nsenter"""
