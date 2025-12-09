@@ -137,6 +137,25 @@ fi
 echo -e "\nI: Adjust PATH for go"
 echo "export PATH=\"\$PATH:/usr/local/go/bin:\$HOME/go/bin\"" >> "/home/$AI_USER/.bashrc"
 
+# add resize_term function for terminal resize in sandy -c <container> sessions
+echo -e "\nI: Add resize_term function"
+cat >> "/home/$AI_USER/.bashrc" << 'EOF'
+
+# Resize terminal by querying the terminal emulator directly
+resize_term() {
+    local old_settings=$(stty -g)
+    stty raw -echo min 0 time 1
+    printf '\e[18t'
+    local response
+    IFS=';' read -r -d 't' _ rows cols < /dev/tty
+    stty "$old_settings"
+    if [[ -n "$rows" && -n "$cols" ]]; then
+        stty rows "$rows" cols "$cols"
+    fi
+    echo "Terminal size (rows x cols): $(stty size)"
+}
+EOF
+
 # Install node
 if [ ! -e "/home/$AI_USER/.nvm" ]; then
   echo -e "\nI: Install node"
