@@ -13,9 +13,12 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import stat
+import struct
 import subprocess
 import sys
+import termios
 import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Final, Optional, Tuple
@@ -213,7 +216,7 @@ def _run_secure_subprocess_pty(
     master_read: Optional[Callable[[int], bytes]] = None,
     stdin_read: Optional[Callable[[int], bytes]] = None,
 ) -> int:
-    """Run a subprocess inside a PTY with argument validation."""
+    """Run a subprocess inside a PTY with argument validation and terminal size handling."""
     _validate_command_args(cmd)
 
     if master_read is None:
@@ -221,16 +224,43 @@ def _run_secure_subprocess_pty(
     if stdin_read is None:
         raise ValueError("stdin_read must be callable")
 
-    spawn_kwargs: Dict[str, Callable[[int], bytes]] = {}
-    if master_read:
-        spawn_kwargs["master_read"] = master_read
-    if stdin_read:
-        spawn_kwargs["stdin_read"] = stdin_read
+    master_fd: Optional[int] = None
+
+    def set_winsize(fd: int):
+        """Set PTY window size from current terminal size."""
+        try:
+            size = os.get_terminal_size()
+            rows, cols = size.lines, size.columns
+        except OSError:
+            rows, cols = 24, 80
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+
+    def handle_sigwinch(signum, frame):
+        """Handle terminal resize."""
+        if master_fd is not None:
+            set_winsize(master_fd)
+
+    def wrapped_master_read(fd: int) -> bytes:
+        nonlocal master_fd
+        if master_fd is None:
+            master_fd = fd
+            set_winsize(fd)
+        return master_read(fd)
+
+    # Only install SIGWINCH handler in main thread
+    in_main_thread = threading.current_thread() is threading.main_thread()
+    old_handler = None
+    if in_main_thread:
+        old_handler = signal.signal(signal.SIGWINCH, handle_sigwinch)
 
     try:
-        return pty.spawn(cmd, **spawn_kwargs)
+        return pty.spawn(cmd, master_read=wrapped_master_read, stdin_read=stdin_read)
     except OSError as exc:
         raise subprocess.SubprocessError(f"Failed to execute command: {exc}") from exc
+    finally:
+        if in_main_thread and old_handler is not None:
+            signal.signal(signal.SIGWINCH, old_handler)
 
 
 # Helper functions
@@ -4037,25 +4067,22 @@ class Sandy:
         else:
             spinner_line_event = threading.Event()
             print(f"I: Starting '{self.container}' ", end="", flush=True)
-            # Start container in background thread and run network init silently
-            container_thread = threading.Thread(
-                target=lambda: self._run_container_interactive(
-                    cmd, spinner_line_event=spinner_line_event
+            # Run network initialization in background thread
+            init_thread = threading.Thread(
+                target=lambda: self._run_init_script(
+                    silent=True,
+                    network_mode=args.network,
+                    spinner_line_event=spinner_line_event,
                 )
             )
-            container_thread.daemon = True
-            container_thread.start()
+            init_thread.daemon = True
+            init_thread.start()
 
-            # Run network initialization silently
-            waited_for_readiness = self._run_init_script(
-                silent=True,
-                network_mode=args.network,
-                spinner_line_event=spinner_line_event,
-            )
-            _finish_spinner_line(spinner_line_event)
+            # Run container interactively in main thread for proper SIGWINCH handling
+            self._run_container_interactive(cmd, spinner_line_event=spinner_line_event)
 
-            # Wait for container to complete
-            container_thread.join()
+            # Wait for init thread to complete
+            init_thread.join()
 
             # Clean up port forwarding rules after container exits
             if self.port_mappings and self.network and self.network.configured:
