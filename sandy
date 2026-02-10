@@ -1306,7 +1306,7 @@ class SandyNet:
                 "-j",
                 "LOG",
                 "--log-prefix",
-                "[CLDT-BLOCK] ",
+                "[SNDY-BLOCK] ",
                 error_prefix="Add LOG rule to sandy-rej",
             )
             self._run_iptables(
@@ -1499,7 +1499,7 @@ class SandyNet:
                 "-j",
                 "LOG",
                 "--log-prefix",
-                "[CLDT-OUT-BLOCK] ",
+                "[SNDY-OUT-BLOCK] ",
                 error_prefix="Add LOG rule to sandy-out",
             )
 
@@ -1546,7 +1546,7 @@ class SandyNet:
                     "-j",
                     "LOG",
                     "--log-prefix",
-                    "[CLDT-BLOCK] ",
+                    "[SNDY-BLOCK] ",
                     error_prefix="Add LOG rule to sandy-rej6",
                 )
                 self._run_ip6tables(
@@ -1690,7 +1690,7 @@ class SandyNet:
                     net,
                     "log",
                     "prefix",
-                    '"[CLDT-BLOCK] "',
+                    '"[SNDY-BLOCK] "',
                     error_prefix=f"Log access to {net}",
                 )
                 # Add reject rule
@@ -1843,7 +1843,7 @@ class SandyNet:
                 network_cidr,
                 "log",
                 "prefix",
-                '"[CLDT-OUT-BLOCK] "',
+                '"[SNDY-OUT-BLOCK] "',
                 error_prefix="Add LOG rule to output_filter",
             )
 
@@ -1904,7 +1904,7 @@ class SandyNet:
                     net,
                     "log",
                     "prefix",
-                    '"[CLDT-BLOCK] "',
+                    '"[SNDY-BLOCK] "',
                     error_prefix=f"Log IPv6 access to {net}",
                 )
                 # Add reject rule
@@ -1934,7 +1934,7 @@ class SandyNet:
                 f'"{self.bridge_name}"',
                 "log",
                 "prefix",
-                '"[CLDT-BLOCK] "',
+                '"[SNDY-BLOCK] "',
                 error_prefix="Log remaining IPv6 traffic",
             )
             self._run_nft(

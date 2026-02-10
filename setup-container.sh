@@ -68,6 +68,7 @@ apt-get install -y \
   bash-completion \
   bind9-host \
   command-not-found \
+  incus-client \
   less \
   lsb-base \
   neovim \
