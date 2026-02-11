@@ -73,6 +73,7 @@ apt-get install -y \
   lsb-base \
   neovim \
   netcat-openbsd \
+  patchelf \
   procps
 apt-get update  # for command-not-found
 
