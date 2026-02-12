@@ -6,9 +6,9 @@ AI_LOCALE="en_US.UTF-8"
 AI_NODEJS_VERSION="22"
 RUSTUP_VERSION="1.28.2"
 RUSTUP_SHA256="17247e4bcacf6027ec2e11c79a72c494c9af69ac8d1abcc1b271fa4375a106c2"
-GOLANG_VERSION="1.25.3"
+GOLANG_VERSION="1.25.7"
 GOLANG_ARCH="amd64"
-GOLANG_SHA256="0335f314b6e7bfe08c3d0cfaa7c19db961b7b99fb20be62b0a826c992ad14e0f"
+GOLANG_SHA256="12e6d6a191091ae27dc31f6efc630e3a3b8ba409baf3573d955b196fdf086005"
 ARCH=$(uname -m)
 if [ "$ARCH" = "aarch64" ]; then
     GOLANG_SHA256="1d42ebc84999b5e2069f5e31b67d6fc5d67308adad3e178d5a2ee2c9ff2001f5"
@@ -68,7 +68,6 @@ apt-get install -y \
   bash-completion \
   bind9-host \
   command-not-found \
-  incus-client \
   less \
   lsb-base \
   neovim \
@@ -83,6 +82,7 @@ apt-get install -y \
   curl \
   file \
   git \
+  incus-client \
   iputils-ping \
   jq \
   manpages-dev \
@@ -135,9 +135,23 @@ if ! test -e "/home/$AI_USER"/go/bin/yq ; then
   su -l "$AI_USER" -c "/usr/local/go/bin/go install github.com/mikefarah/yq/v4@v4.47.2"
 fi
 
-# adjust path for go
-echo -e "\nI: Adjust PATH for go"
-echo "export PATH=\"\$PATH:/usr/local/go/bin:\$HOME/go/bin\"" >> "/home/$AI_USER/.bashrc"
+# ensure ~/.local/bin exists
+if ! test -d "/home/$AI_USER/.local/bin" ; then
+  echo -e "\nI: create ~/.local/bin"
+  su -l "$AI_USER" -c "mkdir -p /home/$AI_USER/.local/bin"
+fi
+
+# adjust path for go and ~/.local/bin
+echo -e "\nI: Adjust PATH for go and ~/.local/bin"
+echo "export PATH=\"\$PATH:/usr/local/go/bin:\$HOME/go/bin:\$HOME/.local/bin\"" >> "/home/$AI_USER/.bashrc"
+
+# update the git credential helper to honor GH_TOKEN with https://github.com/...
+echo -e "\nI: Add git credential helper for GH_TOKEN and https://github.com/..."
+cat > "/home/$AI_USER/.gitconfig" << 'EOF'
+[credential "https://github.com"]
+	helper = "!f() { echo \"username=x-access-token\"; echo \"password=${GH_TOKEN}\"; }; f"
+EOF
+chown "$AI_USER:$AI_USER" "/home/$AI_USER/.gitconfig"
 
 # add resize_term function for terminal resize in sandy -c <container> sessions
 echo -e "\nI: Add resize_term function"
@@ -173,25 +187,18 @@ fi
 #
 ai_tools=()
 
-# Install claude code
-if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/claude ; then
+# Install claude code - native install
+if [ ! -e "/home/$AI_USER/.local/bin/claude" ]; then
   echo -e "\nI: Install claude"
-  # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
-  # PATH as part of nvm install
-  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @anthropic-ai/claude-code"
-  # disable auto-updates (don't work in ephemeral container
+  cd "$TMPDIR"
+  curl -fsSL -o claude-install.sh https://claude.ai/install.sh
+  echo "a27f0c75029d86eab7313ce4d5a2464e4e68dcce76905a1462a76ab4f19937de  claude-install.sh" --check -- || exit 1
+  su -l "$AI_USER" -c "bash $TMPDIR/claude-install.sh"
+
+  # disable auto-updates (don't work in ephemeral container; verify with native install)
   echo '{"autoUpdates": false}' > "/home/$AI_USER/.claude.json"
   chown "$AI_USER:$AI_USER" "/home/$AI_USER/.claude.json"
   chmod 600 "/home/$AI_USER/.claude.json"
-  ai_tools+=("claude (https://www.claude.com/product/claude-code; newline: shift+enter or '\')")
-fi
-
-if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/ccusage ; then
-  echo -e "\nI: Install ccusage (for claude)"
-  # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
-  # PATH as part of nvm install
-  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g ccusage@latest"
-  ai_tools+=("ccusage (for claude code; https://www.npmjs.com/package/ccusage)")
 fi
 
 # Install openai codex
