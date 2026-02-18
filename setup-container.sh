@@ -66,6 +66,7 @@ update-locale LANG="$AI_LOCALE"
 echo -e "\nI: Install handy tools"
 apt-get install -y \
   bash-completion \
+  bind9-dnsutils \
   bind9-host \
   command-not-found \
   less \
