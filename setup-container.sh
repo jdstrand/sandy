@@ -199,6 +199,14 @@ if [ ! -e "/home/$AI_USER/.local/bin/claude" ]; then
   echo '{"autoUpdates": false}' > "/home/$AI_USER/.claude.json"
   chown "$AI_USER:$AI_USER" "/home/$AI_USER/.claude.json"
   chmod 600 "/home/$AI_USER/.claude.json"
+
+  # install plugins (lsp improves efficiency (doesn't need compiler))
+  echo -e "\nI: claude plugin marketplace add anthropics/claude-plugins-official"
+  su -l "$AI_USER" -c "claude plugin marketplace add anthropics/claude-plugins-official"
+  for plugin in gopls-lsp pyright-lsp rust-analyzer-lsp typescript-lsp ; do
+    echo -e "\nI: claude plugin install $plugin@claude-plugins-official"
+    su -l "$AI_USER" -c "claude plugin install $plugin@claude-plugins-official"
+  done
 fi
 
 # Install openai codex
