@@ -17,6 +17,12 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
+# If running under Ghostty, fall back to xterm-256color since the container
+# won't have the xterm-ghostty terminfo entry.
+if [ "$TERM" = "xterm-ghostty" ]; then
+    export TERM=xterm-256color
+fi
+
 echo "I: Setting up the sandbox environment"
 if grep -q "^ID=ubuntu$" /etc/os-release; then
     echo -e "\n# Adding Ubuntu security and updates repositories"
@@ -62,6 +68,11 @@ echo -e "\nI: Generate locale for $AI_LOCALE"
 echo "$AI_LOCALE UTF-8" > /etc/locale.gen
 locale-gen "$AI_LOCALE"
 update-locale LANG="$AI_LOCALE"
+
+# Ensure interactive shells fall back from xterm-ghostty to xterm-256color
+echo -e "\nI: Add xterm-ghostty TERM fallback to /etc/bash.bashrc"
+echo '# xterm-ghostty terminfo is not available in the container' >> /etc/bash.bashrc
+echo 'if [ "$TERM" = "xterm-ghostty" ]; then export TERM=xterm-256color; fi' >> /etc/bash.bashrc
 
 echo -e "\nI: Install handy tools"
 apt-get install -y \
