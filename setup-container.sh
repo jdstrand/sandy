@@ -85,11 +85,13 @@ apt-get install -y \
   bind9-dnsutils \
   bind9-host \
   command-not-found \
+  gh \
   less \
   lsb-base \
   neovim \
   netcat-openbsd \
   patchelf \
+  poppler-utils \
   procps
 apt-get update  # for command-not-found
 
