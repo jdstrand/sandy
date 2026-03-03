@@ -2271,6 +2271,7 @@ class Sandy:
     def __init__(self):
         self.container = "ai-dev"
         self.workspace = "workspace"
+        self.shared = None
         self.user = "developer"
         self.user_home = f"/home/{self.user}"
 
@@ -4093,42 +4094,50 @@ class Sandy:
 
         if not args.persistent:
             # --ephemeral affects the root namespace and not submounts. When
-            # specified, all changes to the system (excepting workspace, below)
+            # specified, all changes to the system (excepting bind mounts below)
             # are discarded.
             cmd.append("--ephemeral")
 
+        # Bind mount workspace and shared directories
+        mount_specs = []
         if self.workspace:
-            # If the workspace directory exists on both the host and the guest,
-            # bind mount it into the container and chdir into it. Otherwise,
-            # chdir into the user's home
-            realp = os.path.realpath(self.workspace)
+            mount_specs.append(("workspace", self.workspace, "workspace", True))
+        if self.shared:
+            mount_specs.append(("shared", self.shared, "shared", False))
+
+        chdir_set = False
+        for label, host_rel, subdir, do_chdir in mount_specs:
+            realp = os.path.realpath(host_rel)
+            intp = f"{self.user_home}/{subdir}"
             if not os.path.isdir(realp):
                 print(
-                    f"W: Could not find '{self.workspace}' on the host, skipping mount"
+                    f"W: Could not find '{host_rel}' on the host, skipping {label} mount"
                 )
-                cmd.append(f"--chdir={self.user_home}")
+                continue
+            extp = os.path.join(mdir, intp[1:])
+            if not os.path.isdir(extp):
+                print(
+                    f"W: Could not find '{intp}' in the container. Skipping {label} mount"
+                )
+                continue
+            if self.systemd_version >= 250:
+                cmd.append(f"--bind={realp}:{intp}:idmap")
             else:
-                intp = f"{self.user_home}/workspace"
-                extp = os.path.join(mdir, intp[1:])
-                if os.path.isdir(extp):
-                    # Use :idmap if supported
-                    if self.systemd_version >= 250:
-                        cmd.append(f"--bind={realp}:{intp}:idmap")
-                    else:
-                        cmd.append(f"--bind={realp}:{intp}")
-                    cmd.append(f"--chdir={intp}")
-                    print(f"I: Mounting '{realp}' on '{intp}'")
-                else:
-                    print(
-                        f"W: Could not find '{intp}' in the container. Skipping workspace mount"
-                    )
-                    cmd.append(f"--chdir={self.user_home}")
+                cmd.append(f"--bind={realp}:{intp}")
+            print(f"I: Mounting '{realp}' on '{intp}'")
+            if do_chdir:
+                cmd.append(f"--chdir={intp}")
+                chdir_set = True
 
-        # Add ACLs if using fallback method (systemd < 250)
-        if self.systemd_version < 250 and self.workspace:
-            realp = os.path.realpath(self.workspace)
-            if os.path.isdir(realp):
-                self._setfacl(realp, self.container)
+        if not chdir_set:
+            cmd.append(f"--chdir={self.user_home}")
+
+        # ACL fallback for systemd < 250
+        if self.systemd_version < 250:
+            for label, host_rel, subdir, do_chdir in mount_specs:
+                realp = os.path.realpath(host_rel)
+                if os.path.isdir(realp):
+                    self._setfacl(realp, self.container)
 
         # Bind mount init.sh as read-only to protect it from modification
         init_script_path = os.path.join(mdir, "init.sh")
@@ -4376,6 +4385,15 @@ class Sandy:
             print(f"{name:<{col_width}} {status:<10} {path}")
 
 
+class _StoreOnceAction(argparse.Action):
+    """Argparse action that rejects duplicate specification of an argument."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest) is not None:
+            parser.error(f"{option_string} can only be specified once")
+        setattr(namespace, self.dest, values)
+
+
 def parse_args_custom():
     """Custom argument parser to handle REMAINDER args properly"""
 
@@ -4393,6 +4411,7 @@ def parse_args_custom():
     # Manually parse global args first
     global_parser = argparse.ArgumentParser(add_help=False)
     global_parser.add_argument("-w", "--workspace", default="workspace")
+    global_parser.add_argument("-s", "--shared", default=None)
     global_parser.add_argument("--container")
     global_parser.add_argument("--user", default="developer")
 
@@ -4417,7 +4436,8 @@ def parse_args_custom():
         epilog="""
 Examples:
   %(prog)s                           # Launch shell
-  %(prog)s -w myproject              # Launch in workspace subdirectory
+  %(prog)s -w myproject              # Mount and launch in workspace subdirectory
+  %(prog)s -s shared                 # Mount shared directory
   %(prog)s up -d --build             # Build and start detached
   %(prog)s exec -- cargo test        # Run tests in container
   %(prog)s bash -c "echo hello"      # Run bash with arguments
@@ -4431,7 +4451,18 @@ Environment Variables:
     )
 
     # Add global arguments
-    parser.add_argument("-w", "--workspace", help="Workspace subdirectory to use")
+    parser.add_argument(
+        "-w",
+        "--workspace",
+        action=_StoreOnceAction,
+        help="Workspace subdirectory to use",
+    )
+    parser.add_argument(
+        "-s",
+        "--shared",
+        action=_StoreOnceAction,
+        help="Shared directory to mount at ~/shared in container",
+    )
     parser.add_argument("-c", "--container", help="Container name (default: ai-dev)")
     parser.add_argument(
         "-u", "--user", default="developer", help="User to run as (default: developer)"
@@ -4541,6 +4572,12 @@ def main():
             print(f"E: Invalid workspace path '{_sanitize_log_output(args.workspace)}'")
             sys.exit(1)
         sandy.workspace = args.workspace
+
+    if args.shared:
+        if not _validate_workspace_path(args.shared):
+            print(f"E: Invalid shared path '{_sanitize_log_output(args.shared)}'")
+            sys.exit(1)
+        sandy.shared = args.shared
 
     if args.container:
         if not _validate_container_name(args.container):

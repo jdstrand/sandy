@@ -64,6 +64,11 @@ if [ ! -e "/home/$AI_USER/workspace" ]; then
   su -l "$AI_USER" -c "mkdir /home/$AI_USER/workspace"
 fi
 
+# Setup the shared directory
+if [ ! -e "/home/$AI_USER/shared" ]; then
+  su -l "$AI_USER" -c "mkdir /home/$AI_USER/shared"
+fi
+
 echo -e "\nI: Generate locale for $AI_LOCALE"
 echo "$AI_LOCALE UTF-8" > /etc/locale.gen
 locale-gen "$AI_LOCALE"
