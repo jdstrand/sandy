@@ -213,7 +213,9 @@ if [ ! -e "/home/$AI_USER/.local/bin/claude" ]; then
   curl -fsSL -o claude-install.sh https://claude.ai/install.sh
   echo "a27f0c75029d86eab7313ce4d5a2464e4e68dcce76905a1462a76ab4f19937de  claude-install.sh" --check -- || exit 1
   su -l "$AI_USER" -c "bash $TMPDIR/claude-install.sh"
-  ai_tools+=("claude (https://github.com/anthropics/claude-code; newline: ctrl+j or shift+enter)")
+  ai_tools+=("claude (https://github.com/anthropics/claude-code):")
+  ai_tools+=("- newline: ctrl+j or shift+enter")
+  ai_tools+=("- verbose: launch with 'claude --verbose' or use '/config' to toggle")
 
   # disable auto-updates (don't work in ephemeral container; verify with native install)
   echo '{"autoUpdates": false}' > "/home/$AI_USER/.claude.json"
