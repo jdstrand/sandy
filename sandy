@@ -69,9 +69,13 @@ def _validate_workspace_path(path: str) -> bool:
     """Validate workspace path to prevent directory traversal"""
     if not path:
         return False
-    # Prevent path traversal attacks
+
     normalized = os.path.normpath(path)
-    if ".." in normalized or normalized.startswith("/"):
+    if ".." in normalized:
+        # Prevent path traversal attacks
+        return False
+    elif normalized.startswith("/"):
+        # For UX consistency, don't allow absolute paths
         return False
     return True
 
