@@ -223,7 +223,7 @@ if [ ! -e "/home/$AI_USER/.local/bin/claude" ]; then
   # install plugins (lsp improves efficiency (doesn't need compiler))
   echo -e "\nI: claude plugin marketplace add anthropics/claude-plugins-official"
   su -l "$AI_USER" -c "claude plugin marketplace add anthropics/claude-plugins-official"
-  for plugin in gopls-lsp pyright-lsp rust-analyzer-lsp typescript-lsp ; do
+  for plugin in gopls-lsp pyright-lsp rust-analyzer-lsp typescript-lsp plugin-dev ; do
     echo -e "\nI: claude plugin install $plugin@claude-plugins-official"
     su -l "$AI_USER" -c "claude plugin install $plugin@claude-plugins-official"
   done
