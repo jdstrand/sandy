@@ -229,6 +229,10 @@ if [ ! -e "/home/$AI_USER/.local/bin/claude" ]; then
     echo -e "\nI: claude plugin install $plugin@claude-plugins-official"
     su -l "$AI_USER" -c "claude plugin install $plugin@claude-plugins-official"
   done
+
+  # install influxdb-docs mcp - https://docs.influxdata.com/kapacitor/v1/reference/mcp-server/
+  echo -e "\nI: claude mcp add --transport http influxdb-docs https://influxdb-docs.mcp.kapa.ai"
+  su -l "$AI_USER" -c "claude mcp add --transport http influxdb-docs https://influxdb-docs.mcp.kapa.ai"
 fi
 
 # Install openai codex
