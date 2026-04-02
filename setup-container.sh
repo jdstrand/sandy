@@ -86,7 +86,6 @@ apt-get install -y \
   bind9-dnsutils \
   bind9-host \
   command-not-found \
-  fd-find \
   gh \
   less \
   lsb-base \
@@ -101,6 +100,7 @@ echo -e "\nI: Install tools for AI"
 apt-get install -y \
   ca-certificates \
   curl \
+  fd-find \
   file \
   git \
   incus-client \
@@ -109,6 +109,7 @@ apt-get install -y \
   manpages-dev \
   patch \
   ripgrep \
+  rsync \
   wget
 
 echo -e "\nI: Install build tools"
