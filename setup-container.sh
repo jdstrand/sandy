@@ -86,6 +86,7 @@ apt-get install -y \
   bind9-dnsutils \
   bind9-host \
   command-not-found \
+  fd-find \
   gh \
   less \
   lsb-base \
@@ -136,6 +137,7 @@ echo "$RUSTUP_SHA256  rustup-init.sh" | sha256sum -c -- || exit 1
 mv "$TMPDIR"/rustup-init.sh /usr/local/bin
 chmod 755 /usr/local/bin/rustup-init.sh
 su -l "$AI_USER" -c "rustup-init.sh -y"
+su -l "$AI_USER" -c "rustup default stable"
 su -l "$AI_USER" -c "rustc --version"
 cd - > /dev/null
 
@@ -148,12 +150,6 @@ echo "$GOLANG_SHA256  $GOLANG_TARBALL" | sha256sum -c -- || exit 1
 tar -C /usr/local -zxf "$TMPDIR/$GOLANG_TARBALL"
 su -l "$AI_USER" -c "/usr/local/go/bin/go version"
 cd - > /dev/null
-
-# install yq
-if ! test -e "/home/$AI_USER"/go/bin/yq ; then
-  echo -e "\nI: Install yq"
-  su -l "$AI_USER" -c "/usr/local/go/bin/go install github.com/mikefarah/yq/v4@v4.47.2"
-fi
 
 # ensure ~/.local/bin exists
 if ! test -d "/home/$AI_USER/.local/bin" ; then
@@ -201,6 +197,29 @@ if [ ! -e "/home/$AI_USER/.nvm" ]; then
   su -l "$AI_USER" -c "bash $TMPDIR/install.sh"
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && nvm install \"$AI_NODEJS_VERSION\""
 fi
+
+#
+# Helpful additional tools
+#
+for tool in semver yarn pnpm ; do
+  echo -e "\nI: Install $tool (node)"
+  # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
+  # PATH as part of nvm install
+  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g '$tool'"
+done
+
+for tool in "github.com/mikefarah/yq/v4@v4.47.2" "golang.org/x/vuln/cmd/govulncheck@latest" ; do
+    echo -e "\nI: Install $tool (go)"
+  # this installs to ~/go/bin which is in the user's PATH as part of rustup
+  su -l "$AI_USER" -c "/usr/local/go/bin/go install '$tool'"
+done
+
+# shellcheck disable=SC2043
+for tool in cargo-audit ; do
+    echo -e "\nI: Install $tool (cargo)"
+  # this installs to ~/.cargo/bin which is in the user's PATH as part of rustup
+  su -l "$AI_USER" -c "/home/$AI_USER/.cargo/bin/cargo install '$tool'"
+done
 
 #
 # AI tools
