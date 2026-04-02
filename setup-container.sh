@@ -320,8 +320,10 @@ echo -e "\nI: Cleaning up cache files, etc"
 rm -rf "/home/$AI_USER"/.cache/*
 rm -rf "/home/$AI_USER"/.cargo/git
 rm -rf "/home/$AI_USER"/.cargo/registry
-rm -rf "/home/$AI_USER"/.rustup   # rustup still in ~/.cargo/bin
 rm -rf "/home/$AI_USER"/go/pkg/*
 su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm cache clean --force"
+# this is 1.4G, but it removes the default toolchain, so we shouldn't do it
+# if we need a usable cargo
+#rm -rf "/home/$AI_USER"/.rustup   # rustup still in ~/.cargo/bin
 
 echo "Done!!"
