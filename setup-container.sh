@@ -79,6 +79,21 @@ echo -e "\nI: Add xterm-ghostty TERM fallback to /etc/bash.bashrc"
 echo '# xterm-ghostty terminfo is not available in the container' >> /etc/bash.bashrc
 echo 'if [ "$TERM" = "xterm-ghostty" ]; then export TERM=xterm-256color; fi' >> /etc/bash.bashrc
 
+# Add set_title helper for setting the host terminal title.
+echo -e "\nI: Add set_title helper to /etc/bash.bashrc"
+cat >> /etc/bash.bashrc <<'EOF'
+
+# set_title <text> (preserves original PS1 so we can repeatedly update
+set_title() {
+    if [[ -z "$ORIG_PS1" ]]; then
+        ORIG_PS1="$PS1"
+    fi
+    local TITLE="\[\e]2;$*\a\]"
+    PS1="${ORIG_PS1}${TITLE}"
+    export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1
+}
+EOF
+
 echo -e "\nI: Install handy tools"
 apt-get install -y \
   bash-completion \
