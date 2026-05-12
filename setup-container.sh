@@ -294,6 +294,10 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/gemini ; then
   # PATH as part of nvm install
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @google/gemini-cli"
   ai_tools+=("gemini (https://github.com/google-gemini/gemini-cli; newline: ctrl+j or alt+enter)")
+
+  # adjust path for go and ~/.local/bin
+  echo -e "\nI: Add gemini alias for NO_BROWSER=true"
+  echo "alias gemini='NO_BROWSER=true gemini'" >> "/home/$AI_USER/.bashrc"
 fi
 
 # install mcp-grafana
