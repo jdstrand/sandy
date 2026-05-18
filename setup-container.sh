@@ -278,6 +278,14 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/codex ; then
   # PATH as part of nvm install
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @openai/codex"
   ai_tools+=("codex (https://github.com/openai/codex; newline: ctrl+j or alt+enter)")
+
+  # raise the subagent thread limit
+  mkdir -p "/home/$AI_USER/.codex"
+  chown "$AI_USER:$AI_USER" "/home/$AI_USER/.codex"
+  chmod 700 "/home/$AI_USER/.codex"
+  echo -e '[agents]\nmax_threads = 10\n' >> "/home/$AI_USER/.codex/config.toml"
+  chown "$AI_USER:$AI_USER" "/home/$AI_USER/.codex/config.toml"
+  chmod 600 "/home/$AI_USER/.codex/config.toml"
 fi
 
 # Install copilot cli
