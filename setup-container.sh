@@ -211,7 +211,12 @@ if [ ! -e "/home/$AI_USER/.nvm" ]; then
   curl -o install.sh https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh
   echo "2d8359a64a3cb07c02389ad88ceecd43f2fa469c06104f92f98df5b6f315275f  install.sh" sha256sum --check -- || exit 1
   su -l "$AI_USER" -c "bash $TMPDIR/install.sh"
-  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && nvm install \"$AI_NODEJS_VERSION\""
+  echo -e "\nI: Install node 24"
+  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && nvm install 24"
+  echo -e "\nI: Install node 22"
+  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && nvm install 22"
+  echo -e "\nI: Default to node 22"
+  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && nvm alias default \"$AI_NODEJS_VERSION\""
 fi
 
 #
