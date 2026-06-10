@@ -125,6 +125,7 @@ apt-get install -y \
   patch \
   ripgrep \
   rsync \
+  sqlite3 \
   wget
 
 echo -e "\nI: Install build tools"
@@ -155,6 +156,7 @@ chmod 755 /usr/local/bin/rustup-init.sh
 su -l "$AI_USER" -c "rustup-init.sh -y"
 su -l "$AI_USER" -c "rustup default stable"
 su -l "$AI_USER" -c "rustc --version"
+su -l "$AI_USER" -c "rustup component add rust-analyzer"
 cd - > /dev/null
 
 # Install golang
@@ -222,21 +224,22 @@ fi
 #
 # Helpful additional tools
 #
-for tool in semver yarn pnpm ; do
+for tool in semver yarn pnpm typescript typescript-language-server ts-morph tree-sitter-cli; do
   echo -e "\nI: Install $tool (node)"
   # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
   # PATH as part of nvm install
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g '$tool'"
 done
 
-for tool in "github.com/mikefarah/yq/v4@v4.47.2" "golang.org/x/vuln/cmd/govulncheck@latest" ; do
+for tool in "github.com/mikefarah/yq/v4@v4.47.2" "golang.org/x/vuln/cmd/govulncheck@latest" "golang.org/x/tools/gopls@latest" "golang.org/x/tools/cmd/callgraph@latest" ; do
     echo -e "\nI: Install $tool (go)"
   # this installs to ~/go/bin which is in the user's PATH as part of rustup
   su -l "$AI_USER" -c "/usr/local/go/bin/go install '$tool'"
 done
 
+# cargo-call-stack may be compiler version specific and fail. For now, just try
 # shellcheck disable=SC2043
-for tool in cargo-audit ; do
+for tool in cargo-audit cargo-call-stack ; do
     echo -e "\nI: Install $tool (cargo)"
   # this installs to ~/.cargo/bin which is in the user's PATH as part of rustup
   su -l "$AI_USER" -c "/home/$AI_USER/.cargo/bin/cargo install '$tool'"
