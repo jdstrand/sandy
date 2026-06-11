@@ -237,9 +237,8 @@ for tool in "github.com/mikefarah/yq/v4@v4.47.2" "golang.org/x/vuln/cmd/govulnch
   su -l "$AI_USER" -c "/usr/local/go/bin/go install '$tool'"
 done
 
-# cargo-call-stack may be compiler version specific and fail. For now, just try
 # shellcheck disable=SC2043
-for tool in cargo-audit cargo-call-stack ; do
+for tool in cargo-audit ; do
     echo -e "\nI: Install $tool (cargo)"
   # this installs to ~/.cargo/bin which is in the user's PATH as part of rustup
   su -l "$AI_USER" -c "/home/$AI_USER/.cargo/bin/cargo install '$tool'"
