@@ -125,6 +125,7 @@ apt-get install -y \
   patch \
   ripgrep \
   rsync \
+  shellcheck \
   sqlite3 \
   wget
 
