@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
 
       - name: Run ShellCheck
-        run: shellcheck debootstrap.sh setup-container.sh
+        run: make shell-check
 
   inclusivity:
     runs-on: ubuntu-latest

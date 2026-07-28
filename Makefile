@@ -8,10 +8,13 @@ PYRIGHT := $(VENV)/bin/pyright
 
 LANGUAGE_CHECKER ?= language-checker
 
-PYTHON_FILES := sandy test_sandy.py
+PYTHON_FILES := sandy $(wildcard tests/*.py) $(wildcard tests/e2e/*.py)
+SHELL_FILES := debootstrap.sh oci.sh setup-container.sh \
+	$(wildcard tests/e2e/*.sh)
+UNIT_TEST_MODULES := tests.test_sandy tests.test_e2e_harness
 
-.PHONY: all check coverage format format-check inclusivity-check
-.PHONY: install-test install-tools test type-check
+.PHONY: all check coverage e2e e2e-full e2e-guard format format-check
+.PHONY: inclusivity-check install-test install-tools shell-check test type-check
 
 all: check
 
@@ -33,11 +36,14 @@ type-check:
 	$(PYRIGHT) --project pyrightconfig.json $(PYTHON_FILES)
 
 test:
-	$(VENV_PYTHON) -W error -m unittest -v test_sandy.py
+	$(VENV_PYTHON) -W error -m unittest -v $(UNIT_TEST_MODULES)
 
 coverage:
-	$(COVERAGE) run -m unittest test_sandy.py
+	$(COVERAGE) run -m unittest $(UNIT_TEST_MODULES)
 	$(COVERAGE) report
+
+shell-check:
+	shellcheck $(SHELL_FILES)
 
 inclusivity-check:
 	@if command -v "$(LANGUAGE_CHECKER)" >/dev/null; then \
@@ -45,5 +51,21 @@ inclusivity-check:
 	else \
 		echo "W: $(LANGUAGE_CHECKER) not found; install language-checker or set LANGUAGE_CHECKER"; \
 	fi
+
+e2e-guard:
+	@if [ "$$SANDY_E2E" != "1" ]; then \
+		echo "ERROR: e2e requires SANDY_E2E=1 (run only in a disposable VM)" >&2; \
+		exit 1; \
+	fi
+	@if [ "$$(id -u)" != "0" ]; then \
+		echo "ERROR: e2e must run as root" >&2; \
+		exit 1; \
+	fi
+
+e2e: e2e-guard
+	$(PYTHON) -m tests.e2e.runner
+
+e2e-full: e2e-guard
+	$(PYTHON) -m tests.e2e.runner --full
 
 check: format-check type-check test inclusivity-check
