@@ -40,7 +40,9 @@ install: sandy debootstrap.sh oci.sh setup-container.sh
 		"$$target_dir/"; \
 	echo "I: Installed sandy to $$target_dir"; \
 	echo "I: sudoers was not changed"; \
-	echo "I: If appropriate for this host, consider adding this with visudo(8):"; \
+	echo "W: Granting sudo access to sandy is equivalent to granting unrestricted host root access"; \
+	echo "W: Delegate it only to users who are already trusted with host root"; \
+	echo "I: If that trust is appropriate, review this example with visudo(8):"; \
 	printf '%s\n' "%sudo ALL=(root:root) $$INSTALL_DIR/sandy"
 
 $(VENV_PYTHON):

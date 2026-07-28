@@ -56,6 +56,11 @@ def test_main(context: E2EContext) -> None:
             cwd=REPO_ROOT,
         )
         assert_contains(result, f"Installed sandy to {staged_install_dir}")
+        assert_contains(
+            result,
+            "Granting sudo access to sandy is equivalent to granting "
+            "unrestricted host root access",
+        )
         _assert_installed_files(staged_install_dir)
         if INSTALL_DIR.exists() or INSTALL_DIR.is_symlink():
             raise E2EFailure("Staged install unexpectedly wrote to the live root")
