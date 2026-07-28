@@ -24,6 +24,7 @@ from typing import Iterator, Mapping, Sequence
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SANDY = REPO_ROOT / "sandy"
 MINIMAL_SETUP = Path(__file__).with_name("setup-container-minimal.sh")
+INSTALL_DIR = Path("/usr/local/lib/sandy")
 SYSTEMD_MACHINES = Path("/var/lib/machines")
 CACHE_DIR = SYSTEMD_MACHINES / "sandy.__cache"
 PORT_STATE = CACHE_DIR / "port_mappings.json"
@@ -130,6 +131,7 @@ class E2EContext:
         self.passed = 0
         self._ip_forward_original: str | None = None
         self._host_state_owned = False
+        self._install_dir_owned = False
 
     def _validate_names(self) -> None:
         for name in (
@@ -267,6 +269,8 @@ class E2EContext:
             raise E2EFailure(f"Missing executable minimal setup: {MINIMAL_SETUP}")
         if not SYSTEMD_MACHINES.is_dir():
             raise E2EFailure(f"Missing {SYSTEMD_MACHINES}")
+        if INSTALL_DIR.exists() or INSTALL_DIR.is_symlink():
+            raise E2EFailure(f"Refusing to replace existing install: {INSTALL_DIR}")
 
         required_tools = (
             "curl",
@@ -275,6 +279,7 @@ class E2EContext:
             "ip6tables",
             "iptables",
             "machinectl",
+            "make",
             "nft",
             "nsenter",
             "runuser",
@@ -307,6 +312,14 @@ class E2EContext:
         # Every global Sandy namespace was absent at preflight, so subsequent
         # Sandy state belongs to this run and is safe for cleanup to remove.
         self._host_state_owned = True
+
+    def claim_install_dir(self) -> None:
+        """Claim the known-absent default install path for guarded cleanup."""
+        if self._install_dir_owned:
+            raise E2EFailure(f"Install path is already owned: {INSTALL_DIR}")
+        if INSTALL_DIR.exists() or INSTALL_DIR.is_symlink():
+            raise E2EFailure(f"Install path appeared during the test: {INSTALL_DIR}")
+        self._install_dir_owned = True
 
     def _sandy_firewall_exists(self) -> bool:
         return bool(self.firewall_artifacts())
@@ -650,6 +663,15 @@ class E2EContext:
                 self.assert_no_sandy_state()
             except Exception as exc:
                 errors.append(f"state verification: {exc}")
+
+        if self._install_dir_owned:
+            try:
+                if INSTALL_DIR.is_symlink() or INSTALL_DIR.is_file():
+                    INSTALL_DIR.unlink()
+                elif INSTALL_DIR.is_dir():
+                    shutil.rmtree(INSTALL_DIR)
+            except OSError as exc:
+                errors.append(f"install directory {INSTALL_DIR}: {exc}")
 
         try:
             shutil.rmtree(self.root)
