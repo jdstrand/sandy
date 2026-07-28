@@ -1,0 +1,12 @@
+black==26.3.1
+click==8.4.2
+coverage==7.15.2
+mypy-extensions==1.1.0
+nodeenv==1.10.0
+nodejs-wheel-binaries==24.16.0
+packaging==26.2
+pathspec==1.1.1
+platformdirs==4.11.0
+pyright[nodejs]==1.1.411
+pytokens==0.4.1
+typing-extensions==4.16.0

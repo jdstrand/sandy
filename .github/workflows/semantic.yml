@@ -1,0 +1,14 @@
+---
+name: Semantic PR and Commit Messages
+
+permissions:
+  contents: read
+  pull-requests: read
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+jobs:
+  semantic:
+    uses: jdstrand/validate-semantic-github-messages/.github/workflows/semantic.yml@95908e211c496c3640b8952fcae40cd0a025080e

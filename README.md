@@ -185,3 +185,37 @@ creating a strong sandbox for AI agents, but it should be understood there may
 be bugs, unimplemented functionality or holes in the sandbox setup that allow
 escape. As a side-project, the project's scope is for experimentation, not as a
 general-purpose production sandboxing tool.
+
+
+## Tests
+
+The unit tests use Python's standard `unittest` framework and mock all
+privileged container, filesystem, PTY, and firewall operations. They can be run
+as an unprivileged user without installing `sandy`'s runtime tools.
+
+```bash
+make install-tools
+make check
+```
+
+`make install-tools` requires Python 3.10 or newer. It creates `.venv-test` and
+installs the pinned Python QA dependencies. If `language-checker` is unavailable,
+the inclusivity check prints a warning and is skipped. The individual checks
+are also available:
+
+```bash
+make format-check
+make type-check
+make test
+make inclusivity-check
+```
+
+Use `make format` to apply Black formatting. Branch coverage is measured with
+`make coverage`; the checked-in configuration enforces a minimum combined
+branch and statement coverage of 95%.
+
+If `language-checker` is not on `PATH`, provide its executable path explicitly:
+
+```bash
+make check LANGUAGE_CHECKER=/path/to/language-checker
+```
