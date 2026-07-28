@@ -31,6 +31,16 @@ jobs:
       - name: Run type check
         run: make type-check
 
+  shellcheck:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Run ShellCheck
+        run: shellcheck debootstrap.sh setup-container.sh
+
   inclusivity:
     runs-on: ubuntu-latest
 

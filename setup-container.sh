@@ -77,6 +77,8 @@ update-locale LANG="$AI_LOCALE"
 # Ensure interactive shells fall back from xterm-ghostty to xterm-256color
 echo -e "\nI: Add xterm-ghostty TERM fallback to /etc/bash.bashrc"
 echo '# xterm-ghostty terminfo is not available in the container' >> /etc/bash.bashrc
+# Preserve $TERM for evaluation when interactive shells start.
+# shellcheck disable=SC2016
 echo 'if [ "$TERM" = "xterm-ghostty" ]; then export TERM=xterm-256color; fi' >> /etc/bash.bashrc
 
 # Add set_title helper for setting the host terminal title.
