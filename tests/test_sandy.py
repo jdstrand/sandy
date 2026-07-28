@@ -207,6 +207,90 @@ class ValidationTests(unittest.TestCase):
         )
         self.assertFalse(sandy._validate_env_var("value\nwith-newline"))
 
+    def test_container_environment_is_an_explicit_allow_list(self):
+        with patch.dict(
+            sandy.os.environ,
+            {
+                "TERM": "xterm-kitty",
+                "SANDY_TEST_HOST_SECRET": "must-not-cross",
+            },
+            clear=True,
+        ):
+            environment = sandy._container_environment(
+                "developer",
+                "/home/developer",
+            )
+
+        self.assertEqual(
+            environment,
+            {
+                "HOME": "/home/developer",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "LOGNAME": "developer",
+                "PATH": sandy.CONTAINER_PATH,
+                "SHELL": "/bin/bash",
+                "SYSTEMD_COLORS": "0",
+                "TERM": "xterm-kitty",
+                "USER": "developer",
+            },
+        )
+        self.assertNotIn("SANDY_TEST_HOST_SECRET", environment)
+
+    def test_container_environment_validates_identity_and_terminal(self):
+        with patch.dict(sandy.os.environ, {}, clear=True):
+            root_environment = sandy._container_environment("root", "/root")
+        self.assertEqual(root_environment["TERM"], sandy.DEFAULT_CONTAINER_TERM)
+
+        for terminal_type in ("xterm-256color", "xterm-ghostty"):
+            with self.subTest(terminal_type=terminal_type):
+                with patch.dict(
+                    sandy.os.environ,
+                    {"TERM": terminal_type},
+                    clear=True,
+                ):
+                    environment = sandy._container_environment("root", "/root")
+                self.assertEqual(environment["TERM"], terminal_type)
+
+        invalid_identities = (
+            ("Bad", "/home/Bad"),
+            ("developer", "/root"),
+            ("root", "/home/root"),
+        )
+        for user, user_home in invalid_identities:
+            with self.subTest(user=user, user_home=user_home):
+                with self.assertRaises(ValueError):
+                    sandy._container_environment(user, user_home)
+
+        for terminal_type in ("bad term", "bad\nterm", "-bad", "x" * 65):
+            with self.subTest(terminal_type=terminal_type):
+                with patch.dict(
+                    sandy.os.environ,
+                    {"TERM": terminal_type},
+                    clear=True,
+                ):
+                    with self.assertRaisesRegex(ValueError, "Invalid TERM"):
+                        sandy._container_environment("root", "/root")
+
+    def test_container_exit_status_normalization(self):
+        cases = (
+            (0, 0),
+            (23, 23),
+            (-15, 143),
+            (-999, 255),
+            (256, 1),
+            (None, 1),
+            (True, 1),
+        )
+        for status, expected in cases:
+            with self.subTest(status=status):
+                self.assertEqual(sandy._container_exit_code(status), expected)
+
+        sandy._raise_for_container_status(0)
+        with self.assertRaises(SystemExit) as raised:
+            sandy._raise_for_container_status(-15)
+        self.assertEqual(raised.exception.code, 143)
+
     def test_image_names(self):
         self.assert_table(
             sandy._validate_image_name,
@@ -342,15 +426,47 @@ class SubprocessWrapperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sandy._run_secure_subprocess_pty(
                 ["tool"],
+                environment={"PATH": sandy.CONTAINER_PATH},
                 master_read=None,
                 stdin_read=callback,
             )
         with self.assertRaises(ValueError):
             sandy._run_secure_subprocess_pty(
                 ["tool"],
+                environment={"PATH": sandy.CONTAINER_PATH},
                 master_read=callback,
                 stdin_read=None,
             )
+
+    def test_pty_wrapper_validates_explicit_environment_before_fork(self):
+        callback = lambda _fd: b""
+        with patch.object(sandy.pty, "fork") as fork:
+            with self.assertRaisesRegex(ValueError, "environment is required"):
+                sandy._run_secure_subprocess_pty(
+                    ["tool"],
+                    master_read=callback,
+                    stdin_read=callback,
+                    environment=None,
+                )
+        fork.assert_not_called()
+
+        invalid_environments = (
+            {"BAD-KEY": "value"},
+            {"KEY": "bad\nvalue"},
+            {"KEY": "x" * 4097},
+            {f"KEY{index}": "value" for index in range(65)},
+        )
+        for environment in invalid_environments:
+            with self.subTest(environment_size=len(environment)):
+                with patch.object(sandy.pty, "fork") as fork:
+                    with self.assertRaises(ValueError):
+                        sandy._run_secure_subprocess_pty(
+                            ["tool"],
+                            master_read=callback,
+                            stdin_read=callback,
+                            environment=environment,
+                        )
+                fork.assert_not_called()
 
 
 class PtyProcessTests(unittest.TestCase):
@@ -439,6 +555,7 @@ class PtyProcessTests(unittest.TestCase):
             )
             result = sandy._run_secure_subprocess_pty(
                 ["tool"],
+                environment={"PATH": sandy.CONTAINER_PATH},
                 master_read=master_read,
                 stdin_read=stdin_read,
             )
@@ -500,6 +617,9 @@ class PtyProcessTests(unittest.TestCase):
                                         ):
                                             result = sandy._run_secure_subprocess_pty(
                                                 ["tool"],
+                                                environment={
+                                                    "PATH": sandy.CONTAINER_PATH
+                                                },
                                                 master_read=master_read,
                                                 stdin_read=MagicMock(),
                                             )
@@ -541,6 +661,9 @@ class PtyProcessTests(unittest.TestCase):
                                         ):
                                             result = sandy._run_secure_subprocess_pty(
                                                 ["tool"],
+                                                environment={
+                                                    "PATH": sandy.CONTAINER_PATH
+                                                },
                                                 master_read=MagicMock(
                                                     side_effect=OSError
                                                 ),
@@ -552,7 +675,7 @@ class PtyProcessTests(unittest.TestCase):
         with patch.object(sandy.pty, "fork", return_value=(0, 10)):
             with patch.object(
                 sandy.os,
-                "execvp",
+                "execvpe",
                 side_effect=OSError("missing"),
             ):
                 with patch.object(
@@ -567,11 +690,37 @@ class PtyProcessTests(unittest.TestCase):
                         ):
                             sandy._run_secure_subprocess_pty(
                                 ["missing"],
+                                environment={"PATH": sandy.CONTAINER_PATH},
                                 master_read=MagicMock(),
                                 stdin_read=MagicMock(),
                             )
         child_exit.assert_called_once_with(1)
         self.assertIn("Failed to execute missing", stderr.getvalue())
+
+    def test_child_pty_executes_with_only_the_explicit_environment(self):
+        environment = {
+            "PATH": sandy.CONTAINER_PATH,
+            "TERM": "xterm-256color",
+        }
+        with patch.object(sandy.pty, "fork", return_value=(0, 10)):
+            with patch.object(
+                sandy.os,
+                "execvpe",
+                side_effect=RuntimeError("exec called"),
+            ) as explicit_exec:
+                with self.assertRaisesRegex(RuntimeError, "exec called"):
+                    sandy._run_secure_subprocess_pty(
+                        ["tool", "argument"],
+                        master_read=MagicMock(),
+                        stdin_read=MagicMock(),
+                        environment=environment,
+                    )
+
+        explicit_exec.assert_called_once_with(
+            "tool",
+            ["tool", "argument"],
+            environment,
+        )
 
 
 class ParserTests(unittest.TestCase):
@@ -881,8 +1030,35 @@ class MainDispatchTests(unittest.TestCase):
 
     def test_no_command_opens_login_shell(self):
         args = self.make_args(None)
-        instance = self.run_main(args)
+        instance = MagicMock()
+        instance._exec.return_value = 0
+        instance = self.run_main(args, instance)
         instance._exec.assert_called_once_with(None, login_shell=True)
+
+    def test_no_command_propagates_login_shell_failure(self):
+        args = self.make_args(None)
+        instance = MagicMock()
+        instance._exec.return_value = 19
+        with self.assertRaises(SystemExit) as raised:
+            self.run_main(args, instance)
+        self.assertEqual(raised.exception.code, 19)
+
+    def test_invalid_terminal_is_rejected_before_privileged_checks(self):
+        args = self.make_args("exec")
+        with patch.dict(sandy.os.environ, {"TERM": "bad\nterm"}, clear=True):
+            with patch.object(sandy, "parse_args_custom", return_value=args):
+                with patch.object(sandy, "_require_root") as require_root:
+                    with patch.object(sandy, "_verify_safe_dir") as verify:
+                        with patch.object(sandy, "Sandy") as constructor:
+                            with captured_output() as (stdout, _):
+                                with self.assertRaises(SystemExit) as raised:
+                                    sandy.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("Invalid TERM", stdout.getvalue())
+        require_root.assert_not_called()
+        verify.assert_not_called()
+        constructor.assert_not_called()
 
 
 class FilesystemSafetyTests(unittest.TestCase):
@@ -3534,6 +3710,12 @@ class CacheTests(unittest.TestCase):
         written_content = write.call_args.args[1]
         self.assertIn("user=developer", written_content)
         self.assertNotIn("%%MACHINE_USER%%", written_content)
+        setup_call = run.call_args_list[2]
+        self.assertEqual(setup_call.args[0][0], "systemd-nspawn")
+        self.assertEqual(
+            setup_call.kwargs["env"],
+            sandy._container_environment("root", "/root"),
+        )
         guest.assert_called_once_with(
             "/machine",
             "ai-dev",
@@ -3660,13 +3842,19 @@ class ExecutionTests(unittest.TestCase):
                     with patch.object(
                         instance,
                         "_run_container_interactive",
+                        return_value=23,
                     ) as interactive:
-                        instance._exec("printf safe")
+                        status = instance._exec("printf safe")
 
         command = interactive.call_args.args[0]
+        self.assertEqual(status, 23)
         self.assertEqual(command[:6], ["nsenter", "-t", "123", "-a", "--", "su"])
         self.assertIn("cd /home/developer/workspace && printf safe", command[-1])
         self.assertIn("script -qec", command[-1])
+        environment = interactive.call_args.kwargs["environment"]
+        self.assertEqual(environment["HOME"], "/home/developer")
+        self.assertEqual(environment["USER"], "developer")
+        self.assertNotIn("SANDY_TEST_HOST_SECRET", environment)
 
     def test_exec_rejects_missing_container_or_command(self):
         instance = make_sandy()
@@ -3684,8 +3872,13 @@ class ExecutionTests(unittest.TestCase):
         instance = make_sandy()
         instance.workspace = None
         with patch.object(instance, "_is_container_running", return_value="123"):
-            with patch.object(instance, "_run_container_interactive") as interactive:
-                instance._exec(None, login_shell=True)
+            with patch.object(
+                instance,
+                "_run_container_interactive",
+                return_value=17,
+            ) as interactive:
+                status = instance._exec(None, login_shell=True)
+        self.assertEqual(status, 17)
         self.assertIn("exec bash --login", interactive.call_args.args[0][-1])
 
     def test_exec_as_root_validates_and_runs(self):
@@ -3699,7 +3892,8 @@ class ExecutionTests(unittest.TestCase):
             ) as run:
                 self.assertIs(instance._exec_as_root("/init.sh"), result)
         run.assert_called_once_with(
-            ["nsenter", "-t", "123", "-a", "--", "sh", "-c", "/init.sh"]
+            ["nsenter", "-t", "123", "-a", "--", "sh", "-c", "/init.sh"],
+            env=sandy._container_environment("root", "/root"),
         )
 
         with captured_output():
@@ -3710,8 +3904,9 @@ class ExecutionTests(unittest.TestCase):
         instance = make_sandy()
         spinner = threading.Event()
 
-        def run_pty(command, *, master_read, stdin_read):
+        def run_pty(command, *, master_read, stdin_read, environment):
             self.assertEqual(command, ["tool"])
+            self.assertEqual(environment, {"PATH": sandy.CONTAINER_PATH})
             with patch.object(sandy.os, "read", return_value=b"output"):
                 self.assertEqual(master_read(10), b"output")
                 self.assertEqual(stdin_read(0), b"output")
@@ -3726,6 +3921,7 @@ class ExecutionTests(unittest.TestCase):
                 self.assertEqual(
                     instance._run_container_interactive(
                         ["tool"],
+                        environment={"PATH": sandy.CONTAINER_PATH},
                         spinner_line_event=spinner,
                     ),
                     7,
@@ -3808,7 +4004,8 @@ class ExecutionTests(unittest.TestCase):
         instance = make_sandy()
         spinner = threading.Event()
 
-        def run_pty(_command, *, master_read, stdin_read):
+        def run_pty(_command, *, master_read, stdin_read, environment):
+            self.assertEqual(environment, {"PATH": sandy.CONTAINER_PATH})
             with patch.object(sandy.os, "read", side_effect=OSError):
                 self.assertEqual(master_read(10), b"")
                 self.assertEqual(stdin_read(0), b"")
@@ -3822,6 +4019,7 @@ class ExecutionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "pty failed"):
                 instance._run_container_interactive(
                     ["tool"],
+                    environment={"PATH": sandy.CONTAINER_PATH},
                     spinner_line_event=spinner,
                 )
         self.assertTrue(spinner.is_set())
@@ -4121,12 +4319,12 @@ class CommandMethodTests(unittest.TestCase):
     def test_run_bash_variants(self):
         instance = make_sandy()
         args = SimpleNamespace(bash_args=[])
-        with patch.object(instance, "_exec") as execute:
+        with patch.object(instance, "_exec", return_value=0) as execute:
             instance.run_bash(args)
         execute.assert_called_once_with(None, login_shell=True)
 
         args = SimpleNamespace(bash_args=["--", "-c", "echo", "safe"])
-        with patch.object(instance, "_exec") as execute:
+        with patch.object(instance, "_exec", return_value=0) as execute:
             instance.run_bash(args)
         execute.assert_called_once_with("echo safe")
 
@@ -4138,13 +4336,42 @@ class CommandMethodTests(unittest.TestCase):
 
     def test_run_exec_strips_separator_and_requires_command(self):
         instance = make_sandy()
-        with patch.object(instance, "_exec") as execute:
+        with patch.object(instance, "_exec", return_value=0) as execute:
             instance.run_exec(SimpleNamespace(exec_command=["--", "python3", "-V"]))
         execute.assert_called_once_with("python3 -V")
 
         with captured_output():
             with self.assertRaises(SystemExit):
                 instance.run_exec(SimpleNamespace(exec_command=[]))
+
+    def test_run_exec_and_bash_propagate_container_failures(self):
+        instance = make_sandy()
+        cases = (
+            (
+                instance.run_exec,
+                SimpleNamespace(exec_command=["false"]),
+                7,
+                7,
+            ),
+            (
+                instance.run_bash,
+                SimpleNamespace(bash_args=["-c", "false"]),
+                -15,
+                143,
+            ),
+            (
+                instance.run_bash,
+                SimpleNamespace(bash_args=[]),
+                31,
+                31,
+            ),
+        )
+        for method, arguments, status, expected in cases:
+            with self.subTest(method=method.__name__, status=status):
+                with patch.object(instance, "_exec", return_value=status):
+                    with self.assertRaises(SystemExit) as raised:
+                        method(arguments)
+                self.assertEqual(raised.exception.code, expected)
 
     def test_status_uses_machinectl(self):
         instance = make_sandy()
@@ -4534,6 +4761,10 @@ class RunUpTests(unittest.TestCase):
             any(argument.startswith("--network-bridge=") for argument in command)
         )
         self.assertEqual(popen.call_args.kwargs["start_new_session"], True)
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(environment["HOME"], "/home/developer")
+        self.assertEqual(environment["USER"], "developer")
+        self.assertNotIn("SANDY_TEST_HOST_SECRET", environment)
 
     def test_lenient_network_adds_bridge_and_dedupes_ports(self):
         instance = make_sandy()
@@ -4646,6 +4877,9 @@ class RunUpTests(unittest.TestCase):
             [call("ai-dev"), call("ai-dev")],
         )
         command = interactive.call_args.args[0]
+        environment = interactive.call_args.kwargs["environment"]
+        self.assertEqual(environment["HOME"], "/home/developer")
+        self.assertEqual(environment["USER"], "developer")
         self.assertIn(
             f"--private-users={sandy.CONTAINER_BASE_UID}:65536",
             command,

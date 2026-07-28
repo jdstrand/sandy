@@ -1,6 +1,11 @@
 #!/bin/bash
 set -e
 
+if [ "${SANDY_HOST_SECRET+x}" = "x" ]; then
+    echo "E: Host environment leaked into minimal setup" >&2
+    exit 1
+fi
+
 AI_USER="%%MACHINE_USER%%"
 AI_LOCALE="en_US.UTF-8"
 

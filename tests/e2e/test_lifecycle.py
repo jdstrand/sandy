@@ -5,6 +5,8 @@ from __future__ import annotations
 from tests.e2e.support import (
     E2EContext,
     E2EFailure,
+    HOST_SECRET_NAME,
+    HOST_SECRET_VALUE,
     assert_contains,
     assert_not_contains,
 )
@@ -99,6 +101,43 @@ def test_main(context: E2EContext) -> None:
             user=context.main_user,
         )
         assert_contains(bash, "sandy-e2e-bash")
+
+    with context.case("container commands hide host environment and report failures"):
+        environment = context.safe_environment(
+            {
+                HOST_SECRET_NAME: HOST_SECRET_VALUE,
+            }
+        )
+        leaked_secret = context.sandy(
+            ["exec", "--", "printenv", HOST_SECRET_NAME],
+            name=context.main_name,
+            user=context.main_user,
+            expected=1,
+            environment=environment,
+        )
+        assert_not_contains(leaked_secret, HOST_SECRET_VALUE)
+
+        leaked_bash_secret = context.sandy(
+            ["bash", "-c", "printenv", HOST_SECRET_NAME],
+            name=context.main_name,
+            user=context.main_user,
+            expected=1,
+            environment=environment,
+        )
+        assert_not_contains(leaked_bash_secret, HOST_SECRET_VALUE)
+
+        context.sandy(
+            ["exec", "--", "false"],
+            name=context.main_name,
+            user=context.main_user,
+            expected=1,
+        )
+        context.sandy(
+            ["bash", "-c", "false"],
+            name=context.main_name,
+            user=context.main_user,
+            expected=1,
+        )
 
     with context.case("starting an already-running machine is rejected"):
         duplicate = context.sandy(
