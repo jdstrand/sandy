@@ -162,9 +162,8 @@ container technologies, `sandy` does not provide a root running service and
 instead is expected to be called with `sudo` (or similar) and for transparency,
 `sandy` is fairly chatty with its output.
 
-Users may find it convenient to install `sandy` to a root-owned directory and
-adjust `sudoers` accordingly. The install target copies `sandy` and its helper
-scripts to `/usr/local/lib/sandy` by default:
+The install target copies `sandy` and its helper scripts to a root-owned
+`/usr/local/lib/sandy` directory by default:
 
 ```bash
 $ git clone https://github.com/jdstrand/sandy.git
@@ -172,9 +171,13 @@ $ cd sandy
 $ sudo make install
 ```
 
-After copying the files, `make install` prints a narrowly scoped example that
-may be appropriate for sudoers, but it never updates sudoers. Review any policy
-change with `visudo`; for example, a site may choose:
+After copying the files, `make install` prints a sudoers example, but it never
+updates sudoers. Granting a user or group permission to run `sandy` as root is
+equivalent to granting unrestricted host root access. The executable path in
+the example limits which command sudo may launch; it does not constrain the
+host filesystems, processes, network interfaces, firewall rules, or container
+state that Sandy can change. Delegate it only to users who are already trusted
+with host root, and review any policy change with `visudo`:
 
 ```
 %sudo	ALL=(root:root) /usr/local/lib/sandy/sandy
@@ -185,9 +188,9 @@ can set an absolute `DESTDIR`, which is prepended as a staging root. A
 `DESTDIR` of `/` is equivalent to leaving it empty, and trailing slashes are
 accepted.
 
-This limits the suggested policy entry to running the installed `sandy`
-executable as `root`. Sites can apply stricter policy or choose a different
-administrative group as appropriate.
+The example limits the sudo command path to the installed `sandy` executable,
+but it is not a privilege or sandbox boundary. Choosing a different group does
+not reduce the effective privilege granted to members of that group.
 
 As mentioned above, `sandy` was written with security in mind with the goal of
 creating a strong sandbox for AI agents, but it should be understood there may
