@@ -603,8 +603,8 @@ done
 ip addr add ${{CONTAINER_IP}}/${{NETWORK_PREFIX}} dev host0
 ip link set host0 up
 ip route add default via ${{GATEWAY_IP}}
-echo 'nameserver 1.1.1.1' > /etc/resolv.conf
-echo 'nameserver 1.0.0.1' >> /etc/resolv.conf
+rm -f -- /etc/resolv.conf
+printf '%s\\n' 'nameserver 1.1.1.1' 'nameserver 1.0.0.1' > /etc/resolv.conf
 """
         print(f"I: Creating /init.sh with:\n{init_script_content}")
         _write(init_script_path, init_script_content, mode=0o0755)
@@ -2276,6 +2276,13 @@ class SandyNet:
             self.gateway = None
 
 
+def _require_root():
+    """Reject non-root execution before accessing root-owned host state."""
+    if os.getuid() != 0:
+        print("E: Must run as root")
+        sys.exit(1)
+
+
 class Sandy:
     def __init__(self):
         self.container = "ai-dev"
@@ -2290,10 +2297,8 @@ class Sandy:
         self.has_skopeo = shutil.which("skopeo") is not None
         self.has_umoci = shutil.which("umoci") is not None
 
-        # Check if running as root
-        if os.getuid() != 0:
-            print("E: Must run as root")
-            sys.exit(1)
+        # Keep this guard for callers that construct Sandy outside main().
+        _require_root()
 
         # Initialize network as None - will be setup in run_up if needed
         self.network = None
@@ -4592,9 +4597,9 @@ def main():
     # Parse arguments with custom handling
     args = parse_args_custom()
 
-    # Parse first so --help and argument errors work on hosts where the machine
-    # directory is not present. No privileged operation occurs before this
-    # safety check completes.
+    # Parsing deliberately comes first: --help and argument errors do not
+    # require root or access to root-owned machine state.
+    _require_root()
     _verify_safe_dir(SYSTEMD_MACHINES)
 
     # Create Sandy instance
@@ -4631,8 +4636,7 @@ def main():
             print(f"E: Invalid username '{_sanitize_log_output(args.user)}'")
             sys.exit(1)
         sandy.user = args.user
-        if sandy.user == "root":
-            sandy.user_home = "/root"
+        sandy.user_home = "/root" if sandy.user == "root" else f"/home/{sandy.user}"
     else:
         # Validate default username too
         if not _validate_username(sandy.user):

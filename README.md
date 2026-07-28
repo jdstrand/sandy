@@ -219,3 +219,52 @@ If `language-checker` is not on `PATH`, provide its executable path explicitly:
 ```bash
 make check LANGUAGE_CHECKER=/path/to/language-checker
 ```
+
+
+## End to End (e2e) Tests
+
+The end-to-end suite exercises the real root-only container, cache,
+`systemd-nspawn`, mount, network, firewall, and cleanup paths. Run it only in a
+disposable Linux VM. It creates and removes `/var/lib/machines/sandy.*`,
+`sandybr0`, Sandy firewall rules and caches, and temporarily changes
+`net.ipv4.ip_forward`. The runner refuses to start if it detects pre-existing
+Sandy machine, bridge, or firewall state.
+
+Ubuntu 24.04 (Noble) is the minimum tested guest. The VM must support nested
+`systemd-nspawn` containers and user namespaces, have outbound DNS, HTTP, and
+HTTPS access, and expose the normal kernel networking and firewall interfaces.
+The tested VM had 4 vCPUs, 8 GiB of RAM, and a 40 GiB disk; allow at least 20
+GiB of free disk space for uncached builds.
+
+Install the host-side test requirements:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+    acl ca-certificates curl debootstrap iproute2 iptables make nftables \
+    python3 skopeo systemd-container uidmap umoci util-linux
+```
+
+From a clean checkout in the disposable VM, run:
+
+```bash
+sudo env SANDY_E2E=1 make e2e
+```
+
+The opt-in variable and root check are intentional safety guards. The fast
+suite uses Sandy's normal default bootstrap method and base image with a
+minimal setup script. It covers cache misses, cache reuse, cache invalidation,
+lifecycle operations, mounts, networking, firewall rules, port forwarding and
+cleanup. Lifecycle and network tests reuse the cache created by the cache
+tests.
+
+To run the fast suite and then smoke-test one uncached build with Sandy's
+complete default `setup-container.sh`, run:
+
+```bash
+sudo env SANDY_E2E=1 make e2e-full
+```
+
+The additional full build may take 10–20 minutes depending on network and
+package caches because the default setup installs and compiles complete
+development toolchains.

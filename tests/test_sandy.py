@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, mock_open, patch
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 SANDY_PATH = PROJECT_DIR / "sandy"
 
 
@@ -717,12 +717,13 @@ class MainDispatchTests(unittest.TestCase):
         instance.container = "ai-dev"
         instance.user = "developer"
         with patch.object(sandy, "parse_args_custom", return_value=args):
-            with patch.object(sandy, "_verify_safe_dir"):
-                with patch.object(sandy, "Sandy", return_value=instance):
-                    sandy.main()
+            with patch.object(sandy, "_require_root"):
+                with patch.object(sandy, "_verify_safe_dir"):
+                    with patch.object(sandy, "Sandy", return_value=instance):
+                        sandy.main()
         return instance
 
-    def test_safe_directory_is_verified_between_parsing_and_construction(self):
+    def test_root_and_safe_directory_checks_precede_construction(self):
         args = self.make_args("status")
         instance = MagicMock(container="ai-dev", user="developer")
         events = []
@@ -734,6 +735,9 @@ class MainDispatchTests(unittest.TestCase):
         def verify_directory(path):
             events.append(("verify", path))
 
+        def require_root():
+            events.append("root")
+
         def create_instance():
             events.append("construct")
             return instance
@@ -743,23 +747,60 @@ class MainDispatchTests(unittest.TestCase):
             "parse_args_custom",
             side_effect=parse_arguments,
         ):
-            with patch.object(
-                sandy,
-                "_verify_safe_dir",
-                side_effect=verify_directory,
-            ) as verify:
+            with patch.object(sandy, "_require_root", side_effect=require_root):
                 with patch.object(
                     sandy,
-                    "Sandy",
-                    side_effect=create_instance,
-                ):
-                    sandy.main()
+                    "_verify_safe_dir",
+                    side_effect=verify_directory,
+                ) as verify:
+                    with patch.object(
+                        sandy,
+                        "Sandy",
+                        side_effect=create_instance,
+                    ):
+                        sandy.main()
 
         self.assertEqual(
-            events[:3],
-            ["parse", ("verify", sandy.SYSTEMD_MACHINES), "construct"],
+            events[:4],
+            ["parse", "root", ("verify", sandy.SYSTEMD_MACHINES), "construct"],
         )
         verify.assert_called_once_with(sandy.SYSTEMD_MACHINES)
+
+    def test_non_root_exits_before_safe_directory_verification(self):
+        args = self.make_args("status")
+        with patch.object(sandy, "parse_args_custom", return_value=args):
+            with patch.object(sandy.os, "getuid", return_value=1000):
+                with patch.object(sandy, "_verify_safe_dir") as verify:
+                    with patch.object(sandy, "Sandy") as constructor:
+                        with captured_output() as (stdout, _):
+                            with self.assertRaises(SystemExit) as raised:
+                                sandy.main()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("Must run as root", stdout.getvalue())
+        verify.assert_not_called()
+        constructor.assert_not_called()
+
+    def test_parser_exits_before_privileged_checks(self):
+        cases = (
+            (["sandy", "--help"], 0),
+            (["sandy", "up", "--network", "untrusted"], 2),
+        )
+
+        for argv, expected_code in cases:
+            with self.subTest(argv=argv):
+                with patch.object(sys, "argv", argv):
+                    with patch.object(sandy, "_require_root") as require_root:
+                        with patch.object(sandy, "_verify_safe_dir") as verify:
+                            with patch.object(sandy, "Sandy") as constructor:
+                                with captured_output():
+                                    with self.assertRaises(SystemExit) as raised:
+                                        sandy.main()
+
+                self.assertEqual(raised.exception.code, expected_code)
+                require_root.assert_not_called()
+                verify.assert_not_called()
+                constructor.assert_not_called()
 
     def test_validated_globals_are_applied(self):
         args = self.make_args(
@@ -776,6 +817,14 @@ class MainDispatchTests(unittest.TestCase):
         self.assertEqual(instance.container, "test-box")
         self.assertEqual(instance.user, "root")
         self.assertEqual(instance.user_home, "/root")
+        instance.run_status.assert_called_once_with()
+
+    def test_custom_user_updates_derived_home(self):
+        args = self.make_args("status", user="tester")
+        instance = self.run_main(args)
+
+        self.assertEqual(instance.user, "tester")
+        self.assertEqual(instance.user_home, "/home/tester")
         instance.run_status.assert_called_once_with()
 
     def test_invalid_globals_exit_before_dispatch(self):
@@ -1045,6 +1094,8 @@ class GuestFileTests(unittest.TestCase):
         self.assertIn('NETWORK_PREFIX="24"', init_content)
         self.assertIn('GATEWAY_IP="10.20.30.1"', init_content)
         self.assertIn("MAX_RETRIES=10", init_content)
+        self.assertIn("rm -f -- /etc/resolv.conf", init_content)
+        self.assertIn("nameserver 1.1.1.1", init_content)
 
     def test_create_guest_files_skips_invalid_network_init(self):
         for cidr, gateway in [
