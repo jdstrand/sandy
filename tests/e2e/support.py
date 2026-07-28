@@ -35,6 +35,8 @@ BUILD_TIMEOUT = 1800
 FULL_BUILD_TIMEOUT = 7200
 OUTPUT_TAIL_LENGTH = 12000
 CONTAINER_USER_ID = 1000
+HOST_SECRET_NAME = "SANDY_HOST_SECRET"
+HOST_SECRET_VALUE = "must-not-enter-container"
 IPTABLES_CHAINS = (
     ("filter", "sandy-fwd"),
     ("filter", "sandy-out"),
@@ -377,6 +379,7 @@ class E2EContext:
     def minimal_environment(self) -> dict[str, str]:
         return self.safe_environment(
             {
+                HOST_SECRET_NAME: HOST_SECRET_VALUE,
                 "SANDY_SETUP_SCRIPT": str(MINIMAL_SETUP),
             }
         )
