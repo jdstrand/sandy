@@ -1,0 +1,8 @@
+{
+    "include": [
+        "sandy",
+        "test_sandy.py"
+    ],
+    "pythonVersion": "3.10",
+    "typeCheckingMode": "standard"
+}

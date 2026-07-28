@@ -67,16 +67,20 @@ def _validate_username(username: str) -> bool:
 
 def _validate_workspace_path(path: str) -> bool:
     """Validate workspace path to prevent directory traversal"""
-    if not path:
+    if not isinstance(path, str) or not path or len(path) > 4096:
         return False
 
-    normalized = os.path.normpath(path)
-    if ".." in normalized:
-        # Prevent path traversal attacks
+    if any(char in path for char in ("\x00", "\n", "\r")):
         return False
-    elif normalized.startswith("/"):
-        # For UX consistency, don't allow absolute paths
+
+    if os.path.isabs(path):
         return False
+
+    # Check the original path components. Normalizing first would turn
+    # "workspace/../secret" into "secret" and hide the traversal attempt.
+    if ".." in path.split(os.sep):
+        return False
+
     return True
 
 
@@ -184,8 +188,9 @@ def _validate_port_mapping(port_spec: str) -> Optional[Tuple[str, int, int]]:
 
 def _run_secure_subprocess(cmd: list, **kwargs) -> subprocess.CompletedProcess:
     """Run subprocess with security hardening"""
-    # Ensure shell=False (default, but explicit for security)
-    kwargs.setdefault("shell", False)
+    if kwargs.get("shell") not in (None, False):
+        raise ValueError("Shell execution is not permitted")
+    kwargs["shell"] = False
 
     _validate_command_args(cmd)
 
@@ -197,14 +202,18 @@ def _run_secure_subprocess(cmd: list, **kwargs) -> subprocess.CompletedProcess:
         # Sanitize error output before logging
         sanitized_stderr = _sanitize_log_output(str(e.stderr)) if e.stderr else ""
         raise subprocess.CalledProcessError(
-            e.returncode, e.cmd, sanitized_stderr, e.stdout
+            e.returncode,
+            e.cmd,
+            output=e.stdout,
+            stderr=sanitized_stderr,
         )
 
 
 def _run_secure_subprocess_popen(cmd: list, **kwargs) -> subprocess.Popen:
     """Run subprocess.Popen with security hardening"""
-    # Ensure shell=False (default, but explicit for security)
-    kwargs.setdefault("shell", False)
+    if kwargs.get("shell") not in (None, False):
+        raise ValueError("Shell execution is not permitted")
+    kwargs["shell"] = False
 
     _validate_command_args(cmd)
 
@@ -252,23 +261,23 @@ def _run_secure_subprocess_pty(
             sys.stderr.write(f"Failed to execute {cmd[0]}: {exc}\n")
             os._exit(1)
 
-    # Parent process - get slave path for signaling on resize
-    slave_path: Optional[str] = None
+    # Parent process - get the PTY peer path for signaling on resize
+    pty_peer_path: Optional[str] = None
     try:
         buf = array.array("i", [0])
         fcntl.ioctl(master_fd, 0x80045430, buf)  # TIOCGPTN
-        slave_path = f"/dev/pts/{buf[0]}"
+        pty_peer_path = f"/dev/pts/{buf[0]}"
     except OSError:
         # Resize still works for outer PTY; just can't propagate to container
         pass
 
-    def signal_slave_processes():
-        """Find and signal all processes using the PTY slave (best-effort).
+    def signal_pty_processes():
+        """Find and signal all processes using the PTY peer (best-effort).
 
-        Safe across containers: slave_path is in host's devpts namespace,
+        Safe across containers: pty_peer_path is in the host's devpts namespace,
         so only processes with our specific host PTY are signaled.
         """
-        if slave_path is None:
+        if pty_peer_path is None:
             return
         for proc_pid in os.listdir("/proc"):
             if not proc_pid.isdigit():
@@ -276,7 +285,7 @@ def _run_secure_subprocess_pty(
             try:
                 fd_dir = f"/proc/{proc_pid}/fd"
                 for fd in os.listdir(fd_dir):
-                    if os.readlink(f"{fd_dir}/{fd}") == slave_path:
+                    if os.readlink(f"{fd_dir}/{fd}") == pty_peer_path:
                         os.kill(int(proc_pid), signal.SIGWINCH)
                         break
             except (OSError, PermissionError):
@@ -314,7 +323,7 @@ def _run_secure_subprocess_pty(
             if sigwinch_received:
                 sigwinch_received = False
                 set_winsize(master_fd)
-                signal_slave_processes()
+                signal_pty_processes()
 
             # Wait for data from stdin or master
             try:
@@ -4397,8 +4406,7 @@ class _StoreOnceAction(argparse.Action):
 def parse_args_custom():
     """Custom argument parser to handle REMAINDER args properly"""
 
-    # Find if there's a subcommand and where it is
-    subcommands = [
+    subcommands = {
         "up",
         "down",
         "rm",
@@ -4406,28 +4414,49 @@ def parse_args_custom():
         "exec",
         "status",
         "list",
-    ]
+    }
+    global_value_options = {
+        "-w",
+        "--workspace",
+        "-s",
+        "--shared",
+        "-c",
+        "--container",
+        "-u",
+        "--user",
+    }
+    long_value_options = {
+        "--workspace",
+        "--shared",
+        "--container",
+        "--user",
+    }
+    short_value_options = {"-w", "-s", "-c", "-u"}
 
-    # Manually parse global args first
-    global_parser = argparse.ArgumentParser(add_help=False)
-    global_parser.add_argument("-w", "--workspace", default="workspace")
-    global_parser.add_argument("-s", "--shared", default=None)
-    global_parser.add_argument("--container")
-    global_parser.add_argument("--user", default="developer")
-
-    # Find the subcommand position
+    # Find the first subcommand that is not a global option value. A simple
+    # string search mistakes invocations such as "-w exec status" for an exec
+    # command even though "exec" is the workspace value.
     subcommand_idx = None
-    for i, arg in enumerate(sys.argv[1:]):
+    index = 1
+    while index < len(sys.argv):
+        arg = sys.argv[index]
         if arg in subcommands:
-            subcommand_idx = i + 1
+            subcommand_idx = index
             break
+        if arg in global_value_options:
+            index += 2
+            continue
+        if any(arg.startswith(f"{option}=") for option in long_value_options):
+            index += 1
+            continue
+        if any(
+            arg.startswith(option) and arg != option for option in short_value_options
+        ):
+            index += 1
+            continue
+        index += 1
 
-    # Parse global args up to the subcommand
-    if subcommand_idx:
-        global_parser.parse_known_args(sys.argv[1:subcommand_idx])
-        remaining_args = sys.argv[subcommand_idx:]
-    else:
-        _, remaining_args = global_parser.parse_known_args()
+    remaining_args = sys.argv[subcommand_idx:] if subcommand_idx is not None else []
 
     # Now parse the full command
     parser = argparse.ArgumentParser(
@@ -4563,6 +4592,11 @@ def main():
     # Parse arguments with custom handling
     args = parse_args_custom()
 
+    # Parse first so --help and argument errors work on hosts where the machine
+    # directory is not present. No privileged operation occurs before this
+    # safety check completes.
+    _verify_safe_dir(SYSTEMD_MACHINES)
+
     # Create Sandy instance
     sandy = Sandy()
 
@@ -4626,5 +4660,4 @@ def main():
 
 
 if __name__ == "__main__":
-    _verify_safe_dir(SYSTEMD_MACHINES)
     main()
