@@ -11,6 +11,7 @@ import traceback
 from tests.e2e import (
     test_cache,
     test_full,
+    test_install,
     test_lifecycle,
     test_network,
     test_unhappy,
@@ -18,6 +19,7 @@ from tests.e2e import (
 from tests.e2e.support import E2EContext, E2EFailure
 
 TEST_MODULES = (
+    test_install,
     test_unhappy,
     test_cache,
     test_lifecycle,

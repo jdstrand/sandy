@@ -26,6 +26,7 @@ class CleanupProbeContext(E2EContext):
         self.owned_containers = {}
         self._ip_forward_original = None
         self._host_state_owned = host_state_owned
+        self._install_dir_owned = False
         self.bridge_checks = 0
         self.cache_purges = 0
         self.state_checks = 0

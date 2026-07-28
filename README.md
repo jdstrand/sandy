@@ -163,22 +163,31 @@ instead is expected to be called with `sudo` (or similar) and for transparency,
 `sandy` is fairly chatty with its output.
 
 Users may find it convenient to install `sandy` to a root-owned directory and
-adjust `sudoers` accordingly. Eg:
+adjust `sudoers` accordingly. The install target copies `sandy` and its helper
+scripts to `/usr/local/lib/sandy` by default:
 
 ```bash
 $ git clone https://github.com/jdstrand/sandy.git
-$ sudo mkdir /usr/local/lib/sandy
-$ sudo cp ./sandy ./*.sh /usr/local/lib/sandy
+$ cd sandy
+$ sudo make install
 ```
 
-Then adjust `/etc/sudoers.d/sandy` to have something like:
+After copying the files, `make install` prints a narrowly scoped example that
+may be appropriate for sudoers, but it never updates sudoers. Review any policy
+change with `visudo`; for example, a site may choose:
+
 ```
-%sudo	ALL=(ALL:ALL) /usr/local/lib/sandy/sandy
+%sudo	ALL=(root:root) /usr/local/lib/sandy/sandy
 ```
 
-This provides similar usability (no password) and security posture as other
-container technologies (since members of the `sudo` group already have `root`
-access).
+Set `INSTALL_DIR` to choose another absolute installation directory. Packagers
+can set an absolute `DESTDIR`, which is prepended as a staging root. A
+`DESTDIR` of `/` is equivalent to leaving it empty, and trailing slashes are
+accepted.
+
+This limits the suggested policy entry to running the installed `sandy`
+executable as `root`. Sites can apply stricter policy or choose a different
+administrative group as appropriate.
 
 As mentioned above, `sandy` was written with security in mind with the goal of
 creating a strong sandbox for AI agents, but it should be understood there may
