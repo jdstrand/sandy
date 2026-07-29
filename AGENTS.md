@@ -177,6 +177,11 @@ Run the smallest validation set that covers the change:
   integration, or container-runtime boundary that unit tests mock; run it only
   inside a verified disposable VM.
 
+To avoid wasting tokens, do not return full diffs or verbose test output to
+model context. Instead, redirect to temporary files and inspect only exit
+status, `tail`, `wc`, and targeted `rg`/small `sed` excerpts. Keep all tool
+output limits small.
+
 Report checks that fail or cannot run. Repeat checks only after a failure or
 material uncertainty. Do not delete an existing virtual environment, install
 host packages, or weaken checks merely to obtain a passing result.
