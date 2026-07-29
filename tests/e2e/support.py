@@ -11,6 +11,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -38,6 +39,8 @@ OUTPUT_TAIL_LENGTH = 12000
 CONTAINER_USER_ID = 1000
 HOST_SECRET_NAME = "SANDY_HOST_SECRET"
 HOST_SECRET_VALUE = "must-not-enter-container"
+DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+PATH_OPEN_FLAGS = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
 IPTABLES_CHAINS = (
     ("filter", "sandy-fwd"),
     ("filter", "sandy-out"),
@@ -58,6 +61,15 @@ NFTABLES_TABLES = (
 
 class E2EFailure(RuntimeError):
     """Raised when an end-to-end assertion fails."""
+
+
+@dataclass(frozen=True)
+class FilesystemFixtureIdentity:
+    """Identity of a root-owned E2E filesystem fixture claimed by this run."""
+
+    dev: int
+    ino: int
+    file_type: int
 
 
 @dataclass(frozen=True)
@@ -141,7 +153,12 @@ class E2EContext:
         self._ip_forward_original: str | None = None
         self._host_state_owned = False
         self._install_dir_owned = False
+        self._filesystem_fixtures_reserved = False
         self._filesystem_fixtures_owned = False
+        self._filesystem_fixture_identities: dict[
+            Path,
+            FilesystemFixtureIdentity,
+        ] = {}
         self._filesystem_mounts: list[Path] = []
 
     def _validate_names(self) -> None:
@@ -335,7 +352,7 @@ class E2EContext:
         # Every global Sandy namespace was absent at preflight, so subsequent
         # Sandy state belongs to this run and is safe for cleanup to remove.
         self._host_state_owned = True
-        self._filesystem_fixtures_owned = True
+        self._filesystem_fixtures_reserved = True
 
     def claim_install_dir(self) -> None:
         """Claim the known-absent default install path for guarded cleanup."""
@@ -401,23 +418,346 @@ class E2EContext:
         if artifacts:
             raise E2EFailure("Sandy state remains: " + ", ".join(artifacts))
 
+    def _filesystem_fixture_paths(self) -> tuple[Path, ...]:
+        return (
+            self.filesystem_machine_link,
+            self.filesystem_image_root,
+            self.filesystem_host_target,
+        )
+
+    @contextmanager
+    def _defer_filesystem_fixture_interrupts(self) -> Iterator[None]:
+        """Defer operator interrupts while a fixture is created and claimed."""
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            {signal.SIGINT, signal.SIGTERM},
+        )
+        try:
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    @staticmethod
+    def _filesystem_fixture_identity(
+        fixture_stat: os.stat_result,
+    ) -> FilesystemFixtureIdentity:
+        return FilesystemFixtureIdentity(
+            dev=fixture_stat.st_dev,
+            ino=fixture_stat.st_ino,
+            file_type=stat.S_IFMT(fixture_stat.st_mode),
+        )
+
+    def _prepare_filesystem_fixture_creation(self, fixture_path: Path) -> None:
+        if not self._filesystem_fixtures_reserved:
+            raise E2EFailure("Filesystem fixtures were not reserved at preflight")
+        if fixture_path not in self._filesystem_fixture_paths():
+            raise E2EFailure(f"Unexpected filesystem fixture path: {fixture_path}")
+        if fixture_path.exists() or fixture_path.is_symlink():
+            raise E2EFailure(f"Filesystem fixture already exists: {fixture_path}")
+
+    def _remove_unclaimed_created_fixture(
+        self,
+        fixture_path: Path,
+        created_identity: FilesystemFixtureIdentity,
+    ) -> None:
+        try:
+            fixture_stat = fixture_path.lstat()
+        except FileNotFoundError:
+            return
+        if not self._identity_matches(fixture_stat, created_identity):
+            return
+        if stat.S_ISDIR(fixture_stat.st_mode):
+            fixture_path.rmdir()
+        else:
+            fixture_path.unlink()
+
+    def create_filesystem_fixture_directory(
+        self,
+        fixture_path: Path,
+        *,
+        mode: int = 0o755,
+    ) -> None:
+        """Create and claim one top-level root fixture without an interrupt gap."""
+        self._prepare_filesystem_fixture_creation(fixture_path)
+        with self._defer_filesystem_fixture_interrupts():
+            fixture_path.mkdir(mode=mode)
+            created_identity = self._filesystem_fixture_identity(fixture_path.lstat())
+            try:
+                self.claim_filesystem_fixture(fixture_path)
+            except Exception:
+                self._remove_unclaimed_created_fixture(fixture_path, created_identity)
+                raise
+
+    def create_filesystem_fixture_symlink(
+        self,
+        fixture_path: Path,
+        target_path: Path,
+    ) -> None:
+        """Create and claim one top-level symlink fixture without an interrupt gap."""
+        self._prepare_filesystem_fixture_creation(fixture_path)
+        with self._defer_filesystem_fixture_interrupts():
+            fixture_path.symlink_to(target_path, target_is_directory=True)
+            created_identity = self._filesystem_fixture_identity(fixture_path.lstat())
+            try:
+                self.claim_filesystem_fixture(fixture_path)
+            except Exception:
+                self._remove_unclaimed_created_fixture(fixture_path, created_identity)
+                raise
+
+    def claim_filesystem_fixture(self, fixture_path: Path) -> None:
+        """Claim one exact top-level fixture inode after successful creation."""
+        if not self._filesystem_fixtures_reserved:
+            raise E2EFailure("Filesystem fixtures were not reserved at preflight")
+        if fixture_path not in self._filesystem_fixture_paths():
+            raise E2EFailure(f"Unexpected filesystem fixture path: {fixture_path}")
+
+        try:
+            fixture_stat = fixture_path.lstat()
+        except OSError as exc:
+            raise E2EFailure(
+                f"Could not inspect filesystem fixture: {fixture_path}"
+            ) from exc
+        if (fixture_stat.st_uid, fixture_stat.st_gid) != (0, 0):
+            raise E2EFailure(
+                f"Filesystem fixture has unexpected ownership: {fixture_path}"
+            )
+        if not (
+            stat.S_ISDIR(fixture_stat.st_mode)
+            or stat.S_ISREG(fixture_stat.st_mode)
+            or stat.S_ISLNK(fixture_stat.st_mode)
+        ):
+            raise E2EFailure(f"Unsafe filesystem fixture type: {fixture_path}")
+
+        identity = self._filesystem_fixture_identity(fixture_stat)
+        existing_identity = self._filesystem_fixture_identities.get(fixture_path)
+        if existing_identity is not None and existing_identity != identity:
+            raise E2EFailure(f"Filesystem fixture changed after claim: {fixture_path}")
+
+        self._filesystem_fixture_identities[fixture_path] = identity
+        self._filesystem_fixtures_owned = True
+
+    def claim_filesystem_fixtures(self) -> None:
+        """Claim exact fixture inodes after a test creates them successfully."""
+        for fixture_path in self._filesystem_fixture_paths():
+            if fixture_path.exists() or fixture_path.is_symlink():
+                self.claim_filesystem_fixture(fixture_path)
+
+        if not self._filesystem_fixture_identities:
+            raise E2EFailure("No filesystem fixtures were created to claim")
+
+    @staticmethod
+    def _identity_matches(
+        fixture_stat: os.stat_result,
+        identity: FilesystemFixtureIdentity,
+    ) -> bool:
+        return (
+            fixture_stat.st_dev == identity.dev
+            and fixture_stat.st_ino == identity.ino
+            and stat.S_IFMT(fixture_stat.st_mode) == identity.file_type
+        )
+
+    @staticmethod
+    def _fd_mount_id(fd: int) -> int:
+        with open(f"/proc/self/fdinfo/{fd}", "r", encoding="ascii") as fdinfo:
+            for line in fdinfo:
+                if line.startswith("mnt_id:"):
+                    value = line.removeprefix("mnt_id:").strip()
+                    if value.isdecimal():
+                        return int(value)
+        raise E2EFailure("Could not determine fixture descriptor mount ID")
+
+    def _remove_directory_contents(
+        self,
+        directory_fd: int,
+        root_device: int,
+        root_mount_id: int,
+    ) -> None:
+        for entry in os.listdir(directory_fd):
+            entry_stat = os.stat(
+                entry,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_ISDIR(entry_stat.st_mode):
+                if entry_stat.st_dev != root_device:
+                    raise E2EFailure(
+                        "Refusing to clean filesystem fixture across a device boundary"
+                    )
+                child_fd = os.open(entry, DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+                try:
+                    opened_stat = os.fstat(child_fd)
+                    if not self._identity_matches(
+                        opened_stat,
+                        FilesystemFixtureIdentity(
+                            dev=entry_stat.st_dev,
+                            ino=entry_stat.st_ino,
+                            file_type=stat.S_IFMT(entry_stat.st_mode),
+                        ),
+                    ):
+                        raise E2EFailure(
+                            "Filesystem fixture directory changed during cleanup"
+                        )
+                    if self._fd_mount_id(child_fd) != root_mount_id:
+                        raise E2EFailure(
+                            "Refusing to clean filesystem fixture across a mount"
+                        )
+                    self._remove_directory_contents(
+                        child_fd,
+                        root_device,
+                        root_mount_id,
+                    )
+                finally:
+                    os.close(child_fd)
+
+                current_stat = os.stat(
+                    entry,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if not self._identity_matches(
+                    current_stat,
+                    FilesystemFixtureIdentity(
+                        dev=entry_stat.st_dev,
+                        ino=entry_stat.st_ino,
+                        file_type=stat.S_IFMT(entry_stat.st_mode),
+                    ),
+                ):
+                    raise E2EFailure(
+                        "Filesystem fixture directory changed before removal"
+                    )
+                os.rmdir(entry, dir_fd=directory_fd)
+            else:
+                entry_fd = os.open(entry, PATH_OPEN_FLAGS, dir_fd=directory_fd)
+                try:
+                    opened_stat = os.fstat(entry_fd)
+                    if not self._identity_matches(
+                        opened_stat,
+                        FilesystemFixtureIdentity(
+                            dev=entry_stat.st_dev,
+                            ino=entry_stat.st_ino,
+                            file_type=stat.S_IFMT(entry_stat.st_mode),
+                        ),
+                    ):
+                        raise E2EFailure(
+                            "Filesystem fixture entry changed during cleanup"
+                        )
+                    if self._fd_mount_id(entry_fd) != root_mount_id:
+                        raise E2EFailure(
+                            "Refusing to clean filesystem fixture across a mount"
+                        )
+                finally:
+                    os.close(entry_fd)
+
+                current_stat = os.stat(
+                    entry,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if not self._identity_matches(
+                    current_stat,
+                    FilesystemFixtureIdentity(
+                        dev=entry_stat.st_dev,
+                        ino=entry_stat.st_ino,
+                        file_type=stat.S_IFMT(entry_stat.st_mode),
+                    ),
+                ):
+                    raise E2EFailure("Filesystem fixture entry changed before removal")
+                os.unlink(entry, dir_fd=directory_fd)
+
+    def _remove_claimed_filesystem_fixture(self, fixture_path: Path) -> None:
+        identity = self._filesystem_fixture_identities[fixture_path]
+        parent_fd = os.open(fixture_path.parent, DIRECTORY_OPEN_FLAGS)
+        fixture_fd: int | None = None
+        try:
+            try:
+                fixture_stat = os.stat(
+                    fixture_path.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return
+            if not self._identity_matches(fixture_stat, identity):
+                raise E2EFailure(
+                    f"Refusing to remove replaced filesystem fixture: {fixture_path}"
+                )
+
+            if stat.S_ISDIR(fixture_stat.st_mode):
+                fixture_fd = os.open(
+                    fixture_path.name,
+                    DIRECTORY_OPEN_FLAGS,
+                    dir_fd=parent_fd,
+                )
+                opened_stat = os.fstat(fixture_fd)
+                if not self._identity_matches(opened_stat, identity):
+                    raise E2EFailure(
+                        f"Filesystem fixture changed during open: {fixture_path}"
+                    )
+                root_mount_id = self._fd_mount_id(fixture_fd)
+                self._remove_directory_contents(
+                    fixture_fd,
+                    opened_stat.st_dev,
+                    root_mount_id,
+                )
+                os.close(fixture_fd)
+                fixture_fd = None
+
+                current_stat = os.stat(
+                    fixture_path.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if not self._identity_matches(current_stat, identity):
+                    raise E2EFailure(
+                        f"Filesystem fixture changed before removal: {fixture_path}"
+                    )
+                os.rmdir(fixture_path.name, dir_fd=parent_fd)
+            else:
+                fixture_fd = os.open(
+                    fixture_path.name,
+                    PATH_OPEN_FLAGS,
+                    dir_fd=parent_fd,
+                )
+                opened_stat = os.fstat(fixture_fd)
+                if not self._identity_matches(opened_stat, identity):
+                    raise E2EFailure(
+                        f"Filesystem fixture changed during open: {fixture_path}"
+                    )
+                os.close(fixture_fd)
+                fixture_fd = None
+
+                current_stat = os.stat(
+                    fixture_path.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if not self._identity_matches(current_stat, identity):
+                    raise E2EFailure(
+                        f"Filesystem fixture changed before removal: {fixture_path}"
+                    )
+                os.unlink(fixture_path.name, dir_fd=parent_fd)
+        finally:
+            if fixture_fd is not None:
+                os.close(fixture_fd)
+            os.close(parent_fd)
+
     def remove_filesystem_fixtures(self) -> None:
-        """Remove only root filesystem fixtures proven absent at preflight."""
-        if not self._filesystem_fixtures_owned:
-            raise E2EFailure("Filesystem fixtures are not owned by this E2E run")
+        """Remove only root filesystem fixtures with a recorded identity."""
+        if (
+            not self._filesystem_fixtures_owned
+            or not self._filesystem_fixture_identities
+        ):
+            raise E2EFailure("Filesystem fixtures are not claimed by this E2E run")
         if self._filesystem_mounts:
             raise E2EFailure(
                 "Refusing to remove filesystem fixtures while tracked mounts remain"
             )
-        for fixture_path in (
-            self.filesystem_machine_link,
-            self.filesystem_image_root,
-            self.filesystem_host_target,
-        ):
-            if fixture_path.is_symlink() or fixture_path.is_file():
-                fixture_path.unlink()
-            elif fixture_path.is_dir():
-                shutil.rmtree(fixture_path)
+        for fixture_path in self._filesystem_fixture_paths():
+            if fixture_path not in self._filesystem_fixture_identities:
+                continue
+            self._remove_claimed_filesystem_fixture(fixture_path)
+        self._filesystem_fixture_identities = {}
+        self._filesystem_fixtures_owned = False
 
     def mount_filesystem_file(
         self,

@@ -403,6 +403,42 @@ class SubprocessWrapperTests(unittest.TestCase):
         self.assertIs(result, process)
         popen.assert_called_once_with(["tool"], stdin=None, shell=False)
 
+    def test_subprocess_wrappers_validate_explicit_inherited_fds(self):
+        completed = subprocess.CompletedProcess(["true"], 0)
+        descriptor = os.open(SANDY_PATH, os.O_RDONLY)
+        try:
+            with patch.object(sandy.subprocess, "run", return_value=completed) as run:
+                result = sandy._run_secure_subprocess(
+                    ["true"],
+                    pass_fds=[descriptor],
+                )
+            self.assertIs(result, completed)
+            run.assert_called_once_with(
+                ["true"],
+                pass_fds=(descriptor,),
+                shell=False,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Inherited file descriptors require close_fds=True",
+            ):
+                sandy._run_secure_subprocess(
+                    ["true"],
+                    close_fds=False,
+                    pass_fds=(descriptor,),
+                )
+        finally:
+            os.close(descriptor)
+
+        with self.assertRaises(OSError):
+            sandy._run_secure_subprocess(["true"], pass_fds=(descriptor,))
+
+        for pass_fds in ((-1,), (True,), (0, 0), object()):
+            with self.subTest(pass_fds=pass_fds):
+                with self.assertRaises(ValueError):
+                    sandy._validate_inherited_fds(pass_fds)
+
     def test_subprocess_wrappers_reject_shell_execution(self):
         for wrapper in (
             sandy._run_secure_subprocess,
@@ -476,6 +512,28 @@ class SubprocessWrapperTests(unittest.TestCase):
                             environment=environment,
                         )
                 fork.assert_not_called()
+
+    def test_pty_wrapper_marks_only_explicit_fds_inheritable_in_child(self):
+        descriptor = os.open(SANDY_PATH, os.O_RDONLY)
+        try:
+            with patch.object(sandy.pty, "fork", return_value=(0, 10)):
+                with patch.object(sandy.os, "set_inheritable") as set_inheritable:
+                    with patch.object(
+                        sandy.os,
+                        "execvpe",
+                        side_effect=RuntimeError("exec called"),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "exec called"):
+                            sandy._run_secure_subprocess_pty(
+                                ["tool"],
+                                environment={"PATH": sandy.CONTAINER_PATH},
+                                master_read=MagicMock(),
+                                stdin_read=MagicMock(),
+                                pass_fds=(descriptor,),
+                            )
+            set_inheritable.assert_called_once_with(descriptor, True)
+        finally:
+            os.close(descriptor)
 
 
 class PtyProcessTests(unittest.TestCase):
@@ -1166,10 +1224,17 @@ class FilesystemSafetyTests(unittest.TestCase):
                         sandy._container_name_from_machine_path(path)
 
     def test_verify_safe_dir_uses_no_follow_descriptor_walk(self):
-        safe = self.safe_stat()
         with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
             with patch.object(sandy.os, "open", side_effect=[10, 11, 12]) as open_fd:
-                with patch.object(sandy.os, "fstat", return_value=safe):
+                with patch.object(
+                    sandy.os,
+                    "fstat",
+                    side_effect=[
+                        self.safe_stat(ino=1),
+                        self.safe_stat(ino=2),
+                        self.safe_stat(ino=3),
+                    ],
+                ):
                     with patch.object(sandy.os, "close") as close:
                         sandy._verify_safe_dir("/safe/sandy.container")
 
@@ -1457,6 +1522,22 @@ class FilesystemSafetyTests(unittest.TestCase):
                                 sandy._open_verified_dir(
                                     "/safe/sandy.container",
                                 )
+        self.assertEqual(close.call_args_list, [call(10), call(12), call(11)])
+
+    def test_verified_directory_rejects_direct_host_root_image(self):
+        root_stat = self.safe_stat(ino=1, dev=1)
+        safe_stat = self.safe_stat(ino=2, dev=1)
+
+        with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
+            with patch.object(sandy.os, "open", side_effect=[10, 11, 12]):
+                with patch.object(
+                    sandy.os,
+                    "fstat",
+                    side_effect=[root_stat, safe_stat, root_stat],
+                ):
+                    with patch.object(sandy.os, "close") as close:
+                        with self.assertRaisesRegex(PermissionError, "host root"):
+                            sandy._open_verified_dir("/safe/sandy.root")
         self.assertEqual(close.call_args_list, [call(10), call(12), call(11)])
 
     def test_verify_safe_dir_rejects_symlink_components_and_closes_fds(self):
@@ -1902,6 +1983,153 @@ class FilesystemSafetyTests(unittest.TestCase):
                     sandy._open_image_directory(image_fd, ("missing",))
             finally:
                 os.close(image_fd)
+
+    def test_image_file_resolution_uses_pinned_root_and_rejects_final_symlink(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = root / "image"
+            external = root / "external"
+            image.mkdir()
+            external.write_text("host", encoding="utf-8")
+            init_script = image / "init.sh"
+            init_script.write_text("#!/bin/sh\n", encoding="utf-8")
+            init_script.chmod(0o644)
+
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                file_fd = sandy._open_image_file(image_fd, ("init.sh",))
+                try:
+                    self.assertEqual(os.read(file_fd, 64), b"#!/bin/sh\n")
+                finally:
+                    os.close(file_fd)
+
+                init_script.unlink()
+                init_script.symlink_to(external)
+                with self.assertRaises(PermissionError):
+                    sandy._open_image_file(image_fd, ("init.sh",))
+            finally:
+                os.close(image_fd)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir)
+            group_writable = image / "init.sh"
+            group_writable.write_text("#!/bin/sh\n", encoding="utf-8")
+            group_writable.chmod(0o664)
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with self.assertRaises(PermissionError):
+                    sandy._open_image_file(image_fd, ("init.sh",))
+            finally:
+                os.close(image_fd)
+
+    def test_image_file_resolution_rejects_mount_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir)
+            init_script = image / "init.sh"
+            init_script.write_text("#!/bin/sh\n", encoding="utf-8")
+            init_script.chmod(0o644)
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(
+                    sandy,
+                    "_fd_mount_id",
+                    side_effect=[1, 2],
+                ):
+                    with self.assertRaisesRegex(PermissionError, "mount boundary"):
+                        sandy._open_image_file(image_fd, ("init.sh",))
+            finally:
+                os.close(image_fd)
+
+    def test_image_file_resolution_rejects_device_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir)
+            init_script = image / "init.sh"
+            init_script.write_text("#!/bin/sh\n", encoding="utf-8")
+            init_script.chmod(0o644)
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            root_stat = os.fstat(image_fd)
+            different_device = self.safe_stat(
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                mode=stat.S_IFREG | 0o644,
+                ino=root_stat.st_ino + 1,
+                dev=root_stat.st_dev + 1,
+            )
+            try:
+                with patch.object(
+                    sandy.os,
+                    "fstat",
+                    side_effect=[root_stat, different_device],
+                ):
+                    with patch.object(sandy, "_fd_mount_id", return_value=1):
+                        with self.assertRaisesRegex(
+                            PermissionError,
+                            "filesystem boundary",
+                        ):
+                            sandy._open_image_file(image_fd, ("init.sh",))
+            finally:
+                os.close(image_fd)
+
+    def test_init_bind_copy_uses_private_regular_file_and_exact_cleanup(self):
+        with tempfile.NamedTemporaryFile() as source:
+            source.write(b'CONTAINER_IP="10.200.1.10"\n')
+            source.flush()
+            init_fd = os.open(source.name, sandy.READ_FILE_OPEN_FLAGS)
+            try:
+                temporary_dir, bind_path = sandy._create_init_bind_copy(init_fd)
+            finally:
+                os.close(init_fd)
+
+        try:
+            directory_stat = os.stat(temporary_dir)
+            file_stat = os.stat(bind_path)
+            self.assertTrue(stat.S_ISDIR(directory_stat.st_mode))
+            self.assertEqual(stat.S_IMODE(directory_stat.st_mode) & 0o077, 0)
+            self.assertTrue(stat.S_ISREG(file_stat.st_mode))
+            self.assertEqual(stat.S_IMODE(file_stat.st_mode), 0o500)
+            self.assertEqual(
+                Path(bind_path).read_text(), 'CONTAINER_IP="10.200.1.10"\n'
+            )
+        finally:
+            sandy._remove_init_bind_copy(temporary_dir)
+        self.assertFalse(Path(temporary_dir).exists())
+
+    def test_init_bind_copy_rejects_oversized_source_and_bad_cleanup_target(self):
+        with tempfile.NamedTemporaryFile() as source:
+            source.write(b"x" * (sandy.INIT_SCRIPT_MAX_BYTES + 1))
+            source.flush()
+            init_fd = os.open(source.name, sandy.READ_FILE_OPEN_FLAGS)
+            try:
+                with self.assertRaisesRegex(PermissionError, "too large"):
+                    sandy._create_init_bind_copy(init_fd)
+            finally:
+                os.close(init_fd)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(PermissionError, "unexpected"):
+                sandy._remove_init_bind_copy(temp_dir)
+
+    def test_init_bind_copy_can_target_fixed_user_namespace_owner(self):
+        with tempfile.NamedTemporaryFile() as source:
+            source.write(b'CONTAINER_IP="10.200.1.10"\n')
+            source.flush()
+            init_fd = os.open(source.name, sandy.READ_FILE_OPEN_FLAGS)
+            try:
+                with patch.object(sandy.os, "fchown") as fchown:
+                    temporary_dir, bind_path = sandy._create_init_bind_copy(
+                        init_fd,
+                        12345,
+                        12345,
+                    )
+            finally:
+                os.close(init_fd)
+
+        try:
+            self.assertEqual(stat.S_IMODE(os.stat(bind_path).st_mode), 0o500)
+            fchown.assert_called_once()
+            self.assertEqual(fchown.call_args.args[1:], (12345, 12345))
+        finally:
+            sandy._remove_init_bind_copy(temporary_dir)
 
     def test_remove_managed_tree_refuses_target_and_nested_mount_boundaries(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3019,6 +3247,109 @@ class NetworkCoreTests(unittest.TestCase):
         self.assertEqual(network.firewall_backend, "nftables")
         self.assertTrue(network.configured)
 
+    def test_preview_bridge_network_reuses_existing_bridge_without_mutation(self):
+        def detect_existing(preview):
+            preview.network = "10.222.5.0"
+            preview.network_cidr = "10.222.5.0/24"
+            preview.gateway = "10.222.5.1"
+            return True
+
+        with patch.object(
+            sandy.SandyNet,
+            "_bridge_exists",
+            autospec=True,
+            return_value=True,
+        ):
+            with patch.object(
+                sandy.SandyNet,
+                "_detect_existing_config",
+                autospec=True,
+                side_effect=detect_existing,
+            ):
+                with patch.object(
+                    sandy.SandyNet,
+                    "_find_unused_network",
+                    autospec=True,
+                ) as find_unused:
+                    with patch.object(
+                        sandy.SandyNet,
+                        "_setup_bridge",
+                        autospec=True,
+                    ) as setup:
+                        guest_network, planned_network = (
+                            sandy.SandyNet.preview_bridge_network()
+                        )
+
+        self.assertEqual(guest_network, ("10.222.5.0/24", "10.222.5.1"))
+        self.assertIsNone(planned_network)
+        find_unused.assert_not_called()
+        setup.assert_not_called()
+
+    def test_preview_bridge_network_plans_unused_network_without_mutation(self):
+        planned = ("10.222.5.0", "10.222.5.0/24", "10.222.5.1")
+        with patch.object(
+            sandy.SandyNet,
+            "_bridge_exists",
+            autospec=True,
+            return_value=False,
+        ):
+            with patch.object(
+                sandy.SandyNet,
+                "_find_unused_network",
+                autospec=True,
+                return_value=planned,
+            ) as find_unused:
+                with patch.object(
+                    sandy.SandyNet,
+                    "_setup_bridge",
+                    autospec=True,
+                ) as setup:
+                    guest_network, planned_network = (
+                        sandy.SandyNet.preview_bridge_network()
+                    )
+
+        self.assertEqual(guest_network, ("10.222.5.0/24", "10.222.5.1"))
+        self.assertEqual(planned_network, planned)
+        find_unused.assert_called_once()
+        setup.assert_not_called()
+
+    def test_preview_bridge_network_rejects_invalid_existing_or_missing_plan(self):
+        def detect_public_network(preview):
+            preview.network = "8.8.8.0"
+            preview.network_cidr = "8.8.8.0/24"
+            preview.gateway = "8.8.8.1"
+            return True
+
+        with patch.object(
+            sandy.SandyNet,
+            "_bridge_exists",
+            autospec=True,
+            return_value=True,
+        ):
+            with patch.object(
+                sandy.SandyNet,
+                "_detect_existing_config",
+                autospec=True,
+                side_effect=detect_public_network,
+            ):
+                with self.assertRaisesRegex(PermissionError, "Invalid Sandy network"):
+                    sandy.SandyNet.preview_bridge_network()
+
+        with patch.object(
+            sandy.SandyNet,
+            "_bridge_exists",
+            autospec=True,
+            return_value=False,
+        ):
+            with patch.object(
+                sandy.SandyNet,
+                "_find_unused_network",
+                autospec=True,
+                return_value=None,
+            ):
+                with self.assertRaisesRegex(PermissionError, "unused network"):
+                    sandy.SandyNet.preview_bridge_network()
+
     def test_bridge_exists(self):
         network = make_network()
         for returncode, expected in [(0, True), (1, False)]:
@@ -3216,6 +3547,66 @@ class NetworkCoreTests(unittest.TestCase):
                     ipt_chains.assert_called_once_with("10.210.1.0/24")
                 if backend == "nftables":
                     nft.assert_called_once_with("10.210.1.0/24")
+
+    def test_setup_bridge_uses_valid_plan_and_skips_discovery(self):
+        network = make_network()
+        network.firewall_backend = None
+        planned = ("10.222.5.0", "10.222.5.0/24", "10.222.5.1")
+        with patch.object(network, "_find_unused_network") as find_unused:
+            with patch.object(
+                network,
+                "_check_network_conflict",
+                return_value=False,
+            ) as conflict:
+                with patch.object(network, "_create_bridge", return_value=True):
+                    with patch.object(network, "_enable_ip_forwarding"):
+                        with patch.object(network, "_enable_route_localnet"):
+                            with patch.object(
+                                network,
+                                "_configure_bridge_ip",
+                                return_value=True,
+                            ):
+                                with captured_output():
+                                    self.assertTrue(network._setup_bridge(planned))
+
+        find_unused.assert_not_called()
+        conflict.assert_called_once_with("10.222.5.0/24")
+        self.assertEqual(network.network, "10.222.5.0")
+        self.assertEqual(network.network_cidr, "10.222.5.0/24")
+        self.assertEqual(network.gateway, "10.222.5.1")
+
+    def test_setup_bridge_rejects_invalid_plans_before_mutation(self):
+        cases = (
+            ("10.222.5.0", "not-cidr", "10.222.5.1"),
+            ("10.222.6.0", "10.222.5.0/24", "10.222.5.1"),
+            ("10.222.5.0", "10.222.5.0/24", "10.222.6.1"),
+        )
+        for planned in cases:
+            with self.subTest(planned=planned):
+                network = make_network()
+                with patch.object(network, "_find_unused_network") as find_unused:
+                    with patch.object(network, "_create_bridge") as create_bridge:
+                        with captured_output():
+                            self.assertFalse(network._setup_bridge(planned))
+                find_unused.assert_not_called()
+                create_bridge.assert_not_called()
+
+    def test_setup_bridge_rejects_conflicting_plan_before_mutation(self):
+        network = make_network()
+        planned = ("10.222.5.0", "10.222.5.0/24", "10.222.5.1")
+        with patch.object(network, "_find_unused_network") as find_unused:
+            with patch.object(
+                network,
+                "_check_network_conflict",
+                return_value=True,
+            ) as conflict:
+                with patch.object(network, "_create_bridge") as create_bridge:
+                    with captured_output():
+                        self.assertFalse(network._setup_bridge(planned))
+
+        find_unused.assert_not_called()
+        conflict.assert_called_once_with("10.222.5.0/24")
+        create_bridge.assert_not_called()
 
     def test_cleanup_nftables_and_bridge(self):
         network = make_network()
@@ -4634,7 +5025,7 @@ class CacheTests(unittest.TestCase):
                             with patch.dict(sandy.os.environ, {}, clear=True):
                                 with captured_output():
                                     instance._build()
-        cached.assert_called_once_with("/cache/key.tar", "/machine")
+        cached.assert_called_once_with("/cache/key.tar", "/machine", None)
         fresh.assert_not_called()
 
     def test_build_can_disable_cache(self):
@@ -4648,7 +5039,7 @@ class CacheTests(unittest.TestCase):
                         clear=True,
                     ):
                         instance._build()
-        fresh.assert_called_once_with("/machine", False)
+        fresh.assert_called_once_with("/machine", False, None)
 
     def test_build_skips_existing_machine_and_uses_fresh_cache_miss(self):
         instance = make_sandy()
@@ -4679,7 +5070,7 @@ class CacheTests(unittest.TestCase):
                     ) as fresh:
                         with patch.dict(sandy.os.environ, {}, clear=True):
                             instance._build()
-        fresh.assert_called_once_with("/machine", True)
+        fresh.assert_called_once_with("/machine", True, None)
 
     def test_cache_path_combines_manifest_hash(self):
         instance = make_sandy()
@@ -4706,11 +5097,15 @@ class CacheTests(unittest.TestCase):
             lock = cache / sandy.PORT_MAPPINGS_LOCK_FILENAME
             archive = cache / "cache.tar"
             directory = cache / "partial"
+            state_alias = cache / "state-alias"
+            directory_alias = cache / "directory-alias"
             state.write_text("{}")
             lock.write_text("")
             archive.write_text("archive")
             directory.mkdir()
             (directory / "file").write_text("partial")
+            state_alias.symlink_to(state)
+            directory_alias.symlink_to(directory, target_is_directory=True)
             with patch.object(instance, "_get_cache_dir", return_value=temp_dir):
                 with patch.object(
                     instance,
@@ -4722,6 +5117,9 @@ class CacheTests(unittest.TestCase):
             self.assertTrue(state.exists())
             self.assertTrue(lock.exists())
             self.assertFalse(archive.exists())
+            self.assertFalse(state_alias.exists())
+            self.assertFalse(directory_alias.exists())
+            self.assertTrue(directory.exists())
             rmtree.assert_called_once_with(str(directory))
 
     def test_create_cache_writes_manifest_and_hardened_tar_command(self):
@@ -4826,8 +5224,8 @@ class CacheTests(unittest.TestCase):
                         return_value=["vanished"],
                     ):
                         with patch.object(
-                            sandy.os.path,
-                            "samefile",
+                            sandy.os,
+                            "lstat",
                             side_effect=FileNotFoundError,
                         ):
                             self.assertFalse(instance._clear_cache_contents())
@@ -4837,25 +5235,37 @@ class CacheTests(unittest.TestCase):
         instance.network = make_network()
         instance.network._ensure_gateway = MagicMock(return_value=True)
         success = SimpleNamespace(returncode=0)
-        with patch.object(sandy, "_verify_safe_dir") as verify:
-            with patch.object(sandy, "_mkdir") as mkdir:
-                with patch.object(
-                    sandy,
-                    "_run_secure_subprocess",
-                    return_value=success,
-                ) as run:
-                    with patch.object(sandy, "_create_guest_files") as guest:
-                        with captured_output():
-                            instance._new_machine_from_cache(
-                                "/cache/key.tar",
-                                "/machine",
-                            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+            with patch.object(sandy, "_verify_safe_dir") as verify:
+                with patch.object(sandy, "_mkdir") as mkdir:
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        return_value=machine_fd,
+                    ) as open_dir:
+                        with patch.object(
+                            sandy,
+                            "_run_secure_subprocess",
+                            return_value=success,
+                        ) as run:
+                            with patch.object(sandy, "_create_guest_files") as guest:
+                                with captured_output():
+                                    instance._new_machine_from_cache(
+                                        "/cache/key.tar",
+                                        "/machine",
+                                    )
 
         verify.assert_called_once_with("/cache")
         mkdir.assert_called_once_with("/machine")
+        open_dir.assert_called_once_with("/machine")
         self.assertEqual(run.call_count, 2)
         extract = run.call_args_list[0].args[0]
         self.assertEqual(extract[:4], ["tar", "--extract", "--file", "/cache/key.tar"])
+        machine_id = run.call_args_list[1]
+        self.assertEqual(machine_id.args[0][0], "systemd-machine-id-setup")
+        self.assertRegex(machine_id.args[0][1], r"^--root=/proc/self/fd/[0-9]+$")
+        self.assertEqual(len(machine_id.kwargs["pass_fds"]), 1)
         guest.assert_called_once_with(
             "/machine",
             "ai-dev",
@@ -4891,45 +5301,59 @@ class CacheTests(unittest.TestCase):
             "_run_secure_subprocess",
             return_value=success,
         ) as run:
-            with patch.object(sandy, "_verify_safe_dir") as verify:
-                with patch.object(
-                    sandy.os.path,
-                    "exists",
-                    return_value=False,
-                ):
-                    with patch(
-                        "builtins.open",
-                        mock_open(read_data=setup_content),
-                    ):
-                        with patch.object(sandy, "_write") as write:
-                            with patch.object(
-                                sandy,
-                                "_create_guest_files",
-                            ) as guest:
-                                with patch.object(
-                                    instance,
-                                    "_create_cache",
-                                ) as create_cache:
-                                    with captured_output():
-                                        instance._new_machine_from_scratch(
-                                            "/machine",
-                                            cache_enabled=True,
-                                        )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                machine_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+                with patch.object(sandy, "_verify_safe_dir") as verify:
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        return_value=machine_fd,
+                    ) as open_dir:
+                        with patch.object(
+                            sandy.os.path,
+                            "exists",
+                            return_value=False,
+                        ):
+                            with patch(
+                                "builtins.open",
+                                mock_open(read_data=setup_content),
+                            ):
+                                with patch.object(sandy, "_write") as write:
+                                    with patch.object(
+                                        sandy,
+                                        "_create_guest_files",
+                                    ) as guest:
+                                        with patch.object(
+                                            instance,
+                                            "_create_cache",
+                                        ) as create_cache:
+                                            with captured_output():
+                                                instance._new_machine_from_scratch(
+                                                    "/machine",
+                                                    cache_enabled=True,
+                                                )
 
         self.assertEqual(
             run.call_args_list[0].args[0],
             [instance.bootstrap_script, "/machine", instance.base_image],
         )
         verify.assert_called_once_with("/machine")
+        open_dir.assert_called_once_with("/machine")
         written_content = write.call_args.args[1]
         self.assertIn("user=developer", written_content)
         self.assertNotIn("%%MACHINE_USER%%", written_content)
+        machine_id = run.call_args_list[1]
+        self.assertEqual(machine_id.args[0][0], "systemd-machine-id-setup")
+        self.assertRegex(machine_id.args[0][1], r"^--root=/proc/self/fd/[0-9]+$")
+        self.assertEqual(len(machine_id.kwargs["pass_fds"]), 1)
         setup_call = run.call_args_list[2]
         self.assertEqual(setup_call.args[0][0], "systemd-nspawn")
+        self.assertRegex(setup_call.args[0][1], r"^--directory=/proc/self/fd/[0-9]+$")
         self.assertEqual(
             setup_call.kwargs["env"],
             sandy._container_environment("root", "/root"),
         )
+        self.assertEqual(len(setup_call.kwargs["pass_fds"]), 1)
         guest.assert_called_once_with(
             "/machine",
             "ai-dev",
@@ -4960,12 +5384,21 @@ class CacheTests(unittest.TestCase):
             "_run_secure_subprocess",
             return_value=success,
         ) as run:
-            with patch.object(sandy, "_verify_safe_dir"):
-                with patch.object(sandy.os.path, "exists", return_value=True):
-                    with patch.object(sandy, "_write") as write:
-                        with captured_output():
-                            instance._new_machine_from_scratch("/machine")
+            with tempfile.TemporaryDirectory() as temp_dir:
+                machine_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+                with patch.object(sandy, "_verify_safe_dir"):
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        return_value=machine_fd,
+                    ):
+                        with patch.object(sandy.os.path, "exists", return_value=True):
+                            with patch.object(sandy, "_write") as write:
+                                with captured_output():
+                                    instance._new_machine_from_scratch("/machine")
         self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[1].args[0][0], "systemd-machine-id-setup")
+        self.assertRegex(run.call_args_list[1].args[0][1], r"^--root=/proc/self/fd/")
         write.assert_not_called()
 
     def test_purge_cache_all_outcomes(self):
@@ -5133,9 +5566,10 @@ class ExecutionTests(unittest.TestCase):
         instance = make_sandy()
         spinner = threading.Event()
 
-        def run_pty(command, *, master_read, stdin_read, environment):
+        def run_pty(command, *, master_read, stdin_read, environment, pass_fds):
             self.assertEqual(command, ["tool"])
             self.assertEqual(environment, {"PATH": sandy.CONTAINER_PATH})
+            self.assertEqual(pass_fds, ())
             with patch.object(sandy.os, "read", return_value=b"output"):
                 self.assertEqual(master_read(10), b"output")
                 self.assertEqual(stdin_read(0), b"output")
@@ -5174,16 +5608,72 @@ class ExecutionTests(unittest.TestCase):
                     self.assertTrue(instance._wait_for_container_ready())
         sleep.assert_called_once_with(1)
 
+    def test_wait_for_container_ready_times_out_without_running_machine(self):
+        instance = make_sandy()
+        with patch.object(instance, "_is_container_running", return_value=None):
+            with patch.object(sandy, "_run_secure_subprocess") as run:
+                with patch("time.monotonic", side_effect=[0, 0, 1]):
+                    with patch("time.sleep") as sleep:
+                        self.assertFalse(instance._wait_for_container_ready(timeout=1))
+        run.assert_not_called()
+        sleep.assert_not_called()
+
     def test_get_container_ip(self):
         instance = make_sandy()
         with tempfile.TemporaryDirectory() as temp_dir:
             init_script = Path(temp_dir) / "init.sh"
             init_script.write_text('CONTAINER_IP="10.20.30.10"\n')
+            init_script.chmod(0o644)
+
+            def open_machine(path):
+                return os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+
             with patch.object(instance, "_get_machine_dir", return_value=temp_dir):
-                self.assertEqual(instance._get_container_ip(), "10.20.30.10")
+                with patch.object(
+                    sandy,
+                    "_open_verified_dir",
+                    side_effect=open_machine,
+                ):
+                    self.assertEqual(instance._get_container_ip(), "10.20.30.10")
             init_script.write_text("no address")
+            init_script.chmod(0o644)
             with patch.object(instance, "_get_machine_dir", return_value=temp_dir):
-                self.assertIsNone(instance._get_container_ip())
+                with patch.object(
+                    sandy,
+                    "_open_verified_dir",
+                    side_effect=open_machine,
+                ):
+                    self.assertIsNone(instance._get_container_ip())
+
+    def test_get_container_ip_rejects_oversized_invalid_and_out_of_network_init(self):
+        instance = make_sandy()
+        instance.network = make_network()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_script = Path(temp_dir) / "init.sh"
+
+            def open_machine(path):
+                return os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+
+            cases = (
+                ('CONTAINER_IP="999.1.1.1"\n', "invalid IP"),
+                ('CONTAINER_IP="10.20.30.10"\n', "outside the Sandy network"),
+                ("#" * (sandy.INIT_SCRIPT_MAX_BYTES + 1), "too large"),
+            )
+            for content, expected in cases:
+                with self.subTest(expected=expected):
+                    init_script.write_text(content, encoding="utf-8")
+                    init_script.chmod(0o644)
+                    with patch.object(
+                        instance, "_get_machine_dir", return_value=temp_dir
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_open_verified_dir",
+                            side_effect=open_machine,
+                        ):
+                            with captured_output() as (stdout, _):
+                                self.assertIsNone(instance._get_container_ip())
+                    self.assertIn(expected, stdout.getvalue())
 
     def test_run_init_script_conditions_and_success(self):
         instance = make_sandy()
@@ -5204,7 +5694,7 @@ class ExecutionTests(unittest.TestCase):
                     ) as execute:
                         with captured_output():
                             self.assertTrue(instance._run_init_script())
-        execute.assert_called_once_with("/init.sh")
+        execute.assert_called_once_with("/bin/sh /init.sh")
 
     def test_spinner_finishes_once_with_optional_suffix(self):
         event = threading.Event()
@@ -5233,8 +5723,9 @@ class ExecutionTests(unittest.TestCase):
         instance = make_sandy()
         spinner = threading.Event()
 
-        def run_pty(_command, *, master_read, stdin_read, environment):
+        def run_pty(_command, *, master_read, stdin_read, environment, pass_fds):
             self.assertEqual(environment, {"PATH": sandy.CONTAINER_PATH})
+            self.assertEqual(pass_fds, ())
             with patch.object(sandy.os, "read", side_effect=OSError):
                 self.assertEqual(master_read(10), b"")
                 self.assertEqual(stdin_read(0), b"")
@@ -5292,16 +5783,19 @@ class ExecutionTests(unittest.TestCase):
             "_get_machine_dir",
             return_value="/machine",
         ):
-            with patch.object(sandy.os.path, "exists", return_value=False):
-                self.assertIsNone(instance._get_container_ip())
+            with patch.object(
+                sandy, "_open_verified_dir", side_effect=FileNotFoundError
+            ):
+                with captured_output() as (stdout, _):
+                    self.assertIsNone(instance._get_container_ip())
 
-            with patch.object(sandy.os.path, "exists", return_value=True):
-                with patch(
-                    "builtins.open",
-                    side_effect=OSError("denied"),
-                ):
-                    with captured_output() as (stdout, _):
-                        self.assertIsNone(instance._get_container_ip())
+            with patch.object(
+                sandy,
+                "_open_verified_dir",
+                side_effect=PermissionError("denied"),
+            ):
+                with captured_output() as (stdout, _):
+                    self.assertIsNone(instance._get_container_ip())
         self.assertIn("Could not read container IP", stdout.getvalue())
 
     def test_run_init_script_skips_or_reports_readiness_failure(self):
@@ -5357,6 +5851,9 @@ class PortForwardingTests(unittest.TestCase):
         instance = make_sandy()
         instance.port_mappings = [("tcp", 8080, 80)]
         instance.network = make_network()
+        instance.network.network = "10.20.30.0"
+        instance.network.network_cidr = "10.20.30.0/24"
+        instance.network.gateway = "10.20.30.1"
         instance.network.firewall_backend = backend
         instance.network._ensure_gateway = MagicMock(return_value=True)
         instance.network._run_iptables = MagicMock(return_value=True)
@@ -5383,6 +5880,18 @@ class PortForwardingTests(unittest.TestCase):
                             instance._setup_port_forwarding_rules()
                 update.assert_called_once_with("ai-dev", "10.20.30.10")
                 setup.assert_called_once_with("10.20.30.10")
+
+        instance = self.configured_instance()
+        with patch.object(instance, "_get_container_ip") as get_ip:
+            with patch.object(
+                instance,
+                "_update_port_mapping_state",
+            ) as update:
+                with patch.object(instance, "_setup_port_forwarding_ipt") as setup:
+                    instance._setup_port_forwarding_rules("10.20.30.10")
+        get_ip.assert_not_called()
+        update.assert_called_once_with("ai-dev", "10.20.30.10")
+        setup.assert_called_once_with("10.20.30.10")
 
     def test_iptables_setup_and_cleanup_create_five_rules(self):
         instance = self.configured_instance()
@@ -5464,6 +5973,15 @@ class PortForwardingTests(unittest.TestCase):
             with captured_output() as (stdout, _):
                 instance._setup_port_forwarding_rules()
         self.assertIn("Could not determine container IP", stdout.getvalue())
+
+        with patch.object(instance, "_get_container_ip") as get_ip:
+            with captured_output() as (stdout, _):
+                instance._setup_port_forwarding_rules(None)
+        get_ip.assert_not_called()
+        self.assertIn("Could not determine container IP", stdout.getvalue())
+
+        with self.assertRaisesRegex(ValueError, "Container IP override"):
+            instance._setup_port_forwarding_rules(object())
 
     def test_forwarding_without_backend_persists_but_skips_rules(self):
         instance = self.configured_instance()
@@ -5974,6 +6492,18 @@ class RemovalTests(unittest.TestCase):
 
 
 class RunUpTests(unittest.TestCase):
+    def setUp(self):
+        def open_runtime_machine(path):
+            return os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+
+        verifier = patch.object(
+            sandy,
+            "_open_verified_dir",
+            side_effect=open_runtime_machine,
+        )
+        verifier.start()
+        self.addCleanup(verifier.stop)
+
     def arguments(self, **overrides):
         values = {
             "ports": None,
@@ -6044,10 +6574,12 @@ class RunUpTests(unittest.TestCase):
         self.assertTrue(
             any(argument.startswith("--system-call-filter=") for argument in command)
         )
+        self.assertRegex(command[1], r"^--directory=/proc/self/fd/[0-9]+$")
         self.assertFalse(
             any(argument.startswith("--network-bridge=") for argument in command)
         )
         self.assertEqual(popen.call_args.kwargs["start_new_session"], True)
+        self.assertEqual(len(popen.call_args.kwargs["pass_fds"]), 1)
         environment = popen.call_args.kwargs["env"]
         self.assertEqual(environment["HOME"], "/home/developer")
         self.assertEqual(environment["USER"], "developer")
@@ -6086,7 +6618,7 @@ class RunUpTests(unittest.TestCase):
                                     instance.run_up(args)
 
         self.assertEqual(instance.port_mappings, [("tcp", 8080, 80)])
-        forwarding.assert_called_once_with()
+        forwarding.assert_called_once_with(None)
         command = popen.call_args.args[0]
         self.assertIn("--network-bridge=sandybr0", command)
         self.assertNotIn("--ephemeral", command)
@@ -6111,7 +6643,9 @@ class RunUpTests(unittest.TestCase):
             host_shared.mkdir()
             (container_home / "workspace").mkdir(parents=True)
             (container_home / "shared").mkdir()
-            (machine / "init.sh").write_text("#!/bin/sh\n")
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+            init_script.chmod(0o644)
             instance.workspace = str(host_workspace)
             instance.shared = str(host_shared)
 
@@ -6148,13 +6682,17 @@ class RunUpTests(unittest.TestCase):
                                                 "machine",
                                                 return_value="unknown-cpu",
                                             ):
-                                                with captured_output() as (
-                                                    stdout,
-                                                    _,
-                                                ):
-                                                    instance.run_up(args)
+                                                with patch.object(
+                                                    sandy.os,
+                                                    "fchown",
+                                                ) as fchown:
+                                                    with captured_output() as (
+                                                        stdout,
+                                                        _,
+                                                    ):
+                                                        instance.run_up(args)
 
-        setup_forwarding.assert_called_once_with()
+        setup_forwarding.assert_called_once_with("10.200.1.10")
         self.assertEqual(setfacl.call_count, 2)
         init.assert_called_once()
         cleanup.assert_called_once_with()
@@ -6162,6 +6700,11 @@ class RunUpTests(unittest.TestCase):
         self.assertEqual(
             remove_state.call_args_list,
             [call("ai-dev"), call("ai-dev")],
+        )
+        fchown.assert_called_once()
+        self.assertEqual(
+            fchown.call_args.args[1:],
+            (sandy.CONTAINER_BASE_UID, sandy.CONTAINER_BASE_UID),
         )
         command = interactive.call_args.args[0]
         environment = interactive.call_args.kwargs["environment"]
@@ -6181,11 +6724,115 @@ class RunUpTests(unittest.TestCase):
             command,
         )
         self.assertIn("--chdir=/home/developer/workspace", command)
-        self.assertIn(
-            f"--bind-ro={machine}/init.sh:/init.sh",
-            command,
+        self.assertRegex(command[1], r"^--directory=/proc/self/fd/[0-9]+$")
+        bind_ro = [
+            argument for argument in command if argument.startswith("--bind-ro=")
+        ]
+        self.assertEqual(len(bind_ro), 1)
+        self.assertTrue(
+            bind_ro[0].startswith(f"--bind-ro={tempfile.gettempdir()}/sandy-init-")
         )
+        self.assertTrue(bind_ro[0].endswith("/init.sh:/init.sh"))
+        bind_source = bind_ro[0].removeprefix("--bind-ro=").split(":", 1)[0]
+        self.assertFalse(Path(bind_source).parent.exists())
+        self.assertEqual(len(interactive.call_args.kwargs["pass_fds"]), 1)
         self.assertIn("unknown architecture", stdout.getvalue())
+
+    def test_modern_init_bind_uses_idmapped_read_only_mount(self):
+        instance = make_sandy()
+        instance.workspace = None
+        args = self.arguments(network="host", persistent=True)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+            init_script.chmod(0o644)
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(instance, "_remove_port_mappings_from_state"):
+                    with patch.object(
+                        instance,
+                        "_get_machine_dir",
+                        return_value=str(machine),
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_run_secure_subprocess_popen",
+                        ) as popen:
+                            with patch.object(
+                                instance,
+                                "_run_init_script",
+                                return_value=False,
+                            ):
+                                with captured_output():
+                                    instance.run_up(args)
+
+        command = popen.call_args.args[0]
+        bind_ro = [
+            argument for argument in command if argument.startswith("--bind-ro=")
+        ]
+        self.assertEqual(len(bind_ro), 1)
+        self.assertTrue(bind_ro[0].endswith("/init.sh:/init.sh:idmap"))
+
+    def test_init_bind_copy_is_cleaned_after_prelaunch_failure(self):
+        instance = make_sandy()
+        instance.workspace = None
+        created_dirs = []
+        opened_fds = []
+        real_create_init_bind_copy = sandy._create_init_bind_copy
+
+        def open_machine(path):
+            machine_fd = os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+            opened_fds.append(machine_fd)
+            return machine_fd
+
+        def create_init_bind_copy(*args, **kwargs):
+            result = real_create_init_bind_copy(*args, **kwargs)
+            created_dirs.append(result[0])
+            return result
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+            init_script.chmod(0o644)
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value=str(machine),
+                ):
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        side_effect=open_machine,
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_create_init_bind_copy",
+                            side_effect=create_init_bind_copy,
+                        ):
+                            with patch.object(
+                                instance,
+                                "_remove_port_mappings_from_state",
+                                side_effect=RuntimeError("port state failure"),
+                            ):
+                                with self.assertRaisesRegex(
+                                    RuntimeError,
+                                    "port state failure",
+                                ):
+                                    with captured_output():
+                                        instance.run_up(
+                                            self.arguments(
+                                                network="host",
+                                                persistent=True,
+                                            )
+                                        )
+
+        self.assertEqual(len(created_dirs), 1)
+        self.assertFalse(Path(created_dirs[0]).exists())
+        self.assertEqual(len(opened_fds), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened_fds[0])
 
     def test_mount_validation_skips_missing_host_and_container_paths(self):
         instance = make_sandy()
@@ -6243,7 +6890,258 @@ class RunUpTests(unittest.TestCase):
                             with captured_output():
                                 with self.assertRaises(SystemExit):
                                     instance.run_up(self.arguments(build=True))
-        build.assert_called_once_with()
+        build.assert_called_once_with(None)
+
+    def test_lenient_build_plans_network_and_configures_after_validation(self):
+        instance = make_sandy()
+        instance.workspace = None
+        configured = make_network()
+        planned = ("10.200.1.0", "10.200.1.0/24", "10.200.1.1")
+        guest_network = ("10.200.1.0/24", "10.200.1.1")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir) / "machine"
+
+            def build(planned_guest_network):
+                self.assertIsNone(instance.network)
+                self.assertEqual(planned_guest_network, guest_network)
+                machine.mkdir()
+
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(instance, "_remove_port_mappings_from_state"):
+                    with patch.object(
+                        sandy,
+                        "SandyNet",
+                        return_value=configured,
+                    ) as network_type:
+                        network_type.preview_bridge_network.return_value = (
+                            guest_network,
+                            planned,
+                        )
+                        with patch.object(
+                            instance, "_build", side_effect=build
+                        ) as build:
+                            with patch.object(
+                                instance,
+                                "_get_machine_dir",
+                                return_value=str(machine),
+                            ):
+                                with patch.object(
+                                    sandy, "_run_secure_subprocess_popen"
+                                ):
+                                    with patch.object(
+                                        instance,
+                                        "_run_init_script",
+                                        return_value=False,
+                                    ):
+                                        with captured_output():
+                                            instance.run_up(
+                                                self.arguments(
+                                                    build=True,
+                                                    network="lenient",
+                                                )
+                                            )
+
+        network_type.preview_bridge_network.assert_called_once_with()
+        network_type.assert_called_once_with(planned)
+        build.assert_called_once_with(guest_network)
+
+    def test_lenient_build_existing_unsafe_image_rejects_before_network(self):
+        instance = make_sandy()
+        instance.workspace = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir) / "machine"
+            machine.mkdir()
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value=str(machine),
+                ):
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        side_effect=PermissionError("unsafe image"),
+                    ):
+                        with patch.object(sandy, "SandyNet") as network_type:
+                            with patch.object(
+                                sandy,
+                                "_run_secure_subprocess_popen",
+                            ) as popen:
+                                with captured_output() as (stdout, _):
+                                    with self.assertRaises(SystemExit):
+                                        instance.run_up(
+                                            self.arguments(
+                                                build=True,
+                                                network="lenient",
+                                            )
+                                        )
+
+        network_type.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("Unsafe machine image", stdout.getvalue())
+
+    def test_rejects_unsafe_machine_image_before_start(self):
+        instance = make_sandy()
+        instance.workspace = None
+        with patch.object(instance, "_is_container_running", return_value=None):
+            with patch.object(instance, "_remove_port_mappings_from_state"):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value="/var/lib/machines/sandy.ai-dev",
+                ):
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        side_effect=PermissionError(
+                            "Machine image symlink targets the managed root"
+                        ),
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_run_secure_subprocess_popen",
+                        ) as popen:
+                            with captured_output() as (stdout, _):
+                                with self.assertRaises(SystemExit):
+                                    instance.run_up(self.arguments())
+
+        popen.assert_not_called()
+        self.assertIn("Unsafe machine image", stdout.getvalue())
+
+    def test_rejects_init_script_symlink_before_start(self):
+        instance = make_sandy()
+        instance.workspace = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            (machine / "init.sh").symlink_to("/etc/passwd")
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(instance, "_remove_port_mappings_from_state"):
+                    with patch.object(
+                        instance,
+                        "_get_machine_dir",
+                        return_value=str(machine),
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_run_secure_subprocess_popen",
+                        ) as popen:
+                            with captured_output() as (stdout, _):
+                                with self.assertRaises(SystemExit):
+                                    instance.run_up(self.arguments())
+
+        popen.assert_not_called()
+        self.assertIn("Unsafe machine image /init.sh", stdout.getvalue())
+
+    def test_rejects_invalid_init_content_before_network_setup(self):
+        instance = make_sandy()
+        instance.workspace = None
+        args = self.arguments(network="lenient")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="999.1.1.1"\n', encoding="utf-8")
+            init_script.chmod(0o644)
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value=str(machine),
+                ):
+                    with patch.object(
+                        sandy.SandyNet,
+                        "preview_bridge_network",
+                    ) as preview:
+                        with patch.object(
+                            sandy.SandyNet,
+                            "__init__",
+                            return_value=None,
+                        ) as network_init:
+                            with patch.object(
+                                sandy,
+                                "_run_secure_subprocess_popen",
+                            ) as popen:
+                                with captured_output() as (stdout, _):
+                                    with self.assertRaises(SystemExit):
+                                        instance.run_up(args)
+
+        preview.assert_not_called()
+        network_init.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("Unsafe machine image /init.sh", stdout.getvalue())
+
+    def test_rejects_out_of_network_init_before_network_setup(self):
+        instance = make_sandy()
+        instance.workspace = None
+        args = self.arguments(network="lenient")
+        planned_network = ("10.200.1.0", "10.200.1.0/24", "10.200.1.1")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="10.20.30.10"\n', encoding="utf-8")
+            init_script.chmod(0o644)
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value=str(machine),
+                ):
+                    with patch.object(
+                        sandy.SandyNet,
+                        "preview_bridge_network",
+                        return_value=(("10.200.1.0/24", "10.200.1.1"), planned_network),
+                    ) as preview:
+                        with patch.object(
+                            sandy.SandyNet,
+                            "__init__",
+                            return_value=None,
+                        ) as network_init:
+                            with patch.object(
+                                sandy,
+                                "_run_secure_subprocess_popen",
+                            ) as popen:
+                                with captured_output() as (stdout, _):
+                                    with self.assertRaises(SystemExit):
+                                        instance.run_up(args)
+
+        preview.assert_called_once_with()
+        network_init.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("outside the Sandy network", stdout.getvalue())
+
+    def test_rejects_invalid_init_ip_before_port_forwarding_setup(self):
+        instance = make_sandy()
+        instance.workspace = None
+        instance.network = make_network()
+        args = self.arguments(
+            network="lenient",
+            ports=["tcp:8080:80"],
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="10.20.30.10"\n', encoding="utf-8")
+            init_script.chmod(0o644)
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value=str(machine),
+                ):
+                    with patch.object(
+                        instance,
+                        "_setup_port_forwarding_rules",
+                    ) as setup_forwarding:
+                        with patch.object(
+                            sandy,
+                            "_run_secure_subprocess_popen",
+                        ) as popen:
+                            with captured_output() as (stdout, _):
+                                with self.assertRaises(SystemExit):
+                                    instance.run_up(args)
+
+        setup_forwarding.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("Unsafe machine image /init.sh", stdout.getvalue())
 
     def test_lenient_network_is_constructed_and_detach_waits(self):
         instance = make_sandy()

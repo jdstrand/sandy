@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import signal
+import stat
 import tempfile
 import unittest
 from collections.abc import Mapping, Sequence
@@ -16,6 +18,7 @@ from tests.e2e.support import (
     CommandResult,
     E2EContext,
     E2EFailure,
+    FilesystemFixtureIdentity,
 )
 from tests.e2e.test_network import _wait_for_public_https
 
@@ -30,7 +33,12 @@ class CleanupProbeContext(E2EContext):
         self._ip_forward_original = None
         self._host_state_owned = host_state_owned
         self._install_dir_owned = False
+        self._filesystem_fixtures_reserved = True
         self._filesystem_fixtures_owned = False
+        self._filesystem_fixture_identities = {}
+        self.filesystem_machine_link = root / "machine"
+        self.filesystem_image_root = root / "image"
+        self.filesystem_host_target = root / "host"
         self._filesystem_mounts = []
         self.bridge_checks = 0
         self.cache_purges = 0
@@ -75,6 +83,20 @@ class RetryContext(E2EContext):
 
 
 class CleanupOwnershipTests(unittest.TestCase):
+    def _claim_fixture(self, context, fixture_path: Path) -> None:
+        fixture_stat = fixture_path.lstat()
+        context.filesystem_machine_link = fixture_path
+        context.filesystem_image_root = fixture_path.parent / "missing-image"
+        context.filesystem_host_target = fixture_path.parent / "missing-host"
+        context._filesystem_fixtures_owned = True
+        context._filesystem_fixture_identities = {
+            fixture_path: FilesystemFixtureIdentity(
+                dev=fixture_stat.st_dev,
+                ino=fixture_stat.st_ino,
+                file_type=stat.S_IFMT(fixture_stat.st_mode),
+            )
+        }
+
     def test_failed_preflight_cleanup_does_not_inspect_or_remove_host_state(self):
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent) / "run"
@@ -140,6 +162,128 @@ class CleanupOwnershipTests(unittest.TestCase):
                     ("remove", None),
                 ],
             )
+
+    def test_filesystem_fixture_cleanup_rejects_replaced_fixture(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent) / "run"
+            root.mkdir()
+            fixture = root / "fixture"
+            fixture.mkdir()
+            context = CleanupProbeContext(root, host_state_owned=False)
+            self._claim_fixture(context, fixture)
+
+            fixture.rmdir()
+            fixture.write_text("replacement\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(E2EFailure, "replaced filesystem fixture"):
+                context.remove_filesystem_fixtures()
+
+            self.assertEqual(fixture.read_text(encoding="utf-8"), "replacement\n")
+
+    def test_filesystem_fixture_cleanup_unlinks_symlinks_without_following(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent) / "run"
+            root.mkdir()
+            fixture = root / "fixture"
+            external = root / "external"
+            fixture.mkdir()
+            external.mkdir()
+            external.joinpath("keep").write_text("external\n", encoding="utf-8")
+            fixture.joinpath("link").symlink_to(external, target_is_directory=True)
+            context = CleanupProbeContext(root, host_state_owned=False)
+            self._claim_fixture(context, fixture)
+
+            context.remove_filesystem_fixtures()
+
+            self.assertFalse(fixture.exists())
+            self.assertEqual(
+                external.joinpath("keep").read_text(encoding="utf-8"),
+                "external\n",
+            )
+
+    def test_create_filesystem_fixture_directory_claims_before_unblocking(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent) / "run"
+            root.mkdir()
+            context = CleanupProbeContext(root, host_state_owned=False)
+            calls = []
+            previous_mask = {signal.SIGHUP}
+
+            def pthread_sigmask(how, mask):
+                calls.append((how, mask))
+                return previous_mask
+
+            def claim(fixture_path):
+                self.assertEqual(fixture_path, context.filesystem_image_root)
+                self.assertTrue(fixture_path.is_dir())
+                self.assertEqual(
+                    calls,
+                    [
+                        (
+                            signal.SIG_BLOCK,
+                            {signal.SIGINT, signal.SIGTERM},
+                        )
+                    ],
+                )
+
+            with patch(
+                "tests.e2e.support.signal.pthread_sigmask",
+                side_effect=pthread_sigmask,
+            ):
+                with patch.object(
+                    context,
+                    "claim_filesystem_fixture",
+                    side_effect=claim,
+                ) as claim_fixture:
+                    context.create_filesystem_fixture_directory(
+                        context.filesystem_image_root
+                    )
+
+            claim_fixture.assert_called_once_with(context.filesystem_image_root)
+            self.assertEqual(
+                calls,
+                [
+                    (
+                        signal.SIG_BLOCK,
+                        {signal.SIGINT, signal.SIGTERM},
+                    ),
+                    (signal.SIG_SETMASK, previous_mask),
+                ],
+            )
+            self.assertTrue(context.filesystem_image_root.is_dir())
+
+    def test_create_filesystem_fixture_symlink_claims_exact_link(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent) / "run"
+            root.mkdir()
+            context = CleanupProbeContext(root, host_state_owned=False)
+
+            with patch.object(context, "claim_filesystem_fixture") as claim_fixture:
+                context.create_filesystem_fixture_symlink(
+                    context.filesystem_machine_link,
+                    context.filesystem_image_root,
+                )
+
+            claim_fixture.assert_called_once_with(context.filesystem_machine_link)
+            self.assertTrue(context.filesystem_machine_link.is_symlink())
+
+    def test_create_filesystem_fixture_directory_removes_unclaimed_failure(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent) / "run"
+            root.mkdir()
+            context = CleanupProbeContext(root, host_state_owned=False)
+
+            with patch.object(
+                context,
+                "claim_filesystem_fixture",
+                side_effect=E2EFailure("claim failed"),
+            ):
+                with self.assertRaisesRegex(E2EFailure, "claim failed"):
+                    context.create_filesystem_fixture_directory(
+                        context.filesystem_image_root
+                    )
+
+            self.assertFalse(context.filesystem_image_root.exists())
 
 
 class FilesystemMountTrackingTests(unittest.TestCase):

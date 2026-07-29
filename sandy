@@ -23,6 +23,7 @@ import struct
 import subprocess
 import sys
 import termios
+import tempfile
 import threading
 import tty
 from contextlib import contextmanager
@@ -36,6 +37,9 @@ CONTAINER_BASE_UID: Final = (
 )
 PORT_MAPPINGS_FILENAME: Final = "port_mappings.json"
 PORT_MAPPINGS_LOCK_FILENAME: Final = "port_mappings.lock"
+INIT_SCRIPT_MAX_BYTES: Final = 8192
+CONTAINER_READY_TIMEOUT: Final = 60
+CONTAINER_IP_UNSET: Final = object()
 CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 DEFAULT_CONTAINER_TERM: Final = "xterm-256color"
 ENVIRONMENT_KEY_PATTERN: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -53,6 +57,8 @@ PATH_OPEN_FLAGS: Final = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
 # Sandy resolves only short, known image paths. Use the POSIX minimum limit to
 # bound work from an untrusted image without rejecting normal filesystem layouts.
 MAX_SYMLINK_RESOLUTIONS: Final = 8
+NetworkInfo = Tuple[str, str, str]
+GuestNetwork = Tuple[str, str]
 
 
 # Input validation functions
@@ -292,6 +298,41 @@ def _validate_port_mapping(port_spec: str) -> Optional[Tuple[str, int, int]]:
         return None
 
 
+def _validate_inherited_fds(pass_fds: Any) -> Tuple[int, ...]:
+    """Validate descriptors deliberately inherited across a subprocess exec."""
+    if pass_fds is None:
+        return ()
+    try:
+        inherited_fds = tuple(pass_fds)
+    except TypeError as exc:
+        raise ValueError("Inherited file descriptors must be iterable") from exc
+
+    seen = set()
+    for fd in inherited_fds:
+        if not isinstance(fd, int) or isinstance(fd, bool) or fd < 0 or fd in seen:
+            raise ValueError("Invalid inherited file descriptor")
+        os.fstat(fd)
+        seen.add(fd)
+    return inherited_fds
+
+
+def _validate_subprocess_fd_policy(kwargs: Dict[str, Any]) -> None:
+    """Validate explicit subprocess FD inheritance without broadening it."""
+    if "pass_fds" not in kwargs:
+        return
+
+    inherited_fds = _validate_inherited_fds(kwargs["pass_fds"])
+    if inherited_fds and kwargs.get("close_fds") is False:
+        raise ValueError("Inherited file descriptors require close_fds=True")
+    kwargs["pass_fds"] = inherited_fds
+
+
+def _proc_self_fd_path(fd: int) -> str:
+    """Return a Linux procfs path for an open descriptor after validating it."""
+    _validate_inherited_fds((fd,))
+    return f"/proc/self/fd/{fd}"
+
+
 def _run_secure_subprocess(cmd: list, **kwargs) -> subprocess.CompletedProcess:
     """Run subprocess with security hardening.
 
@@ -303,6 +344,7 @@ def _run_secure_subprocess(cmd: list, **kwargs) -> subprocess.CompletedProcess:
     kwargs["shell"] = False
 
     _validate_command_args(cmd)
+    _validate_subprocess_fd_policy(kwargs)
 
     return subprocess.run(cmd, **kwargs)
 
@@ -314,6 +356,7 @@ def _run_secure_subprocess_popen(cmd: list, **kwargs) -> subprocess.Popen:
     kwargs["shell"] = False
 
     _validate_command_args(cmd)
+    _validate_subprocess_fd_policy(kwargs)
 
     return subprocess.Popen(cmd, **kwargs)
 
@@ -330,10 +373,12 @@ def _run_secure_subprocess_pty(
     environment: Mapping[str, str],
     master_read: Optional[Callable[[int], bytes]] = None,
     stdin_read: Optional[Callable[[int], bytes]] = None,
+    pass_fds: Tuple[int, ...] = (),
 ) -> int:
     """Run a subprocess inside a PTY with argument validation and terminal size handling."""
     _validate_command_args(cmd)
     child_environment = _validated_subprocess_environment(environment)
+    inherited_fds = _validate_inherited_fds(pass_fds)
 
     if master_read is None:
         raise ValueError("master_read must be callable")
@@ -356,6 +401,8 @@ def _run_secure_subprocess_pty(
     if pid == 0:
         # Child process - exec the command
         try:
+            for fd in inherited_fds:
+                os.set_inheritable(fd, True)
             os.execvpe(cmd[0], cmd, child_environment)
         except OSError as exc:
             sys.stderr.write(
@@ -710,6 +757,190 @@ def _open_image_directory(image_root_fd: int, components: Tuple[str, ...]) -> in
         raise
 
 
+def _verify_owned_image_file(file_stat: os.stat_result, label: str) -> None:
+    """Verify a contained image file before exposing it as a host bind source."""
+    safe_label = _terminal_safe_repr(label)
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise PermissionError(f"Image file {safe_label} is not a regular file")
+    if file_stat.st_uid != os.geteuid() or file_stat.st_gid != os.getegid():
+        raise PermissionError(f"Image file {safe_label} has unexpected ownership")
+    if file_stat.st_nlink != 1:
+        raise PermissionError(f"Image file {safe_label} has multiple links")
+    if file_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PermissionError(f"Image file {safe_label} is writable by other users")
+
+
+def _open_image_file(image_root_fd: int, components: Tuple[str, ...]) -> int:
+    """Open a regular file through a pinned image root without following it."""
+    if not components:
+        raise ValueError("Image file path must include a file name")
+
+    image_root_stat = os.fstat(image_root_fd)
+    image_mount_id = _fd_mount_id(image_root_fd)
+    parent_components = components[:-1]
+    basename = components[-1]
+    parent_fd = (
+        _open_image_directory(image_root_fd, parent_components)
+        if parent_components
+        else os.dup(image_root_fd)
+    )
+    file_fd: Optional[int] = None
+    try:
+        try:
+            file_fd = os.open(
+                basename,
+                READ_FILE_OPEN_FLAGS,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                safe_basename = _terminal_safe_repr(basename)
+                raise PermissionError(
+                    f"Unsafe image file path component {safe_basename}"
+                ) from exc
+            raise
+
+        file_stat = os.fstat(file_fd)
+        _verify_owned_image_file(file_stat, basename)
+        if file_stat.st_dev != image_root_stat.st_dev:
+            raise PermissionError("Refusing to cross an image filesystem boundary")
+        if _fd_mount_id(file_fd) != image_mount_id:
+            raise PermissionError("Refusing to cross an image mount boundary")
+        return file_fd
+    except Exception:
+        if file_fd is not None:
+            os.close(file_fd)
+        raise
+    finally:
+        os.close(parent_fd)
+
+
+def _open_optional_image_file(
+    image_root_fd: int,
+    components: Tuple[str, ...],
+) -> Optional[int]:
+    """Open an optional image file, returning None only when it is absent."""
+    try:
+        return _open_image_file(image_root_fd, components)
+    except FileNotFoundError:
+        return None
+
+
+def _parse_container_ip_from_init_fd(init_script_fd: int) -> Optional[str]:
+    """Read CONTAINER_IP from a verified regular init script descriptor."""
+    _validate_inherited_fds((init_script_fd,))
+    raw_content = os.pread(init_script_fd, INIT_SCRIPT_MAX_BYTES + 1, 0)
+    if len(raw_content) > INIT_SCRIPT_MAX_BYTES:
+        raise PermissionError("Container init script is too large")
+    try:
+        content = raw_content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PermissionError("Container init script is not valid UTF-8") from exc
+
+    match = re.search(
+        r'(?m)^CONTAINER_IP="([0-9]{1,3}(?:\.[0-9]{1,3}){3})"$',
+        content,
+    )
+    if not match:
+        return None
+
+    container_ip = match.group(1)
+    if not _validate_ip_address(container_ip):
+        raise PermissionError("Container init script contains an invalid IP address")
+    return container_ip
+
+
+def _create_init_bind_copy(
+    init_script_fd: int,
+    owner_uid: Optional[int] = None,
+    owner_gid: Optional[int] = None,
+) -> Tuple[str, str]:
+    """Copy a verified init script into a private file nspawn can bind mount."""
+    _validate_inherited_fds((init_script_fd,))
+    if (owner_uid is None) != (owner_gid is None):
+        raise PermissionError("Init bind copy owner must include uid and gid")
+    if owner_uid is not None and (
+        owner_uid < 0
+        or owner_gid is None
+        or owner_gid < 0
+        or owner_uid > 0xFFFFFFFF
+        or owner_gid > 0xFFFFFFFF
+    ):
+        raise PermissionError("Init bind copy owner is outside the uid/gid range")
+    temporary_dir = tempfile.mkdtemp(prefix="sandy-init-")
+    bind_path = os.path.join(temporary_dir, "init.sh")
+    bind_fd: Optional[int] = None
+    try:
+        raw_content = os.pread(init_script_fd, INIT_SCRIPT_MAX_BYTES + 1, 0)
+        if len(raw_content) > INIT_SCRIPT_MAX_BYTES:
+            raise PermissionError("Container init script is too large")
+        bind_fd = os.open(
+            bind_path,
+            TEMPORARY_FILE_OPEN_FLAGS,
+            0o600,
+        )
+        remaining = memoryview(raw_content)
+        while remaining:
+            written = os.write(bind_fd, remaining)
+            if written <= 0:
+                raise OSError("Temporary init bind copy write made no progress")
+            remaining = remaining[written:]
+        if owner_uid is not None and owner_gid is not None:
+            os.fchown(bind_fd, owner_uid, owner_gid)
+        # Mode 0500 is intentional: the bind is read-only, and the owner maps
+        # to container root either through an idmapped bind mount on modern
+        # systemd or the fixed pre-250 private-user uid range. Avoid granting
+        # group/world access to this transient host-side copy.
+        os.fchmod(bind_fd, 0o500)
+        os.fsync(bind_fd)
+        return temporary_dir, bind_path
+    except Exception:
+        shutil.rmtree(temporary_dir, ignore_errors=True)
+        raise
+    finally:
+        if bind_fd is not None:
+            os.close(bind_fd)
+
+
+def _remove_init_bind_copy(temporary_dir: str) -> None:
+    """Remove the exact private temporary directory used for an init bind copy."""
+    normalized_dir = os.path.normpath(temporary_dir)
+    expected_parent = os.path.normpath(tempfile.gettempdir())
+    basename = os.path.basename(normalized_dir)
+    if os.path.dirname(normalized_dir) != expected_parent or not basename.startswith(
+        "sandy-init-"
+    ):
+        raise PermissionError("Refusing to remove unexpected init bind directory")
+    directory_stat = os.lstat(normalized_dir)
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise PermissionError("Init bind copy path is not a directory")
+    if directory_stat.st_uid != os.geteuid() or directory_stat.st_gid != os.getegid():
+        raise PermissionError("Init bind copy directory has unexpected ownership")
+    if directory_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PermissionError("Init bind copy directory has unsafe permissions")
+    shutil.rmtree(normalized_dir)
+
+
+def _validate_container_ip_for_cidr(
+    container_ip: str,
+    network_cidr: Optional[str],
+) -> str:
+    """Verify a parsed container IP belongs to a known Sandy network."""
+    if not _validate_ip_address(container_ip):
+        raise PermissionError("Container init script contains an invalid IP address")
+    if network_cidr:
+        try:
+            network = ipaddress.ip_network(network_cidr, strict=True)
+            address = ipaddress.ip_address(container_ip)
+        except ValueError as exc:
+            raise PermissionError("Invalid Sandy network configuration") from exc
+        if address not in network:
+            raise PermissionError(
+                "Container init script IP is outside the Sandy network"
+            )
+    return container_ip
+
+
 def _open_verified_dir(path: str) -> int:
     """Open a managed directory with image-root-contained symlink resolution."""
     path_components = _managed_path_components(path, allow_managed_root=True)
@@ -721,8 +952,9 @@ def _open_verified_dir(path: str) -> int:
     relative_components = path_components[len(managed_root_components) :]
 
     current_fd = os.open("/", DIRECTORY_OPEN_FLAGS)
+    root_stat = os.fstat(current_fd)
     try:
-        _verify_owned_directory(os.fstat(current_fd), "/")
+        _verify_owned_directory(root_stat, "/")
         for component in managed_root_components:
             try:
                 next_fd = os.open(
@@ -762,7 +994,12 @@ def _open_verified_dir(path: str) -> int:
             image_fd = _open_machine_image_symlink(current_fd, managed_name)
         else:
             try:
-                _verify_owned_directory(os.fstat(image_fd), managed_name)
+                image_stat = os.fstat(image_fd)
+                _verify_owned_directory(image_stat, managed_name)
+                if _same_inode(image_stat, root_stat):
+                    raise PermissionError(
+                        "Refusing to use the host root as a machine image"
+                    )
             except Exception:
                 os.close(image_fd)
                 raise
@@ -1372,7 +1609,10 @@ class SandyNet:
         "fc00::/7",  # Unique local addresses
     ]
 
-    def __init__(self):
+    def __init__(
+        self,
+        planned_network_info: Optional[NetworkInfo] = None,
+    ):
         self.bridge_name = "sandybr0"
         self.network: Optional[str] = None
         self.network_cidr: Optional[str] = None
@@ -1403,13 +1643,53 @@ class SandyNet:
             return
 
         # Create and configure new bridge
-        if self._setup_bridge():
+        if self._setup_bridge(planned_network_info):
             self.configured = True
             print(
                 f"I: Created bridge with network: {self.network_cidr} gateway: {self.gateway}"
             )
         else:
             print(f"W: Failed to setup bridge network")
+
+    @classmethod
+    def preview_bridge_network(
+        cls,
+    ) -> Tuple[GuestNetwork, Optional[NetworkInfo]]:
+        """Return lenient guest networking data without mutating host networking."""
+        preview = object.__new__(cls)
+        preview.bridge_name = "sandybr0"
+        preview.network = None
+        preview.network_cidr = None
+        preview.gateway = None
+        preview.configured = False
+        preview.has_iptables = False
+        preview.has_ip6tables = False
+        preview.has_nft = False
+        preview.firewall_backend = None
+
+        if preview._bridge_exists():
+            if preview._detect_existing_config():
+                if (
+                    not preview.network_cidr
+                    or not preview.gateway
+                    or not _validate_network_cidr(preview.network_cidr)
+                    or not _validate_ip_address(preview.gateway)
+                ):
+                    raise PermissionError("Invalid Sandy network configuration")
+                return (preview.network_cidr, preview.gateway), None
+            raise PermissionError("Could not detect Sandy network configuration")
+
+        planned_network_info = preview._find_unused_network()
+        if planned_network_info is None:
+            raise PermissionError("Could not find unused network in 10.0.0.0/8 range")
+        network, network_cidr, gateway = planned_network_info
+        if (
+            not _validate_ip_address(network)
+            or not _validate_network_cidr(network_cidr)
+            or not _validate_ip_address(gateway)
+        ):
+            raise PermissionError("Invalid Sandy network plan")
+        return (network_cidr, gateway), planned_network_info
 
     def _bridge_exists(self) -> bool:
         """Check if the bridge interface already exists"""
@@ -2737,15 +3017,40 @@ class SandyNet:
             )
             return False
 
-    def _setup_bridge(self) -> bool:
+    def _setup_bridge(
+        self,
+        planned_network_info: Optional[NetworkInfo] = None,
+    ) -> bool:
         """Setup new bridge with networking"""
         # Find unused network
-        network_info = self._find_unused_network()
+        network_info = planned_network_info or self._find_unused_network()
         if not network_info:
             print("E: Could not find unused network in 10.0.0.0/8 range")
             return False
 
         network, network_cidr, gateway = network_info
+        if planned_network_info is not None:
+            if (
+                not _validate_ip_address(network)
+                or not _validate_network_cidr(network_cidr)
+                or not _validate_ip_address(gateway)
+            ):
+                print("E: Refusing invalid planned bridge network")
+                return False
+            try:
+                planned_network = ipaddress.ip_network(network_cidr, strict=True)
+                if str(planned_network.network_address) != network:
+                    print("E: Refusing inconsistent planned bridge network")
+                    return False
+                if ipaddress.ip_address(gateway) not in planned_network:
+                    print("E: Refusing planned bridge gateway outside network")
+                    return False
+            except ValueError:
+                print("E: Refusing invalid planned bridge network")
+                return False
+            if self._check_network_conflict(network_cidr):
+                print(f"E: Planned bridge network conflicts: {network_cidr}")
+                return False
         print(f"I: Selected network: {network_cidr}")
 
         # Create bridge
@@ -3834,7 +4139,6 @@ class Sandy:
         if not os.path.exists(cache_dir):
             return False
 
-        port_state_path = self._get_port_mappings_path()
         removed_any = False
         for entry in os.listdir(cache_dir):
             entry_path = os.path.join(cache_dir, entry)
@@ -3842,17 +4146,14 @@ class Sandy:
                 # This inode is the permanent transaction lock. Removing it
                 # could split queued and new processes across different locks.
                 continue
+            if preserve_state and entry == PORT_MAPPINGS_FILENAME:
+                continue
             try:
-                if (
-                    preserve_state
-                    and os.path.exists(port_state_path)
-                    and os.path.samefile(entry_path, port_state_path)
-                ):
-                    continue
+                entry_stat = os.lstat(entry_path)
             except FileNotFoundError:
                 continue
 
-            if os.path.isdir(entry_path):
+            if stat.S_ISDIR(entry_stat.st_mode):
                 _remove_managed_tree(entry_path)
             else:
                 try:
@@ -3862,7 +4163,28 @@ class Sandy:
             removed_any = True
         return removed_any
 
-    def _new_machine_from_cache(self, cache_path, mdir):
+    def _guest_network_config(
+        self,
+        planned_guest_network: Optional[GuestNetwork],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Return guest network files data from a preview or configured bridge."""
+        if planned_guest_network is not None:
+            return planned_guest_network
+
+        if self.network and self.network.configured:
+            if self.network._ensure_gateway():
+                return self.network.network_cidr, self.network.gateway
+            print(
+                f"W: Could not refresh network configuration for '{_strip_control_characters(self.network.bridge_name)}', creating guest files without network init"
+            )
+        return None, None
+
+    def _new_machine_from_cache(
+        self,
+        cache_path: str,
+        mdir: str,
+        planned_guest_network: Optional[GuestNetwork] = None,
+    ) -> None:
         """Create new machine from cache template"""
         _verify_safe_dir(os.path.dirname(cache_path))
 
@@ -3892,24 +4214,30 @@ class Sandy:
             sys.exit(1)
 
         # Generate new machine ID for the new container instance
-        _run_secure_subprocess(["systemd-machine-id-setup", f"--root={mdir}"])
+        machine_fd = _open_verified_dir(mdir)
+        try:
+            _run_secure_subprocess(
+                [
+                    "systemd-machine-id-setup",
+                    f"--root={_proc_self_fd_path(machine_fd)}",
+                ],
+                pass_fds=(machine_fd,),
+            )
+        finally:
+            os.close(machine_fd)
 
         # Create fresh /etc/hosts file with container name
-        network_cidr = None
-        gateway = None
-        if self.network and self.network.configured:
-            if self.network._ensure_gateway():
-                network_cidr = self.network.network_cidr
-                gateway = self.network.gateway
-            else:
-                print(
-                    f"W: Could not refresh network configuration for '{_strip_control_characters(self.network.bridge_name)}', creating guest files without network init"
-                )
+        network_cidr, gateway = self._guest_network_config(planned_guest_network)
         _create_guest_files(mdir, self.container, network_cidr, gateway)
 
         print(f"I: Successfully created new machine from cache")
 
-    def _new_machine_from_scratch(self, mdir, cache_enabled=False):
+    def _new_machine_from_scratch(
+        self,
+        mdir: str,
+        cache_enabled: bool = False,
+        planned_guest_network: Optional[GuestNetwork] = None,
+    ) -> None:
         """Build new machine from scratch using bootstrap method"""
         setup_environment = _container_environment("root", "/root")
         print(
@@ -3923,10 +4251,9 @@ class Sandy:
             sys.exit(1)
         _verify_safe_dir(mdir)
 
-        _run_secure_subprocess(["systemd-machine-id-setup", f"--root={mdir}"])
-
         setup_script = os.path.join(mdir, "root", "setup-container.sh")
-        if os.path.exists(setup_script):
+        setup_script_exists = os.path.exists(setup_script)
+        if setup_script_exists:
             print(f"W: '{setup_script}' exists, skipping setup")
         else:
             source_script = self._get_setup_script_path()
@@ -3940,38 +4267,48 @@ class Sandy:
 
             _write(setup_script, content, mode=0o0755)
 
+        machine_fd = _open_verified_dir(mdir)
+        try:
+            machine_root = _proc_self_fd_path(machine_fd)
+            _run_secure_subprocess(
+                [
+                    "systemd-machine-id-setup",
+                    f"--root={machine_root}",
+                ],
+                pass_fds=(machine_fd,),
+            )
+
             # run without --ephemeral, --private-users and restrictive
             # networking (need to do this at least once without --private-users
             # to setup the container properly). Also run with:
-            # --directory=/var/lib/machines/sandy.foo
+            # --directory=/proc/self/fd/<machine-fd>
             # --machine=foo  # this makes it show up as 'foo', not 'sandy.foo'
             # --timezone=off # needed if self.cn_setup_container upgrades
             #                # tzdata since nspawn otherwise bind mounts this
             #                # file into the container. Omitting this allows
             #                # the upgrade to work (up will omit this)
-            cmd = [
-                "systemd-nspawn",
-                f"--directory={mdir}",
-                f"--machine={self.container}",
-                "--tmpfs=/tmp:mode=1777",
-                "--as-pid2",
-                "--timezone=off",
-                "--user=root",
-                os.path.join("/root", os.path.basename(setup_script)),
-            ]
-            _run_secure_subprocess(cmd, env=setup_environment)
+            if not setup_script_exists:
+                cmd = [
+                    "systemd-nspawn",
+                    f"--directory={machine_root}",
+                    f"--machine={self.container}",
+                    "--tmpfs=/tmp:mode=1777",
+                    "--as-pid2",
+                    "--timezone=off",
+                    "--user=root",
+                    os.path.join("/root", os.path.basename(setup_script)),
+                ]
+                _run_secure_subprocess(
+                    cmd,
+                    env=setup_environment,
+                    pass_fds=(machine_fd,),
+                )
+        finally:
+            os.close(machine_fd)
 
+        if not setup_script_exists:
             # Create fresh /etc/hosts file with container name
-            network_cidr = None
-            gateway = None
-            if self.network and self.network.configured:
-                if self.network._ensure_gateway():
-                    network_cidr = self.network.network_cidr
-                    gateway = self.network.gateway
-                else:
-                    print(
-                        f"W: Could not refresh network configuration for '{_strip_control_characters(self.network.bridge_name)}', creating guest files without network init"
-                    )
+            network_cidr, gateway = self._guest_network_config(planned_guest_network)
             _create_guest_files(mdir, self.container, network_cidr, gateway)
 
             # Create cache if enabled and setup completed successfully
@@ -4089,6 +4426,7 @@ class Sandy:
         cmd,
         environment: Mapping[str, str],
         spinner_line_event: Optional[threading.Event] = None,
+        pass_fds: Tuple[int, ...] = (),
     ) -> int:
         """Run systemd-nspawn interactively while monitoring output for spinner."""
         newline_injected = False
@@ -4117,6 +4455,7 @@ class Sandy:
                 master_read=master_read,
                 stdin_read=stdin_read,
                 environment=environment,
+                pass_fds=pass_fds,
             )
         finally:
             if spinner_line_event and not spinner_line_event.is_set():
@@ -4124,16 +4463,22 @@ class Sandy:
         return return_code
 
     def _wait_for_container_ready(
-        self, spinner_line_event: Optional[threading.Event] = None
-    ):
+        self,
+        spinner_line_event: Optional[threading.Event] = None,
+        timeout: int = CONTAINER_READY_TIMEOUT,
+    ) -> bool:
         """Wait for container readiness; show spinner dots only when requested."""
         import time
+
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+            return False
 
         spinner_active = False
         if spinner_line_event:
             spinner_active = not spinner_line_event.is_set()
+        deadline = time.monotonic() + timeout
 
-        while True:
+        while time.monotonic() < deadline:
             pid = self._is_container_running()
             if pid:
                 # Test if we can execute a simple command
@@ -4152,31 +4497,53 @@ class Sandy:
                     spinner_active = False
                 else:
                     print(".", end="", flush=True)
-            time.sleep(1)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(1, remaining))
+        return False
+
+    def _validate_container_ip_for_network(self, container_ip: str) -> str:
+        """Verify a parsed container IP belongs to the active Sandy network."""
+        network_cidr = self.network.network_cidr if self.network else None
+        return _validate_container_ip_for_cidr(container_ip, network_cidr)
+
+    def _get_container_ip_from_init_fd(self, init_script_fd: int) -> Optional[str]:
+        """Extract and validate the container IP from a verified init descriptor."""
+        container_ip = _parse_container_ip_from_init_fd(init_script_fd)
+        if container_ip is None:
+            return None
+        return self._validate_container_ip_for_network(container_ip)
 
     def _get_container_ip(self) -> Optional[str]:
-        """Extract container IP from /init.sh file"""
+        """Extract container IP from /init.sh using contained descriptor resolution."""
         mdir = self._get_machine_dir()
-        init_script_path = os.path.join(mdir, "init.sh")
-
-        if not os.path.exists(init_script_path):
-            return None
+        machine_fd: Optional[int] = None
+        init_script_fd: Optional[int] = None
 
         try:
-            with open(init_script_path, "r", encoding="utf-8") as f:
-                content = f.read()
-                match = re.search(r'CONTAINER_IP="(\d+\.\d+\.\d+\.\d+)"', content)
-                if match:
-                    return match.group(1)
+            machine_fd = _open_verified_dir(mdir)
+            init_script_fd = _open_optional_image_file(machine_fd, ("init.sh",))
+            if init_script_fd is None:
+                return None
+            return self._get_container_ip_from_init_fd(init_script_fd)
         except Exception as e:
             print(
                 "W: Could not read container IP from init script: "
                 f"{_terminal_safe_repr(str(e))}"
             )
+        finally:
+            if init_script_fd is not None:
+                os.close(init_script_fd)
+            if machine_fd is not None:
+                os.close(machine_fd)
 
         return None
 
-    def _setup_port_forwarding_rules(self):
+    def _setup_port_forwarding_rules(
+        self,
+        container_ip_override: object = CONTAINER_IP_UNSET,
+    ):
         """Setup port forwarding rules after container starts"""
         if not self.port_mappings:
             return
@@ -4185,9 +4552,24 @@ class Sandy:
             self.network is not None
         ), "Network must be configured for port forwarding"
 
-        container_ip = self._get_container_ip()
+        if container_ip_override is CONTAINER_IP_UNSET:
+            container_ip = self._get_container_ip()
+        elif container_ip_override is None:
+            container_ip = None
+        elif isinstance(container_ip_override, str):
+            container_ip = container_ip_override
+        else:
+            raise ValueError("Container IP override must be a string or None")
         if not container_ip:
             print("E: Could not determine container IP for port forwarding")
+            return
+        try:
+            container_ip = self._validate_container_ip_for_network(container_ip)
+        except PermissionError as exc:
+            print(
+                "E: Invalid container IP for port forwarding: "
+                f"{_terminal_safe_repr(str(exc))}"
+            )
             return
 
         self._update_port_mapping_state(self.container, container_ip)
@@ -4239,7 +4621,7 @@ class Sandy:
                     "--to-destination",
                     f"{container_ip}:{container_port}",
                     table="nat",
-                    error_prefix=f"Add OUTPUT DNAT for {proto}:{host_port}→{container_port}",
+                    error_prefix=f"Add OUTPUT DNAT for {proto}:{host_port}->{container_port}",
                 )
 
                 # DNAT in PREROUTING chain (for forwarded traffic)
@@ -4257,7 +4639,7 @@ class Sandy:
                     "--to-destination",
                     f"{container_ip}:{container_port}",
                     table="nat",
-                    error_prefix=f"Add PREROUTING DNAT for {proto}:{host_port}→{container_port}",
+                    error_prefix=f"Add PREROUTING DNAT for {proto}:{host_port}->{container_port}",
                 )
 
                 # SNAT in POSTROUTING chain (rewrite source from 127.0.0.1 to gateway)
@@ -4326,7 +4708,7 @@ class Sandy:
                 )
 
                 print(
-                    f"I: Port forwarding: 127.0.0.1:{host_port} → {container_ip}:{container_port} ({proto})"
+                    f"I: Port forwarding: 127.0.0.1:{host_port} -> {container_ip}:{container_port} ({proto})"
                 )
 
             return True
@@ -4461,7 +4843,7 @@ class Sandy:
                 self.network._run_nft(
                     "add",
                     *self._nft_dnat_rule_args("output", proto, host_port, destination),
-                    error_prefix=f"Add OUTPUT DNAT for {proto}:{host_port}→{container_port}",
+                    error_prefix=f"Add OUTPUT DNAT for {proto}:{host_port}->{container_port}",
                 )
 
                 # DNAT in prerouting chain (for forwarded traffic)
@@ -4470,7 +4852,7 @@ class Sandy:
                     *self._nft_dnat_rule_args(
                         "prerouting", proto, host_port, destination
                     ),
-                    error_prefix=f"Add PREROUTING DNAT for {proto}:{host_port}→{container_port}",
+                    error_prefix=f"Add PREROUTING DNAT for {proto}:{host_port}->{container_port}",
                 )
 
                 # SNAT in postrouting chain (rewrite source from 127.0.0.1 to gateway)
@@ -4500,7 +4882,7 @@ class Sandy:
                 )
 
                 print(
-                    f"I: Port forwarding: 127.0.0.1:{host_port} → {container_ip}:{container_port} ({proto})"
+                    f"I: Port forwarding: 127.0.0.1:{host_port} -> {container_ip}:{container_port} ({proto})"
                 )
 
             return True
@@ -4567,7 +4949,7 @@ class Sandy:
                     "--to-destination",
                     f"{container_ip}:{container_port}",
                     table="nat",
-                    error_prefix=f"Remove OUTPUT DNAT for {proto}:{host_port}→{container_port}",
+                    error_prefix=f"Remove OUTPUT DNAT for {proto}:{host_port}->{container_port}",
                 )
                 # Remove DNAT in PREROUTING chain (for forwarded traffic)
                 self.network._run_iptables(
@@ -4584,7 +4966,7 @@ class Sandy:
                     "--to-destination",
                     f"{container_ip}:{container_port}",
                     table="nat",
-                    error_prefix=f"Remove PREROUTING DNAT for {proto}:{host_port}→{container_port}",
+                    error_prefix=f"Remove PREROUTING DNAT for {proto}:{host_port}->{container_port}",
                 )
                 # Remove SNAT in POSTROUTING chain
                 self.network._run_iptables(
@@ -4646,7 +5028,7 @@ class Sandy:
                     error_prefix=f"Remove sandy-out rule for direct access to {proto}:{container_port}",
                 )
                 print(
-                    f"I: Removed port forwarding: 127.0.0.1:{host_port} → {container_ip}:{container_port} ({proto})"
+                    f"I: Removed port forwarding: 127.0.0.1:{host_port} -> {container_ip}:{container_port} ({proto})"
                 )
             return True
         except Exception as e:
@@ -4688,7 +5070,7 @@ class Sandy:
                 self.network._run_nft(
                     "delete",
                     *self._nft_dnat_rule_args("output", proto, host_port, destination),
-                    error_prefix=f"Remove OUTPUT DNAT for {proto}:{host_port}→{container_port}",
+                    error_prefix=f"Remove OUTPUT DNAT for {proto}:{host_port}->{container_port}",
                 )
                 # Remove DNAT in prerouting chain (for forwarded traffic)
                 self.network._run_nft(
@@ -4696,7 +5078,7 @@ class Sandy:
                     *self._nft_dnat_rule_args(
                         "prerouting", proto, host_port, destination
                     ),
-                    error_prefix=f"Remove PREROUTING DNAT for {proto}:{host_port}→{container_port}",
+                    error_prefix=f"Remove PREROUTING DNAT for {proto}:{host_port}->{container_port}",
                 )
                 # Remove SNAT in postrouting chain
                 self.network._run_nft(
@@ -4721,7 +5103,7 @@ class Sandy:
                     error_prefix=f"Remove output_filter rule for direct access to {proto}:{container_port}",
                 )
                 print(
-                    f"I: Removed port forwarding: 127.0.0.1:{host_port} → {container_ip}:{container_port} ({proto})"
+                    f"I: Removed port forwarding: 127.0.0.1:{host_port} -> {container_ip}:{container_port} ({proto})"
                 )
             return True
         except Exception as e:
@@ -4764,7 +5146,7 @@ class Sandy:
 
             if not silent:
                 print("I: Executing network initialization script as root")
-            result = self._exec_as_root("/init.sh")
+            result = self._exec_as_root("/bin/sh /init.sh")
             if result.returncode != 0:
                 if not silent:
                     print("W: Network initialization script failed")
@@ -4775,7 +5157,10 @@ class Sandy:
 
         return wait_attempted
 
-    def _build(self):
+    def _build(
+        self,
+        planned_guest_network: Optional[GuestNetwork] = None,
+    ) -> None:
         """Build container"""
         mdir = self._get_machine_dir()
         if os.path.exists(mdir):
@@ -4795,11 +5180,11 @@ class Sandy:
             cache_path = self._get_cache_path()
             if os.path.exists(cache_path):
                 print(f"I: Using cached container")
-                self._new_machine_from_cache(cache_path, mdir)
+                self._new_machine_from_cache(cache_path, mdir, planned_guest_network)
                 return
 
         # Build container from scratch
-        self._new_machine_from_scratch(mdir, cache_enabled)
+        self._new_machine_from_scratch(mdir, cache_enabled, planned_guest_network)
 
     def run_up(self, args):
         """Build and start container"""
@@ -4809,6 +5194,8 @@ class Sandy:
         if self._is_container_running():
             print(f"E: Container '{self.container}' is already running")
             sys.exit(1)
+
+        remove_stale_port_state = False
 
         # Parse and validate port mappings
         if hasattr(args, "ports") and args.ports:
@@ -4831,29 +5218,69 @@ class Sandy:
                 self.port_mappings.append(validated)
             self.port_mappings = self._dedupe_port_mappings(self.port_mappings)
         else:
-            self._remove_port_mappings_from_state(self.container)
-
-        # Setup networking based on network mode
-        if args.network == "lenient":
-            # Setup networking (bridge and NAT) if not already done
-            if self.network is None:
-                self.network = SandyNet()
-        elif args.network == "host":
-            # Host networking - don't initialize network bridge
-            if self.network is None:
-                print("I: Using host networking mode (no bridge setup)")
-            else:
-                print("I: Using host networking mode (ignoring existing bridge)")
-
-        if args.build:
-            self._build()
+            remove_stale_port_state = True
 
         mdir = self._get_machine_dir()
-        if not os.path.exists(mdir):
+        planned_guest_network = None
+        planned_network_info = None
+        building_new_machine = args.build and not os.path.lexists(mdir)
+        if building_new_machine and args.network == "lenient" and self.network is None:
+            try:
+                planned_guest_network, planned_network_info = (
+                    SandyNet.preview_bridge_network()
+                )
+            except (
+                OSError,
+                PermissionError,
+                ValueError,
+                subprocess.SubprocessError,
+            ) as exc:
+                print(
+                    "E: Could not plan lenient network: "
+                    f"{_terminal_safe_repr(str(exc))}"
+                )
+                sys.exit(1)
+
+        if args.build:
+            self._build(planned_guest_network)
+
+        try:
+            machine_fd = _open_verified_dir(mdir)
+        except FileNotFoundError:
             print(f"E: '{mdir}' does not exist. Use --build")
             sys.exit(1)
+        except (OSError, PermissionError, ValueError) as exc:
+            print(
+                f"E: Unsafe machine image '{_terminal_safe_repr(mdir)}': "
+                f"{_terminal_safe_repr(str(exc))}"
+            )
+            sys.exit(1)
+        runtime_fds = [machine_fd]
+        init_bind_dir: Optional[str] = None
 
-        # --directory=/var/lib/machines/sandy.foo
+        def close_runtime_fds() -> None:
+            nonlocal runtime_fds
+            for fd in reversed(runtime_fds):
+                os.close(fd)
+            runtime_fds = []
+
+        def cleanup_init_bind() -> None:
+            nonlocal init_bind_dir
+            if init_bind_dir is not None:
+                try:
+                    _remove_init_bind_copy(init_bind_dir)
+                finally:
+                    init_bind_dir = None
+
+        def reject_unsafe_init(exc: BaseException) -> None:
+            close_runtime_fds()
+            cleanup_init_bind()
+            print(
+                "E: Unsafe machine image /init.sh: " f"{_terminal_safe_repr(str(exc))}"
+            )
+            sys.exit(1)
+
+        # --directory=/proc/self/fd/<machine-fd>
         # --machine=foo           # show up as 'foo', not 'sandy.foo'
         # --tmpfs=/tmp:mode=1777  # memory tmpfs
         # --private-users         # user namespace - pick for >=250, fixed for <250
@@ -4864,7 +5291,7 @@ class Sandy:
         # --user=self.user        # change to this user within the container
         cmd = [
             "systemd-nspawn",
-            f"--directory={mdir}",
+            f"--directory={_proc_self_fd_path(machine_fd)}",
             f"--machine={self.container}",
             "--tmpfs=/tmp:mode=1777",
             "--as-pid2",
@@ -4872,164 +5299,254 @@ class Sandy:
             f"--user={self.user}",
         ]
 
-        # Use bridge network if configured and not in host mode
-        if args.network != "host" and self.network and self.network.configured:
-            # --network-bridge implies --network-veth (which implies
-            # --private-network). We currently setup a single bridge (sandybr0)
-            # and configure it with an unused IP address in a /24 network. The
-            # container's network interface shows up as 'host0' while the
-            # host's side of the veth shows up as vb-<container>@ifN. Firewall
-            # rules are then setup up on the bridge, external to the constainer
-            # (see above).
-            cmd.append(f"--network-bridge={self.network.bridge_name}")
+        try:
+            # Bind mount init.sh as read-only to protect it from modification.
+            # Open it before port forwarding so IP discovery cannot follow a raw
+            # image path or mutate host firewall state before validation.
+            init_script_fd: Optional[int] = None
+            try:
+                init_script_fd = _open_optional_image_file(machine_fd, ("init.sh",))
+            except (OSError, PermissionError, ValueError) as exc:
+                reject_unsafe_init(exc)
+            init_container_ip = None
+            if init_script_fd is not None:
+                init_bind_path = ""
+                try:
+                    init_container_ip = _parse_container_ip_from_init_fd(init_script_fd)
+                    init_bind_dir, init_bind_path = _create_init_bind_copy(
+                        init_script_fd,
+                        CONTAINER_BASE_UID if self.systemd_version < 250 else None,
+                        CONTAINER_BASE_UID if self.systemd_version < 250 else None,
+                    )
+                except (OSError, PermissionError, ValueError) as exc:
+                    os.close(init_script_fd)
+                    reject_unsafe_init(exc)
+                os.close(init_script_fd)
+                init_bind_options = ":idmap" if self.systemd_version >= 250 else ""
+                cmd.append(f"--bind-ro={init_bind_path}:/init.sh{init_bind_options}")
+                print(f"I: Bind mounting /init.sh as read-only")
 
-            # Setup port forwarding if configured
-            if self.port_mappings and self.network and self.network.configured:
-                self._setup_port_forwarding_rules()
-        else:
-            print("W: Using host networking (no restrictions)")
+            # Setup networking based on network mode after validating the machine
+            # image and init script. Network construction mutates host state.
+            if args.network == "lenient":
+                # Setup networking (bridge and NAT) if not already done
+                if self.network is None:
+                    if init_container_ip is not None:
+                        try:
+                            if planned_guest_network is None:
+                                planned_guest_network, planned_network_info = (
+                                    SandyNet.preview_bridge_network()
+                                )
+                            _validate_container_ip_for_cidr(
+                                init_container_ip,
+                                planned_guest_network[0],
+                            )
+                        except (
+                            OSError,
+                            PermissionError,
+                            ValueError,
+                            subprocess.SubprocessError,
+                        ) as exc:
+                            reject_unsafe_init(exc)
+                    self.network = (
+                        SandyNet(planned_network_info)
+                        if planned_network_info is not None
+                        else SandyNet()
+                    )
+                if (
+                    init_container_ip is not None
+                    and self.network
+                    and self.network.configured
+                ):
+                    try:
+                        self._validate_container_ip_for_network(init_container_ip)
+                    except PermissionError as exc:
+                        reject_unsafe_init(exc)
+            elif args.network == "host":
+                # Host networking - don't initialize network bridge
+                if self.network is None:
+                    print("I: Using host networking mode (no bridge setup)")
+                else:
+                    print("I: Using host networking mode (ignoring existing bridge)")
 
-        # Use fixed UID range for older systemd to make ACLs predictable
-        if self.systemd_version >= 250:
-            # XXX: Can this slow startup?
-            cmd.append("--private-users=pick")  # implies --private-users-ownership=auto
-        else:
-            cmd.append(f"--private-users={CONTAINER_BASE_UID}:65536")
-            cmd.append(f"--private-users-ownership=auto")
+            if remove_stale_port_state:
+                self._remove_port_mappings_from_state(self.container)
 
-        # codex' sandbox needs these landlock calls: landlock_create_ruleset,
-        # landlock_add_rule, landlock_restrict_self. It was observed that both
-        # the syscall names and the syscall numbers were required (Ubuntu 24.04
-        # host with Debian trixie-based container). These syscall numbers were
-        # confirmed to be the same number on all of these architectures:
-        # $ for a in x86_64 x86 arm aarch64 ppc64 ppc64le s390x riscv64 ; do
-        #     for sc in landlock_create_ruleset landlock_add_rule landlock_restrict_self ; do
-        #       scmp_sys_resolver -a $a $sc
-        #     done
-        #   done
-        if platform.machine() not in [
-            "x86_64",
-            "x86",
-            "arm",
-            "aarch64",
-            "ppc64",
-            "ppc64le",
-            "s390x",
-            "riscv64",
-        ]:
-            print(
-                "W: unknown architecture '%s'; hard-coded landlock syscall numbers may be incorrect"
-                % platform.machine()
-            )
-        cmd.append(
-            "--system-call-filter='@default landlock_create_ruleset landlock_add_rule landlock_restrict_self 444 445 446'"
-        )
+            # Use bridge network if configured and not in host mode
+            if args.network != "host" and self.network and self.network.configured:
+                # --network-bridge implies --network-veth (which implies
+                # --private-network). We currently setup a single bridge (sandybr0)
+                # and configure it with an unused IP address in a /24 network. The
+                # container's network interface shows up as 'host0' while the
+                # host's side of the veth shows up as vb-<container>@ifN. Firewall
+                # rules are then setup up on the bridge, external to the constainer
+                # (see above).
+                cmd.append(f"--network-bridge={self.network.bridge_name}")
 
-        if not args.persistent:
-            # --ephemeral affects the root namespace and not submounts. When
-            # specified, all changes to the system (excepting bind mounts below)
-            # are discarded.
-            cmd.append("--ephemeral")
-
-        # Bind mount workspace and shared directories
-        mount_specs = []
-        if self.workspace:
-            mount_specs.append(("workspace", self.workspace, "workspace", True))
-        if self.shared:
-            mount_specs.append(("shared", self.shared, "shared", False))
-
-        chdir_set = False
-        for label, host_rel, subdir, do_chdir in mount_specs:
-            realp = os.path.realpath(host_rel)
-            intp = f"{self.user_home}/{subdir}"
-            if not os.path.isdir(realp):
-                print(
-                    f"W: Could not find '{host_rel}' on the host, skipping {label} mount"
-                )
-                continue
-            extp = os.path.join(mdir, intp[1:])
-            if not os.path.isdir(extp):
-                print(
-                    f"W: Could not find '{intp}' in the container. Skipping {label} mount"
-                )
-                continue
-            if self.systemd_version >= 250:
-                cmd.append(f"--bind={realp}:{intp}:idmap")
+                # Setup port forwarding if configured
+                if self.port_mappings and self.network and self.network.configured:
+                    self._setup_port_forwarding_rules(init_container_ip)
             else:
-                cmd.append(f"--bind={realp}:{intp}")
-            print(f"I: Mounting '{realp}' on '{intp}'")
-            if do_chdir:
-                cmd.append(f"--chdir={intp}")
-                chdir_set = True
+                print("W: Using host networking (no restrictions)")
 
-        if not chdir_set:
-            cmd.append(f"--chdir={self.user_home}")
+            # Use fixed UID range for older systemd to make ACLs predictable
+            if self.systemd_version >= 250:
+                # XXX: Can this slow startup?
+                cmd.append(
+                    "--private-users=pick"
+                )  # implies --private-users-ownership=auto
+            else:
+                cmd.append(f"--private-users={CONTAINER_BASE_UID}:65536")
+                cmd.append(f"--private-users-ownership=auto")
 
-        # ACL fallback for systemd < 250
-        if self.systemd_version < 250:
+            # codex' sandbox needs these landlock calls: landlock_create_ruleset,
+            # landlock_add_rule, landlock_restrict_self. It was observed that both
+            # the syscall names and the syscall numbers were required (Ubuntu 24.04
+            # host with Debian trixie-based container). These syscall numbers were
+            # confirmed to be the same number on all of these architectures:
+            # $ for a in x86_64 x86 arm aarch64 ppc64 ppc64le s390x riscv64 ; do
+            #     for sc in landlock_create_ruleset landlock_add_rule landlock_restrict_self ; do
+            #       scmp_sys_resolver -a $a $sc
+            #     done
+            #   done
+            if platform.machine() not in [
+                "x86_64",
+                "x86",
+                "arm",
+                "aarch64",
+                "ppc64",
+                "ppc64le",
+                "s390x",
+                "riscv64",
+            ]:
+                print(
+                    "W: unknown architecture '%s'; hard-coded landlock syscall numbers may be incorrect"
+                    % platform.machine()
+                )
+            cmd.append(
+                "--system-call-filter='@default landlock_create_ruleset landlock_add_rule landlock_restrict_self 444 445 446'"
+            )
+
+            if not args.persistent:
+                # --ephemeral affects the root namespace and not submounts. When
+                # specified, all changes to the system (excepting bind mounts below)
+                # are discarded.
+                cmd.append("--ephemeral")
+
+            # Bind mount workspace and shared directories
+            mount_specs = []
+            if self.workspace:
+                mount_specs.append(("workspace", self.workspace, "workspace", True))
+            if self.shared:
+                mount_specs.append(("shared", self.shared, "shared", False))
+
+            chdir_set = False
             for label, host_rel, subdir, do_chdir in mount_specs:
                 realp = os.path.realpath(host_rel)
-                if os.path.isdir(realp):
-                    self._setfacl(realp, self.container)
+                intp = f"{self.user_home}/{subdir}"
+                if not os.path.isdir(realp):
+                    print(
+                        f"W: Could not find '{host_rel}' on the host, skipping {label} mount"
+                    )
+                    continue
+                extp = os.path.join(mdir, intp[1:])
+                if not os.path.isdir(extp):
+                    print(
+                        f"W: Could not find '{intp}' in the container. Skipping {label} mount"
+                    )
+                    continue
+                if self.systemd_version >= 250:
+                    cmd.append(f"--bind={realp}:{intp}:idmap")
+                else:
+                    cmd.append(f"--bind={realp}:{intp}")
+                print(f"I: Mounting '{realp}' on '{intp}'")
+                if do_chdir:
+                    cmd.append(f"--chdir={intp}")
+                    chdir_set = True
 
-        # Bind mount init.sh as read-only to protect it from modification
-        init_script_path = os.path.join(mdir, "init.sh")
-        if os.path.exists(init_script_path):
-            cmd.append(f"--bind-ro={init_script_path}:/init.sh")
-            print(f"I: Bind mounting /init.sh as read-only")
+            if not chdir_set:
+                cmd.append(f"--chdir={self.user_home}")
 
-        # XXX: probably should create a systemd unit for this
-        if args.detach:
-            spinner_line_event = threading.Event()
-            print(
-                f"I: Starting '{self.container}' in detached state ", end="", flush=True
-            )
-            _run_secure_subprocess_popen(
-                cmd,
-                start_new_session=True,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=container_environment,
-            )
-            # Run network initialization after detached start
-            waited_for_readiness = self._run_init_script(
-                silent=True,
-                network_mode=args.network,
-                spinner_line_event=spinner_line_event,
-            )
-            if waited_for_readiness:
-                _finish_spinner_line(spinner_line_event, suffix=" done")
-            else:
-                _finish_spinner_line(spinner_line_event)
-        else:
-            spinner_line_event = threading.Event()
-            print(f"I: Starting '{self.container}' ", end="", flush=True)
-            # Run network initialization in background thread
-            init_thread = threading.Thread(
-                target=lambda: self._run_init_script(
-                    silent=True,
-                    network_mode=args.network,
-                    spinner_line_event=spinner_line_event,
+            # ACL fallback for systemd < 250
+            if self.systemd_version < 250:
+                for label, host_rel, subdir, do_chdir in mount_specs:
+                    realp = os.path.realpath(host_rel)
+                    if os.path.isdir(realp):
+                        self._setfacl(realp, self.container)
+
+            # XXX: probably should create a systemd unit for this
+            if args.detach:
+                spinner_line_event = threading.Event()
+                print(
+                    f"I: Starting '{self.container}' in detached state ",
+                    end="",
+                    flush=True,
                 )
-            )
-            init_thread.daemon = True
-            init_thread.start()
+                try:
+                    try:
+                        _run_secure_subprocess_popen(
+                            cmd,
+                            start_new_session=True,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            env=container_environment,
+                            pass_fds=tuple(runtime_fds),
+                        )
+                    finally:
+                        close_runtime_fds()
+                    # Run network initialization after detached start
+                    waited_for_readiness = self._run_init_script(
+                        silent=True,
+                        network_mode=args.network,
+                        spinner_line_event=spinner_line_event,
+                    )
+                finally:
+                    cleanup_init_bind()
+                if waited_for_readiness:
+                    _finish_spinner_line(spinner_line_event, suffix=" done")
+                else:
+                    _finish_spinner_line(spinner_line_event)
+            else:
+                spinner_line_event = threading.Event()
+                print(f"I: Starting '{self.container}' ", end="", flush=True)
+                # Run network initialization in background thread
+                init_thread = threading.Thread(
+                    target=lambda: self._run_init_script(
+                        silent=True,
+                        network_mode=args.network,
+                        spinner_line_event=spinner_line_event,
+                    )
+                )
+                init_thread.daemon = True
+                init_thread.start()
 
-            # Run container interactively in main thread for proper SIGWINCH handling
-            self._run_container_interactive(
-                cmd,
-                spinner_line_event=spinner_line_event,
-                environment=container_environment,
-            )
+                # Run container interactively in main thread for proper SIGWINCH handling
+                try:
+                    try:
+                        self._run_container_interactive(
+                            cmd,
+                            spinner_line_event=spinner_line_event,
+                            environment=container_environment,
+                            pass_fds=tuple(runtime_fds),
+                        )
+                    finally:
+                        close_runtime_fds()
+                finally:
+                    cleanup_init_bind()
 
-            # Wait for init thread to complete
-            init_thread.join()
+                # Wait for init thread to complete
+                init_thread.join()
 
-            # Clean up port forwarding rules after container exits
-            if self.port_mappings and self.network and self.network.configured:
-                self._cleanup_port_forwarding_rules()
-                self._remove_port_mappings_from_state(self.container)
+                # Clean up port forwarding rules after container exits
+                if self.port_mappings and self.network and self.network.configured:
+                    self._cleanup_port_forwarding_rules()
+                    self._remove_port_mappings_from_state(self.container)
+        finally:
+            try:
+                cleanup_init_bind()
+            finally:
+                close_runtime_fds()
 
     def run_rm(self, args, all=False, cache=False, network=False):
         """Remove container(s)"""

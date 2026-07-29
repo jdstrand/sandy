@@ -41,12 +41,13 @@ def test_main(context: E2EContext) -> None:
         machine_link = context.filesystem_machine_link
         contained_target = image_root / host_target.relative_to("/")
 
+        context.create_filesystem_fixture_directory(image_root)
         contained_target.mkdir(parents=True)
-        host_target.mkdir()
+        context.create_filesystem_fixture_directory(host_target)
         host_keep = host_target / "keep"
         host_keep.write_text("host-decoy\n", encoding="utf-8")
         image_root.joinpath("etc").symlink_to(host_target)
-        machine_link.symlink_to(image_root)
+        context.create_filesystem_fixture_symlink(machine_link, image_root)
 
         image_root.joinpath("control").symlink_to("/unsafe\x1b[31m")
         try:
@@ -103,8 +104,8 @@ def test_main(context: E2EContext) -> None:
     with context.case("regular-file bind mounts block recursive removal"):
         source_root = context.filesystem_host_target
         managed_root = context.filesystem_machine_link
-        source_root.mkdir()
-        managed_root.mkdir(mode=0o700)
+        context.create_filesystem_fixture_directory(source_root)
+        context.create_filesystem_fixture_directory(managed_root, mode=0o700)
         source_file = source_root / "source"
         mount_point = managed_root / "mounted-file"
         source_file.write_text("host-decoy\n", encoding="utf-8")
