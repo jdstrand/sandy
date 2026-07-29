@@ -16,21 +16,19 @@ helpers are in the repository root; unit and E2E tests are under `tests/`.
 
 ## Task Scope and Autonomy
 
-* For review, explanation, diagnosis, or planning, inspect and report without
-  modifying files.
-* For change, build, or fix requests, make in-scope local changes and run
-  relevant non-destructive checks without asking first.
-* Make routine decisions independently. Ask only when materially different
-  interpretations would produce different outcomes.
+* Answer, explain, review, diagnose, and plan requests authorize inspection and
+  reporting only.
+* Change, build, and fix requests authorize in-scope local changes and relevant
+  non-destructive checks.
+* Decide routine details independently; ask only when material interpretations
+  would change the outcome.
 * Require explicit authorization for root commands, destructive actions,
   external writes, production dependencies, or material scope expansion.
-* Deliver the requested scope completely without silently narrowing, widening,
-  or transforming it.
+* Complete the requested scope without silently changing it.
 
 ## Mandatory Security Requirements
 
-These requirements take priority over convenience. Obtain explicit direction
-before weakening one.
+Security rules override convenience; get explicit direction before weakening them.
 
 ### Trust, Privilege, and Lifecycle
 
@@ -139,33 +137,24 @@ Unit tests must run unprivileged without Sandy runtime tools.
   firewalls, and timing.
 * Mock `subprocess.run` or `subprocess.Popen` directly only in wrapper tests;
   elsewhere, mock Sandy's wrapper boundary.
-* For each security property, identify which parts unit tests replace with
-  mocks. When correctness depends on real root privileges, kernel filesystem or
-  namespace semantics, mounts, systemd, networking, firewall behavior, or
-  external-tool integration, add a focused E2E case in a disposable VM. Unit
-  mocks remain useful for deterministic failure paths, but are not sufficient
-  evidence for behavior they cannot exercise.
+* State what each security-property unit test mocks. When correctness depends
+  on root, kernel filesystem/namespace/mount behavior, systemd, networking,
+  firewalls, or external tools, add focused E2E coverage in a disposable VM.
+  Mocks cover deterministic failure paths; they do not prove integration.
 * Assert exact arguments, ordering, rollback, cleanup, and error paths. Cover
   malformed input, boundaries, partial failure, conflicts, and repeated
   cleanup.
 * Add a regression test for each bug fix.
-* Treat the configured 95 percent combined branch and statement coverage as a
-  minimum regression floor, not a target. Add practical tests for testable
-  behavior and failure paths, especially security-sensitive control flow, even
-  after the floor is met. Do not add low-value tests solely to reach 100
-  percent.
+* Treat 95 percent combined branch and statement coverage as a floor. Add
+  practical tests for testable failures and security-sensitive paths; do not
+  add low-value tests solely to reach 100 percent.
 
 ## Development and Validation
 
-The Makefile is the source of truth. Run commands from the repository root and
-set up tools with `make install-tools`.
+The Makefile is authoritative; set up tools with `make install-tools`.
 
-Run a focused unit test with:
-
-```bash
-.venv-test/bin/python -W error -m unittest -v \
-    tests.test_sandy.ClassName.test_name
-```
+* Focused unit test: `.venv-test/bin/python -W error -m unittest -v
+  tests.test_sandy.ClassName.test_name`.
 
 Run the smallest validation set that covers the change:
 
@@ -173,14 +162,11 @@ Run the smallest validation set that covers the change:
 * Python: focused tests, then `make check`.
 * Shell: `make shell-check` plus relevant tests.
 * Security-sensitive control flow: `make coverage`.
-* E2E: required when the relevant behavior crosses a root-only, kernel, host
-  integration, or container-runtime boundary that unit tests mock; run it only
-  inside a verified disposable VM.
+* E2E: when required by Test Strategy, follow End-to-End Test Safety below.
 
-To avoid wasting tokens, do not return full diffs or verbose test output to
-model context. Instead, redirect to temporary files and inspect only exit
-status, `tail`, `wc`, and targeted `rg`/small `sed` excerpts. Keep all tool
-output limits small.
+* Redirect output from full test suites, coverage, linters, full diffs, or other
+  commands likely to produce long output to temporary files; inspect only status
+  and targeted `tail`, `wc`, `rg`, or `sed` excerpts.
 
 Report checks that fail or cannot run. Repeat checks only after a failure or
 material uncertainty. Do not delete an existing virtual environment, install
@@ -188,24 +174,23 @@ host packages, or weaken checks merely to obtain a passing result.
 
 ## End-to-End Test Safety
 
-E2E tests perform real root-only host and container operations.
-
-* Never run them on a normal development host or shared system.
-* Run them only in a verified disposable Linux VM satisfying `README.md`.
-* Require root and `SANDY_E2E=1`; never bypass or weaken these guards.
-* Confirm the VM has no pre-existing Sandy machines, bridge, firewall state, or
-  caches.
+* E2E performs real root-only host and container operations. Run it only as root
+  with `SANDY_E2E=1` in a verified disposable Linux VM satisfying `README.md`;
+  never use a normal or shared host or bypass the guards.
+* Confirm no pre-existing Sandy machines, bridge, firewall state, or caches are
+  in the VM.
 * Prefer focused E2E cases for security properties that mocked unit tests
   cannot establish. Track every host resource created by a test, clean only
   resources proven to belong to that run, and assert clean postconditions.
-* Use `sudo env SANDY_E2E=1 make e2e`. Run `e2e-full` only when executable
-  behavior in `setup-container.sh` changes and complete provisioning therefore
-  needs verification (comment-only changes and updates limited to global
-  version variables do not require `e2e-full` when ShellCheck passes on this
-  script).
+* Use `sudo env SANDY_E2E=1 make e2e`. Run `e2e-full` only for executable
+  `setup-container.sh` changes requiring complete provisioning; comment-only
+  or global-version changes require only ShellCheck.
 
 ## Communication and Handoff
 
+* Use ASD-STE100 Simplified Technical English, Issue 9, for all authored prose,
+  including agent messages, documentation, code comments, commit messages,
+  issue content, and pull request content.
 * Report progress only for material findings or changes in direction.
 * Lead the final response with the outcome, checks, gaps, risks, and
   assumptions; omit filler and repeated summaries.
