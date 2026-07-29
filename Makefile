@@ -95,4 +95,4 @@ e2e: e2e-guard
 e2e-full: e2e-guard
 	$(PYTHON) -m tests.e2e.runner --full
 
-check: format-check type-check test inclusivity-check
+check: test format-check type-check shell-check inclusivity-check

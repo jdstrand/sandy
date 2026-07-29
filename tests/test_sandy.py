@@ -3,6 +3,7 @@
 """Unit tests for the extensionless ``sandy`` CLI script."""
 
 import argparse
+import errno
 import importlib.machinery
 import importlib.util
 import io
@@ -349,10 +350,18 @@ class ValidationTests(unittest.TestCase):
             ],
         )
 
-    def test_log_sanitization_removes_control_characters(self):
+    def test_strip_control_characters(self):
         message = "safe\nforged\rline\tvalue\x00\x7f"
-        self.assertEqual(sandy._sanitize_log_output(message), "safeforgedlinevalue")
-        self.assertEqual(sandy._sanitize_log_output(123), "123")
+        self.assertEqual(
+            sandy._strip_control_characters(message), "safeforgedlinevalue"
+        )
+        self.assertEqual(sandy._strip_control_characters(123), "123")
+
+    def test_terminal_safe_repr_preserves_escaped_identity(self):
+        represented = sandy._terminal_safe_repr("unsafe\x1b[31m\\literal")
+
+        self.assertEqual(represented, "'unsafe\\x1b[31m\\\\literal'")
+        self.assertFalse(sandy._contains_control_character(represented))
 
 
 class SubprocessWrapperTests(unittest.TestCase):
@@ -372,7 +381,7 @@ class SubprocessWrapperTests(unittest.TestCase):
         self.assertIs(result, completed)
         run.assert_called_once_with(["true"], check=True, shell=False)
 
-    def test_run_wrapper_sanitizes_called_process_error(self):
+    def test_run_wrapper_preserves_called_process_error_output(self):
         error = subprocess.CalledProcessError(
             2,
             ["tool"],
@@ -383,7 +392,7 @@ class SubprocessWrapperTests(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError) as raised:
                 sandy._run_secure_subprocess(["tool"])
 
-        self.assertEqual(raised.exception.stderr, "badforged")
+        self.assertEqual(raised.exception.stderr, "bad\nforged")
         self.assertEqual(raised.exception.stdout, "ordinary output")
 
     def test_popen_wrapper_forces_shell_false(self):
@@ -393,6 +402,42 @@ class SubprocessWrapperTests(unittest.TestCase):
 
         self.assertIs(result, process)
         popen.assert_called_once_with(["tool"], stdin=None, shell=False)
+
+    def test_subprocess_wrappers_validate_explicit_inherited_fds(self):
+        completed = subprocess.CompletedProcess(["true"], 0)
+        descriptor = os.open(SANDY_PATH, os.O_RDONLY)
+        try:
+            with patch.object(sandy.subprocess, "run", return_value=completed) as run:
+                result = sandy._run_secure_subprocess(
+                    ["true"],
+                    pass_fds=[descriptor],
+                )
+            self.assertIs(result, completed)
+            run.assert_called_once_with(
+                ["true"],
+                pass_fds=(descriptor,),
+                shell=False,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Inherited file descriptors require close_fds=True",
+            ):
+                sandy._run_secure_subprocess(
+                    ["true"],
+                    close_fds=False,
+                    pass_fds=(descriptor,),
+                )
+        finally:
+            os.close(descriptor)
+
+        with self.assertRaises(OSError):
+            sandy._run_secure_subprocess(["true"], pass_fds=(descriptor,))
+
+        for pass_fds in ((-1,), (True,), (0, 0), object()):
+            with self.subTest(pass_fds=pass_fds):
+                with self.assertRaises(ValueError):
+                    sandy._validate_inherited_fds(pass_fds)
 
     def test_subprocess_wrappers_reject_shell_execution(self):
         for wrapper in (
@@ -467,6 +512,28 @@ class SubprocessWrapperTests(unittest.TestCase):
                             environment=environment,
                         )
                 fork.assert_not_called()
+
+    def test_pty_wrapper_marks_only_explicit_fds_inheritable_in_child(self):
+        descriptor = os.open(SANDY_PATH, os.O_RDONLY)
+        try:
+            with patch.object(sandy.pty, "fork", return_value=(0, 10)):
+                with patch.object(sandy.os, "set_inheritable") as set_inheritable:
+                    with patch.object(
+                        sandy.os,
+                        "execvpe",
+                        side_effect=RuntimeError("exec called"),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "exec called"):
+                            sandy._run_secure_subprocess_pty(
+                                ["tool"],
+                                environment={"PATH": sandy.CONTAINER_PATH},
+                                master_read=MagicMock(),
+                                stdin_read=MagicMock(),
+                                pass_fds=(descriptor,),
+                            )
+            set_inheritable.assert_called_once_with(descriptor, True)
+        finally:
+            os.close(descriptor)
 
 
 class PtyProcessTests(unittest.TestCase):
@@ -671,12 +738,13 @@ class PtyProcessTests(unittest.TestCase):
                                             )
         self.assertEqual(result, -1)
 
-    def test_child_pty_reports_exec_failure(self):
+    def test_child_pty_reports_exec_failure_safely(self):
+        executable = "missing\n\x1b[31m"
         with patch.object(sandy.pty, "fork", return_value=(0, 10)):
             with patch.object(
                 sandy.os,
                 "execvpe",
-                side_effect=OSError("missing"),
+                side_effect=OSError("missing\nforged"),
             ):
                 with patch.object(
                     sandy.os,
@@ -689,13 +757,19 @@ class PtyProcessTests(unittest.TestCase):
                             "child exited",
                         ):
                             sandy._run_secure_subprocess_pty(
-                                ["missing"],
+                                [executable],
                                 environment={"PATH": sandy.CONTAINER_PATH},
                                 master_read=MagicMock(),
                                 stdin_read=MagicMock(),
                             )
         child_exit.assert_called_once_with(1)
-        self.assertIn("Failed to execute missing", stderr.getvalue())
+        output = stderr.getvalue()
+        diagnostic = output.rstrip("\n")
+        self.assertFalse(sandy._contains_control_character(diagnostic))
+        self.assertNotIn(executable, output)
+        self.assertNotIn("missing\nforged", output)
+        self.assertIn("missing\\n\\x1b[31m", output)
+        self.assertIn("missing\\nforged", output)
 
     def test_child_pty_executes_with_only_the_explicit_environment(self):
         environment = {
@@ -1062,157 +1136,1393 @@ class MainDispatchTests(unittest.TestCase):
 
 
 class FilesystemSafetyTests(unittest.TestCase):
-    def safe_stat(self, *, uid=0, gid=0, mode=stat.S_IFDIR | 0o755, ino=1):
+    def safe_stat(
+        self,
+        *,
+        uid=0,
+        gid=0,
+        mode=stat.S_IFDIR | 0o755,
+        ino=1,
+        dev=1,
+        nlink=1,
+    ):
         return SimpleNamespace(
             st_uid=uid,
             st_gid=gid,
             st_mode=mode,
-            st_dev=1,
+            st_dev=dev,
             st_ino=ino,
+            st_nlink=nlink,
         )
 
-    def test_verify_safe_dir_rejects_outside_managed_root(self):
-        with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
-            with self.assertRaises(ValueError):
-                sandy._verify_safe_dir("/unsafe/container")
+    @contextmanager
+    def opened_parent(self, directory, basename="state"):
+        def open_parent(_path):
+            return (
+                os.open(directory, sandy.DIRECTORY_OPEN_FLAGS),
+                basename,
+            )
 
-    def test_verify_safe_dir_accepts_owned_non_writable_components(self):
-        safe = self.safe_stat()
-        with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
-            with patch.object(sandy.os.path, "realpath", side_effect=lambda p: p):
-                with patch.object(sandy.os, "open", side_effect=[10, 11, 12]):
-                    with patch.object(
-                        sandy.os,
-                        "fstat",
-                        side_effect=[safe, safe, safe, safe],
-                    ):
-                        with patch.object(sandy.os, "stat", return_value=safe):
-                            with patch.object(sandy.os, "close") as close:
-                                sandy._verify_safe_dir("/safe/container")
-        self.assertTrue(close.called)
+        with patch.object(sandy, "_open_verified_parent", side_effect=open_parent):
+            yield
 
-    def test_verify_safe_dir_rejects_unsafe_ownership_and_permissions(self):
+    def test_managed_paths_are_normalized_and_scoped(self):
+        with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
+            self.assertEqual(
+                sandy._managed_path_components(
+                    "/safe",
+                    allow_managed_root=True,
+                ),
+                ("safe",),
+            )
+            self.assertEqual(
+                sandy._managed_path_components(
+                    "/safe/sandy.container/etc",
+                    allow_managed_root=False,
+                ),
+                ("safe", "sandy.container", "etc"),
+            )
+
+            invalid_paths = (
+                ("/safe", False),
+                ("/unsafe/sandy.container", True),
+                ("/safe/container", True),
+                ("/safe/sandy.", True),
+                ("/safe/sandy.container/../other", True),
+                ("/safe//sandy.container", True),
+                ("safe/sandy.container", True),
+                ("", True),
+                ("/safe/sandy.container\n", True),
+                ("/safe/sandy.container\x1b", True),
+                ("/safe/sandy.container\t", True),
+                (f"/safe/sandy.container{chr(0x85)}", True),
+            )
+            for path, allow_managed_root in invalid_paths:
+                with self.subTest(path=path):
+                    with self.assertRaises(ValueError):
+                        sandy._managed_path_components(
+                            path,
+                            allow_managed_root=allow_managed_root,
+                        )
+
+    def test_container_name_from_machine_path_validates_top_level_name(self):
+        with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
+            self.assertEqual(
+                sandy._container_name_from_machine_path("/safe/sandy.container"),
+                "container",
+            )
+
+            invalid_paths = (
+                "/safe",
+                "/safe/sandy.__cache",
+                "/safe/sandy.bad_name",
+                "/safe/sandy.container/sandy.nested",
+            )
+            for path in invalid_paths:
+                with self.subTest(path=path):
+                    with self.assertRaises(ValueError):
+                        sandy._container_name_from_machine_path(path)
+
+    def test_verify_safe_dir_uses_no_follow_descriptor_walk(self):
+        with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
+            with patch.object(sandy.os, "open", side_effect=[10, 11, 12]) as open_fd:
+                with patch.object(
+                    sandy.os,
+                    "fstat",
+                    side_effect=[
+                        self.safe_stat(ino=1),
+                        self.safe_stat(ino=2),
+                        self.safe_stat(ino=3),
+                    ],
+                ):
+                    with patch.object(sandy.os, "close") as close:
+                        sandy._verify_safe_dir("/safe/sandy.container")
+
+        self.assertEqual(
+            open_fd.call_args_list,
+            [
+                call("/", sandy.DIRECTORY_OPEN_FLAGS),
+                call("safe", sandy.DIRECTORY_OPEN_FLAGS, dir_fd=10),
+                call("sandy.container", sandy.DIRECTORY_OPEN_FLAGS, dir_fd=11),
+            ],
+        )
+        self.assertEqual(close.call_args_list, [call(10), call(11), call(12)])
+
+    def test_owned_directory_rejects_wrong_type_owner_and_permissions(self):
         cases = [
+            self.safe_stat(mode=stat.S_IFREG | 0o644),
             self.safe_stat(uid=1000),
             self.safe_stat(gid=1000),
-            self.safe_stat(mode=stat.S_IFDIR | 0o777),
+            self.safe_stat(mode=stat.S_IFDIR | 0o775),
+            self.safe_stat(mode=stat.S_IFDIR | 0o757),
         ]
         for unsafe in cases:
             with self.subTest(unsafe=unsafe):
-                root = self.safe_stat()
-                with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
-                    with patch.object(
-                        sandy.os.path,
-                        "realpath",
-                        side_effect=lambda p: p,
+                with self.assertRaises(PermissionError):
+                    sandy._verify_owned_directory(unsafe, "unsafe")
+
+        sandy._verify_owned_directory(self.safe_stat(), "safe")
+
+    def test_owned_symlink_and_target_validation_fail_closed(self):
+        safe_link = self.safe_stat(mode=stat.S_IFLNK | 0o777)
+        sandy._verify_owned_symlink(safe_link, "safe")
+
+        unsafe_links = (
+            self.safe_stat(mode=stat.S_IFREG | 0o644),
+            self.safe_stat(mode=stat.S_IFLNK | 0o777, uid=1000),
+            self.safe_stat(mode=stat.S_IFLNK | 0o777, gid=1000),
+        )
+        for unsafe_link in unsafe_links:
+            with self.subTest(unsafe_link=unsafe_link):
+                with self.assertRaises(PermissionError) as raised:
+                    sandy._verify_owned_symlink(
+                        unsafe_link,
+                        "unsafe\x1b[31m",
+                    )
+                message = str(raised.exception)
+                self.assertIn("\\x1b", message)
+                self.assertFalse(sandy._contains_control_character(message))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            (parent / "link").symlink_to("target")
+            parent_fd = os.open(parent, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(sandy, "_verify_owned_symlink"):
+                    for target in (
+                        "\n",
+                        "\t",
+                        "\x1b[31m",
+                        "\x7f",
+                        chr(0x85),
                     ):
-                        with patch.object(sandy.os, "open", side_effect=[10, 11]):
+                        with self.subTest(target=repr(target)):
                             with patch.object(
                                 sandy.os,
-                                "fstat",
-                                side_effect=[root, unsafe],
+                                "readlink",
+                                return_value=target,
                             ):
-                                with patch.object(sandy.os, "close"):
-                                    with self.assertRaises(PermissionError):
-                                        sandy._verify_safe_dir("/safe")
+                                with self.assertRaises(PermissionError) as raised:
+                                    sandy._read_verified_symlink(
+                                        parent_fd,
+                                        "link",
+                                    )
+                        self.assertFalse(
+                            sandy._contains_control_character(str(raised.exception))
+                        )
+            finally:
+                os.close(parent_fd)
 
-    def test_verify_safe_dir_rejects_unsafe_root_and_non_directory(self):
-        root_cases = [
-            self.safe_stat(uid=1000),
-            self.safe_stat(mode=stat.S_IFDIR | 0o777),
-        ]
-        for unsafe_root in root_cases:
-            with self.subTest(root=unsafe_root):
-                with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
+    def test_managed_regular_file_helpers_are_no_follow_and_inode_stable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            lock_path = parent / "port_mappings.lock"
+
+            with self.opened_parent(parent, lock_path.name):
+                first = sandy._open_stable_lock_file("/managed/lock")
+            try:
+                first_stat = os.fstat(first.fileno())
+            finally:
+                first.close()
+
+            with self.opened_parent(parent, lock_path.name):
+                second = sandy._open_stable_lock_file("/managed/lock")
+            try:
+                second_stat = os.fstat(second.fileno())
+            finally:
+                second.close()
+
+            self.assertTrue(sandy._same_inode(first_stat, second_stat))
+            self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
+
+            with self.opened_parent(parent, lock_path.name):
+                with patch.object(sandy, "_same_inode", return_value=False):
+                    with self.assertRaises(PermissionError):
+                        sandy._open_stable_lock_file("/managed/lock")
+
+            state_path = parent / "port_mappings.json"
+            state_path.write_text("{}\n", encoding="utf-8")
+            state_path.chmod(0o600)
+            with self.opened_parent(parent, state_path.name):
+                state = sandy._open_existing_managed_text_file("/managed/state")
+            self.assertIsNotNone(state)
+            try:
+                self.assertEqual(state.read(), "{}\n")
+            finally:
+                state.close()
+
+            state_path.chmod(0o644)
+            with self.opened_parent(parent, state_path.name):
+                with self.assertRaises(PermissionError):
+                    sandy._open_existing_managed_text_file("/managed/state")
+
+            state_path.unlink()
+            with self.opened_parent(parent, state_path.name):
+                self.assertIsNone(
+                    sandy._open_existing_managed_text_file("/managed/state")
+                )
+
+    def test_managed_regular_file_validation_escapes_labels(self):
+        cases = (
+            self.safe_stat(uid=os.geteuid(), gid=os.getegid()),
+            self.safe_stat(
+                mode=stat.S_IFREG | 0o600,
+                uid=os.geteuid() + 1,
+                gid=os.getegid(),
+            ),
+            self.safe_stat(
+                mode=stat.S_IFREG | 0o600,
+                uid=os.geteuid(),
+                gid=os.getegid() + 1,
+            ),
+            self.safe_stat(
+                mode=stat.S_IFREG | 0o600,
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                nlink=2,
+            ),
+            self.safe_stat(
+                mode=stat.S_IFREG | 0o640,
+                uid=os.geteuid(),
+                gid=os.getegid(),
+            ),
+        )
+        for unsafe in cases:
+            with self.subTest(unsafe=unsafe):
+                with self.assertRaises(PermissionError) as raised:
+                    sandy._verify_owned_regular_file(
+                        unsafe,
+                        "unsafe\x1b[31m",
+                        expected_mode=0o600,
+                    )
+                message = str(raised.exception)
+                self.assertIn("\\x1b", message)
+                self.assertFalse(sandy._contains_control_character(message))
+
+        sandy._verify_owned_regular_file(
+            self.safe_stat(
+                mode=stat.S_IFREG | 0o600,
+                uid=os.geteuid(),
+                gid=os.getegid(),
+            ),
+            "safe",
+            expected_mode=0o600,
+        )
+
+    def test_host_directory_resolution_rejects_invalid_and_linked_paths(self):
+        invalid_paths = (
+            "",
+            "relative",
+            "/tmp/../tmp",
+            "/tmp\n",
+            "/tmp\x1b",
+            f"/tmp{chr(0x85)}",
+        )
+        for path in invalid_paths:
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    sandy._open_verified_host_directory(path)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "target"
+            target.mkdir()
+            (root / "link").symlink_to(target, target_is_directory=True)
+            with patch.object(sandy, "_verify_owned_directory"):
+                with self.assertRaises(PermissionError):
+                    sandy._open_verified_host_directory(str(root / "link"))
+
+        safe = self.safe_stat()
+        with patch.object(
+            sandy.os, "open", side_effect=[10, OSError(errno.EACCES, "")]
+        ):
+            with patch.object(sandy.os, "fstat", return_value=safe):
+                with patch.object(sandy.os, "close") as close:
+                    with patch.object(sandy, "_verify_owned_directory"):
+                        with self.assertRaises(OSError):
+                            sandy._open_verified_host_directory("/target")
+        close.assert_called_once_with(10)
+
+        with patch.object(sandy.os, "open", side_effect=[10, 11]):
+            with patch.object(sandy.os, "fstat", return_value=safe):
+                with patch.object(sandy.os, "close") as close:
                     with patch.object(
-                        sandy.os.path,
-                        "realpath",
-                        side_effect=lambda path: path,
+                        sandy,
+                        "_verify_owned_directory",
+                        side_effect=[None, PermissionError("unsafe")],
                     ):
-                        with patch.object(sandy.os, "open", return_value=10):
-                            with patch.object(
-                                sandy.os,
-                                "fstat",
-                                return_value=unsafe_root,
-                            ):
-                                with patch.object(sandy.os, "close"):
-                                    with self.assertRaises(PermissionError):
-                                        sandy._verify_safe_dir("/safe")
+                        with self.assertRaises(PermissionError):
+                            sandy._open_verified_host_directory("/target")
+        self.assertEqual(close.call_args_list, [call(11), call(10)])
 
-        root = self.safe_stat()
-        regular_file = self.safe_stat(mode=stat.S_IFREG | 0o644)
+    def test_verified_directory_resolution_closes_error_paths(self):
+        safe = self.safe_stat()
+
+        with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
+            with patch.object(sandy.os, "open", side_effect=[10, 11]):
+                with patch.object(sandy.os, "fstat", return_value=safe):
+                    with patch.object(sandy.os, "close") as close:
+                        with patch.object(sandy, "_verify_owned_directory"):
+                            directory_fd = sandy._open_verified_dir("/safe")
+                            self.assertEqual(directory_fd, 11)
+                            sandy.os.close(directory_fd)
+        self.assertEqual(close.call_args_list, [call(10), call(11)])
+
         with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
             with patch.object(
-                sandy.os.path,
-                "realpath",
-                side_effect=lambda path: path,
+                sandy.os,
+                "open",
+                side_effect=[10, OSError(errno.EACCES, "unsafe")],
             ):
-                with patch.object(sandy.os, "open", side_effect=[10, 11]):
-                    with patch.object(
-                        sandy.os,
-                        "fstat",
-                        side_effect=[root, regular_file],
-                    ):
-                        with patch.object(sandy.os, "close"):
+                with patch.object(sandy.os, "fstat", return_value=safe):
+                    with patch.object(sandy.os, "close") as close:
+                        with patch.object(sandy, "_verify_owned_directory"):
+                            with self.assertRaises(OSError):
+                                sandy._open_verified_dir("/safe")
+        close.assert_called_once_with(10)
+
+        with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
+            with patch.object(sandy.os, "open", side_effect=[10, 11]):
+                with patch.object(sandy.os, "fstat", return_value=safe):
+                    with patch.object(sandy.os, "close") as close:
+                        with patch.object(
+                            sandy,
+                            "_verify_owned_directory",
+                            side_effect=[None, PermissionError("unsafe")],
+                        ):
                             with self.assertRaises(PermissionError):
-                                sandy._verify_safe_dir("/safe")
+                                sandy._open_verified_dir("/safe")
+        self.assertEqual(close.call_args_list, [call(11), call(10)])
 
-    def test_verify_safe_dir_detects_inode_mismatch(self):
-        safe = self.safe_stat(ino=1)
-        mismatch = self.safe_stat(ino=2)
         with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
-            with patch.object(sandy.os.path, "realpath", side_effect=lambda p: p):
-                with patch.object(sandy.os, "open", side_effect=[10, 11]):
+            with patch.object(
+                sandy.os,
+                "open",
+                side_effect=[10, 11, FileNotFoundError()],
+            ):
+                with patch.object(sandy.os, "fstat", return_value=safe):
+                    with patch.object(sandy.os, "close") as close:
+                        with patch.object(sandy, "_verify_owned_directory"):
+                            with self.assertRaises(FileNotFoundError):
+                                sandy._open_verified_dir(
+                                    "/safe/sandy.container",
+                                )
+        self.assertEqual(close.call_args_list, [call(10), call(11)])
+
+        with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
+            with patch.object(sandy.os, "open", side_effect=[10, 11, 12]):
+                with patch.object(sandy.os, "fstat", return_value=safe):
+                    with patch.object(sandy.os, "close") as close:
+                        with patch.object(
+                            sandy,
+                            "_verify_owned_directory",
+                            side_effect=[None, None, PermissionError("unsafe")],
+                        ):
+                            with self.assertRaises(PermissionError):
+                                sandy._open_verified_dir(
+                                    "/safe/sandy.container",
+                                )
+        self.assertEqual(close.call_args_list, [call(10), call(12), call(11)])
+
+    def test_verified_directory_rejects_direct_host_root_image(self):
+        root_stat = self.safe_stat(ino=1, dev=1)
+        safe_stat = self.safe_stat(ino=2, dev=1)
+
+        with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
+            with patch.object(sandy.os, "open", side_effect=[10, 11, 12]):
+                with patch.object(
+                    sandy.os,
+                    "fstat",
+                    side_effect=[root_stat, safe_stat, root_stat],
+                ):
+                    with patch.object(sandy.os, "close") as close:
+                        with self.assertRaisesRegex(PermissionError, "host root"):
+                            sandy._open_verified_dir("/safe/sandy.root")
+        self.assertEqual(close.call_args_list, [call(10), call(12), call(11)])
+
+    def test_verify_safe_dir_rejects_symlink_components_and_closes_fds(self):
+        safe = self.safe_stat()
+        for error_number in (errno.ELOOP, errno.ENOTDIR):
+            with self.subTest(error_number=error_number):
+                with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
                     with patch.object(
                         sandy.os,
-                        "fstat",
-                        side_effect=[safe, safe, safe],
+                        "open",
+                        side_effect=[10, OSError(error_number, "unsafe")],
                     ):
-                        with patch.object(sandy.os, "stat", return_value=mismatch):
-                            with patch.object(sandy.os, "close"):
+                        with patch.object(sandy.os, "fstat", return_value=safe):
+                            with patch.object(sandy.os, "close") as close:
                                 with self.assertRaises(PermissionError):
-                                    sandy._verify_safe_dir("/safe")
+                                    sandy._verify_safe_dir(
+                                        "/safe/sandy.container",
+                                    )
+                close.assert_called_once_with(10)
 
-    def test_rmtree_never_removes_managed_root(self):
+    def test_remove_managed_tree_never_removes_managed_root(self):
         with patch.object(sandy, "SYSTEMD_MACHINES", "/safe"):
-            with patch.object(sandy.os.path, "realpath", side_effect=lambda p: p):
-                with self.assertRaises(ValueError):
-                    sandy._rmtree("/safe")
+            with self.assertRaises(ValueError):
+                sandy._remove_managed_tree("/safe")
 
-    def test_rmtree_verifies_before_removal(self):
-        with patch.object(sandy, "_verify_safe_dir") as verify:
-            with patch.object(sandy.shutil, "rmtree") as rmtree:
-                sandy._rmtree("/var/lib/machines/sandy.test")
-
-        verify.assert_called_once_with("/var/lib/machines/sandy.test")
-        rmtree.assert_called_once_with("/var/lib/machines/sandy.test")
-
-    def test_mkdir_verifies_parent_and_result(self):
-        with patch.object(sandy, "_verify_safe_dir") as verify:
-            with patch.object(sandy.os, "mkdir") as mkdir:
-                sandy._mkdir("/var/lib/machines/sandy.test")
-
-        self.assertEqual(
-            verify.call_args_list,
-            [
-                call("/var/lib/machines"),
-                call("/var/lib/machines/sandy.test"),
-            ],
-        )
-        mkdir.assert_called_once_with(
-            "/var/lib/machines/sandy.test",
-            mode=0o700,
-        )
-
-    def test_write_verifies_parent_and_sets_mode(self):
+    def test_remove_managed_tree_is_descriptor_anchored_and_does_not_follow_symlinks(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "state"
-            with patch.object(sandy, "_verify_safe_dir") as verify:
-                sandy._write(str(path), "safe content", mode=0o640)
+            root = Path(temp_dir)
+            parent = root / "managed"
+            target = parent / "sandy.test"
+            external = root / "external"
+            (target / "nested").mkdir(parents=True)
+            external.mkdir()
+            (target / "file").write_text("managed", encoding="utf-8")
+            (target / "nested" / "file").write_text("nested", encoding="utf-8")
+            (external / "keep").write_text("external", encoding="utf-8")
+            (target / "link").symlink_to(external, target_is_directory=True)
 
-            self.assertEqual(path.read_text(), "safe content")
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
-            verify.assert_called_once_with(temp_dir)
+            with self.opened_parent(parent, target.name):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    sandy._remove_managed_tree("/managed/sandy.test")
+
+            self.assertFalse(target.exists())
+            self.assertEqual(
+                (external / "keep").read_text(encoding="utf-8"),
+                "external",
+            )
+
+    def test_remove_managed_tree_unlinks_top_level_image_symlink_without_following(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent = root / "managed"
+            external = root / "external"
+            parent.mkdir()
+            external.mkdir()
+            (external / "keep").write_text("external", encoding="utf-8")
+            (parent / "sandy.test").symlink_to(
+                external,
+                target_is_directory=True,
+            )
+
+            with patch.object(sandy, "SYSTEMD_MACHINES", "/managed"):
+                with self.opened_parent(parent, "sandy.test"):
+                    with patch.object(sandy, "_verify_owned_symlink"):
+                        sandy._remove_managed_tree("/managed/sandy.test")
+
+            self.assertFalse((parent / "sandy.test").exists())
+            self.assertEqual(
+                (external / "keep").read_text(encoding="utf-8"),
+                "external",
+            )
+
+    def test_remove_managed_tree_rejects_nested_and_cache_symlink_targets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent = root / "managed"
+            external = root / "external"
+            parent.mkdir()
+            external.mkdir()
+            (parent / "nested").symlink_to(external, target_is_directory=True)
+
+            with patch.object(sandy, "SYSTEMD_MACHINES", "/managed"):
+                with self.opened_parent(parent, "nested"):
+                    with self.assertRaises(PermissionError):
+                        sandy._remove_managed_tree("/managed/sandy.test/nested")
+
+            self.assertTrue((parent / "nested").is_symlink())
+            self.assertTrue(external.is_dir())
+
+            (parent / "nested").unlink()
+            (parent / "sandy.__cache").symlink_to(
+                external,
+                target_is_directory=True,
+            )
+            with patch.object(sandy, "SYSTEMD_MACHINES", "/managed"):
+                with self.opened_parent(parent, "sandy.__cache"):
+                    with self.assertRaises(PermissionError):
+                        sandy._remove_managed_tree("/managed/sandy.__cache")
+
+            self.assertTrue((parent / "sandy.__cache").is_symlink())
+
+    def test_remove_managed_tree_revalidates_image_link_and_rejects_regular_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            external = parent / "external"
+            external.mkdir()
+            (parent / "sandy.test").symlink_to(
+                external,
+                target_is_directory=True,
+            )
+
+            mismatched = self.safe_stat(mode=stat.S_IFLNK | 0o777, ino=999)
+            with patch.object(sandy, "SYSTEMD_MACHINES", "/managed"):
+                with self.opened_parent(parent, "sandy.test"):
+                    with patch.object(
+                        sandy,
+                        "_read_verified_symlink",
+                        return_value=(str(external), mismatched),
+                    ):
+                        with self.assertRaises(PermissionError):
+                            sandy._remove_managed_tree("/managed/sandy.test")
+            self.assertTrue((parent / "sandy.test").is_symlink())
+
+            (parent / "sandy.test").unlink()
+            (parent / "sandy.test").write_text("keep", encoding="utf-8")
+            with self.opened_parent(parent, "sandy.test"):
+                with self.assertRaises(PermissionError):
+                    sandy._remove_managed_tree("/managed/sandy.test")
+            self.assertEqual(
+                (parent / "sandy.test").read_text(encoding="utf-8"),
+                "keep",
+            )
+
+    def test_remove_managed_tree_uses_open_parent_after_path_replacement(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent = root / "managed"
+            moved_parent = root / "moved"
+            target = parent / "sandy.test"
+            target.mkdir(parents=True)
+            (target / "old").write_text("old", encoding="utf-8")
+
+            def replace_parent(_path):
+                parent_fd = os.open(parent, sandy.DIRECTORY_OPEN_FLAGS)
+                parent.rename(moved_parent)
+                parent.mkdir()
+                replacement = parent / "sandy.test"
+                replacement.mkdir()
+                (replacement / "keep").write_text("new", encoding="utf-8")
+                return parent_fd, "sandy.test"
+
+            with patch.object(
+                sandy,
+                "_open_verified_parent",
+                side_effect=replace_parent,
+            ):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    sandy._remove_managed_tree("/managed/sandy.test")
+
+            self.assertFalse((moved_parent / "sandy.test").exists())
+            self.assertEqual(
+                (parent / "sandy.test" / "keep").read_text(encoding="utf-8"),
+                "new",
+            )
+
+    def test_mount_id_metadata_is_strictly_validated(self):
+        with patch("builtins.open", mock_open(read_data="mnt_id:\t123\n")):
+            self.assertEqual(sandy._fd_mount_id(10), 123)
+
+        invalid_metadata = (
+            "",
+            "mnt_id:\tabc\n",
+            "mnt_id:\t0\n",
+            "mnt_id:\t1\nmnt_id:\t2\n",
+            f"mnt_id:\t{'1' * 21}\n",
+        )
+        for metadata in invalid_metadata:
+            with self.subTest(metadata=metadata):
+                with patch("builtins.open", mock_open(read_data=metadata)):
+                    with self.assertRaises(PermissionError):
+                        sandy._fd_mount_id(10)
+
+        for invalid_fd in (-1, True, None):
+            with self.subTest(invalid_fd=invalid_fd):
+                with self.assertRaises(ValueError):
+                    sandy._fd_mount_id(invalid_fd)
+
+    def test_image_and_internal_symlinks_are_contained_by_image_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            managed = root / "machines"
+            image = root / "external-image"
+            real_etc = image / "real-etc"
+            host_target = root / "real-etc"
+            managed.mkdir()
+            real_etc.mkdir(parents=True)
+            host_target.mkdir()
+            (host_target / "keep").write_text("host", encoding="utf-8")
+            (image / "etc").symlink_to("/real-etc", target_is_directory=True)
+            (managed / "sandy.test").symlink_to(
+                image,
+                target_is_directory=True,
+            )
+
+            path = managed / "sandy.test" / "etc" / "hosts"
+            with patch.object(sandy, "SYSTEMD_MACHINES", str(managed)):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(sandy, "_verify_owned_symlink"):
+                        sandy._write(str(path), "contained", mode=0o644)
+
+            self.assertEqual(
+                (real_etc / "hosts").read_text(encoding="utf-8"),
+                "contained",
+            )
+            self.assertEqual(
+                (host_target / "keep").read_text(encoding="utf-8"),
+                "host",
+            )
+            self.assertFalse((host_target / "hosts").exists())
+
+    def test_relative_machine_image_symlink_and_ancestor_policy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            managed = root / "machines"
+            image = root / "image"
+            managed.mkdir()
+            image.mkdir()
+            (managed / "sandy.relative").symlink_to(
+                "../image",
+                target_is_directory=True,
+            )
+
+            with patch.object(sandy, "SYSTEMD_MACHINES", str(managed)):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(sandy, "_verify_owned_symlink"):
+                        sandy._verify_safe_dir(
+                            str(managed / "sandy.relative"),
+                        )
+
+            (managed / "sandy.ancestor").symlink_to(
+                "..",
+                target_is_directory=True,
+            )
+            with patch.object(sandy, "SYSTEMD_MACHINES", str(managed)):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(sandy, "_verify_owned_symlink"):
+                        with self.assertRaises(PermissionError):
+                            sandy._verify_safe_dir(
+                                str(managed / "sandy.ancestor"),
+                            )
+
+            managed_fd = os.open(managed, sandy.DIRECTORY_OPEN_FLAGS)
+            duplicate_fd = os.dup(managed_fd)
+            try:
+                with patch.object(
+                    sandy,
+                    "_read_verified_symlink",
+                    return_value=("/different", self.safe_stat()),
+                ):
+                    with patch.object(
+                        sandy,
+                        "_open_verified_host_directory",
+                        return_value=duplicate_fd,
+                    ):
+                        with self.assertRaises(PermissionError):
+                            sandy._open_machine_image_symlink(
+                                managed_fd,
+                                "sandy.same",
+                            )
+            finally:
+                os.close(managed_fd)
+
+    def test_relative_image_symlink_cannot_escape_image_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            managed = root / "machines"
+            image = managed / "sandy.test"
+            contained = image / "outside"
+            external = root / "outside"
+            contained.mkdir(parents=True)
+            external.mkdir()
+            (external / "keep").write_text("external", encoding="utf-8")
+            (image / "escape").symlink_to(
+                "../outside",
+                target_is_directory=True,
+            )
+
+            path = image / "escape" / "state"
+            with patch.object(sandy, "SYSTEMD_MACHINES", str(managed)):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(sandy, "_verify_owned_symlink"):
+                        sandy._write(str(path), "contained")
+
+            self.assertEqual(
+                (contained / "state").read_text(encoding="utf-8"),
+                "contained",
+            )
+            self.assertEqual(
+                (external / "keep").read_text(encoding="utf-8"),
+                "external",
+            )
+            self.assertFalse((external / "state").exists())
+
+    def test_image_symlink_component_normalization(self):
+        self.assertEqual(
+            sandy._image_symlink_components(
+                ("usr", "lib"),
+                "../share/./zoneinfo",
+                ("UTC",),
+            ),
+            ("usr", "share", "zoneinfo", "UTC"),
+        )
+        self.assertEqual(
+            sandy._image_symlink_components(
+                ("ignored",),
+                "/etc",
+                ("hosts",),
+            ),
+            ("etc", "hosts"),
+        )
+
+    def test_image_symlink_resolution_limit_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir)
+            (image / "target").mkdir()
+
+            for prefix, count in (("accepted", 8), ("rejected", 9)):
+                for index in range(count):
+                    destination = (
+                        f"{prefix}-{index + 1}" if index + 1 < count else "target"
+                    )
+                    (image / f"{prefix}-{index}").symlink_to(
+                        destination,
+                        target_is_directory=True,
+                    )
+
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(sandy, "_verify_owned_symlink"):
+                        accepted_fd = sandy._open_image_directory(
+                            image_fd,
+                            ("accepted-0",),
+                        )
+                        os.close(accepted_fd)
+
+                        with self.assertRaisesRegex(
+                            PermissionError,
+                            "Too many symlinks",
+                        ):
+                            sandy._open_image_directory(
+                                image_fd,
+                                ("rejected-0",),
+                            )
+            finally:
+                os.close(image_fd)
+
+    def test_image_symlink_loops_and_unsafe_targets_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            managed = root / "machines"
+            image = managed / "sandy.test"
+            image.mkdir(parents=True)
+            (image / "first").symlink_to("second", target_is_directory=True)
+            (image / "second").symlink_to("first", target_is_directory=True)
+
+            with patch.object(sandy, "SYSTEMD_MACHINES", str(managed)):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(sandy, "_verify_owned_symlink"):
+                        with self.assertRaises(PermissionError):
+                            sandy._verify_safe_dir(str(image / "first"))
+
+            (managed / "sandy.root").symlink_to("/", target_is_directory=True)
+            with patch.object(sandy, "SYSTEMD_MACHINES", str(managed)):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(sandy, "_verify_owned_symlink"):
+                        with self.assertRaises(PermissionError):
+                            sandy._verify_safe_dir(
+                                str(managed / "sandy.root"),
+                            )
+
+            (managed / "sandy.__cache").symlink_to(
+                root,
+                target_is_directory=True,
+            )
+            with patch.object(sandy, "SYSTEMD_MACHINES", str(managed)):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with self.assertRaises(PermissionError):
+                        sandy._verify_safe_dir(
+                            str(managed / "sandy.__cache"),
+                        )
+
+    def test_image_directory_resolution_rejects_mount_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir)
+            (image / "etc").mkdir()
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(
+                        sandy,
+                        "_fd_mount_id",
+                        side_effect=[1, 2],
+                    ):
+                        with self.assertRaises(PermissionError):
+                            sandy._open_image_directory(image_fd, ("etc",))
+            finally:
+                os.close(image_fd)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir)
+            (image / "etc").mkdir()
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            root_stat = os.fstat(image_fd)
+            different_device = SimpleNamespace(
+                st_uid=root_stat.st_uid,
+                st_gid=root_stat.st_gid,
+                st_mode=stat.S_IFDIR | 0o755,
+                st_dev=root_stat.st_dev + 1,
+                st_ino=root_stat.st_ino + 1,
+            )
+            try:
+                with patch.object(
+                    sandy.os,
+                    "fstat",
+                    side_effect=[root_stat, different_device],
+                ):
+                    with patch.object(sandy, "_verify_owned_directory"):
+                        with patch.object(sandy, "_fd_mount_id", return_value=1):
+                            with self.assertRaises(PermissionError):
+                                sandy._open_image_directory(image_fd, ("etc",))
+            finally:
+                os.close(image_fd)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with self.assertRaises(FileNotFoundError):
+                    sandy._open_image_directory(image_fd, ("missing",))
+            finally:
+                os.close(image_fd)
+
+    def test_image_file_resolution_uses_pinned_root_and_rejects_final_symlink(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = root / "image"
+            external = root / "external"
+            image.mkdir()
+            external.write_text("host", encoding="utf-8")
+            init_script = image / "init.sh"
+            init_script.write_text("#!/bin/sh\n", encoding="utf-8")
+            init_script.chmod(0o644)
+
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                file_fd = sandy._open_image_file(image_fd, ("init.sh",))
+                try:
+                    self.assertEqual(os.read(file_fd, 64), b"#!/bin/sh\n")
+                finally:
+                    os.close(file_fd)
+
+                init_script.unlink()
+                init_script.symlink_to(external)
+                with self.assertRaises(PermissionError):
+                    sandy._open_image_file(image_fd, ("init.sh",))
+            finally:
+                os.close(image_fd)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir)
+            group_writable = image / "init.sh"
+            group_writable.write_text("#!/bin/sh\n", encoding="utf-8")
+            group_writable.chmod(0o664)
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with self.assertRaises(PermissionError):
+                    sandy._open_image_file(image_fd, ("init.sh",))
+            finally:
+                os.close(image_fd)
+
+    def test_image_file_resolution_rejects_mount_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir)
+            init_script = image / "init.sh"
+            init_script.write_text("#!/bin/sh\n", encoding="utf-8")
+            init_script.chmod(0o644)
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(
+                    sandy,
+                    "_fd_mount_id",
+                    side_effect=[1, 2],
+                ):
+                    with self.assertRaisesRegex(PermissionError, "mount boundary"):
+                        sandy._open_image_file(image_fd, ("init.sh",))
+            finally:
+                os.close(image_fd)
+
+    def test_image_file_resolution_rejects_device_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir)
+            init_script = image / "init.sh"
+            init_script.write_text("#!/bin/sh\n", encoding="utf-8")
+            init_script.chmod(0o644)
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            root_stat = os.fstat(image_fd)
+            different_device = self.safe_stat(
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                mode=stat.S_IFREG | 0o644,
+                ino=root_stat.st_ino + 1,
+                dev=root_stat.st_dev + 1,
+            )
+            try:
+                with patch.object(
+                    sandy.os,
+                    "fstat",
+                    side_effect=[root_stat, different_device],
+                ):
+                    with patch.object(sandy, "_fd_mount_id", return_value=1):
+                        with self.assertRaisesRegex(
+                            PermissionError,
+                            "filesystem boundary",
+                        ):
+                            sandy._open_image_file(image_fd, ("init.sh",))
+            finally:
+                os.close(image_fd)
+
+    def test_init_bind_copy_uses_private_regular_file_and_exact_cleanup(self):
+        with tempfile.NamedTemporaryFile() as source:
+            source.write(b'CONTAINER_IP="10.200.1.10"\n')
+            source.flush()
+            init_fd = os.open(source.name, sandy.READ_FILE_OPEN_FLAGS)
+            try:
+                temporary_dir, bind_path = sandy._create_init_bind_copy(init_fd)
+            finally:
+                os.close(init_fd)
+
+        try:
+            directory_stat = os.stat(temporary_dir)
+            file_stat = os.stat(bind_path)
+            self.assertTrue(stat.S_ISDIR(directory_stat.st_mode))
+            self.assertEqual(stat.S_IMODE(directory_stat.st_mode) & 0o077, 0)
+            self.assertTrue(stat.S_ISREG(file_stat.st_mode))
+            self.assertEqual(stat.S_IMODE(file_stat.st_mode), 0o500)
+            self.assertEqual(
+                Path(bind_path).read_text(), 'CONTAINER_IP="10.200.1.10"\n'
+            )
+        finally:
+            sandy._remove_init_bind_copy(temporary_dir)
+        self.assertFalse(Path(temporary_dir).exists())
+
+    def test_init_bind_copy_rejects_oversized_source_and_bad_cleanup_target(self):
+        with tempfile.NamedTemporaryFile() as source:
+            source.write(b"x" * (sandy.INIT_SCRIPT_MAX_BYTES + 1))
+            source.flush()
+            init_fd = os.open(source.name, sandy.READ_FILE_OPEN_FLAGS)
+            try:
+                with self.assertRaisesRegex(PermissionError, "too large"):
+                    sandy._create_init_bind_copy(init_fd)
+            finally:
+                os.close(init_fd)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(PermissionError, "unexpected"):
+                sandy._remove_init_bind_copy(temp_dir)
+
+    def test_init_bind_copy_can_target_fixed_user_namespace_owner(self):
+        with tempfile.NamedTemporaryFile() as source:
+            source.write(b'CONTAINER_IP="10.200.1.10"\n')
+            source.flush()
+            init_fd = os.open(source.name, sandy.READ_FILE_OPEN_FLAGS)
+            try:
+                with patch.object(sandy.os, "fchown") as fchown:
+                    temporary_dir, bind_path = sandy._create_init_bind_copy(
+                        init_fd,
+                        12345,
+                        12345,
+                    )
+            finally:
+                os.close(init_fd)
+
+        try:
+            self.assertEqual(stat.S_IMODE(os.stat(bind_path).st_mode), 0o500)
+            fchown.assert_called_once()
+            self.assertEqual(fchown.call_args.args[1:], (12345, 12345))
+        finally:
+            sandy._remove_init_bind_copy(temporary_dir)
+
+    def test_remove_managed_tree_refuses_target_and_nested_mount_boundaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            target = parent / "sandy.test"
+            (target / "nested").mkdir(parents=True)
+
+            with self.opened_parent(parent, target.name):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(
+                        sandy,
+                        "_fd_mount_id",
+                        side_effect=[1, 2],
+                    ):
+                        with self.assertRaises(PermissionError):
+                            sandy._remove_managed_tree("/managed/sandy.test")
+            self.assertTrue((target / "nested").is_dir())
+
+    def test_recursive_removal_revalidates_devices_and_inodes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "nested").mkdir()
+            root_fd = os.open(root, sandy.DIRECTORY_OPEN_FLAGS)
+            root_stat = os.fstat(root_fd)
+            try:
+                with self.assertRaises(PermissionError):
+                    sandy._remove_directory_contents(
+                        root_fd,
+                        root_stat.st_dev + 1,
+                        sandy._fd_mount_id(root_fd),
+                    )
+            finally:
+                os.close(root_fd)
+            self.assertTrue((root / "nested").is_dir())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "nested").mkdir()
+            root_fd = os.open(root, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(sandy, "_same_inode", return_value=False):
+                    with self.assertRaises(PermissionError):
+                        sandy._remove_directory_contents(
+                            root_fd,
+                            os.fstat(root_fd).st_dev,
+                            sandy._fd_mount_id(root_fd),
+                        )
+            finally:
+                os.close(root_fd)
+            self.assertTrue((root / "nested").is_dir())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "nested").mkdir()
+            root_fd = os.open(root, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(
+                    sandy,
+                    "_same_inode",
+                    side_effect=[True, False],
+                ):
+                    with self.assertRaises(PermissionError):
+                        sandy._remove_directory_contents(
+                            root_fd,
+                            os.fstat(root_fd).st_dev,
+                            sandy._fd_mount_id(root_fd),
+                        )
+            finally:
+                os.close(root_fd)
+            self.assertTrue((root / "nested").is_dir())
+
+    def test_recursive_removal_revalidates_non_directory_mount_and_inode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            entry = root / "mounted-file"
+            entry.write_text("keep", encoding="utf-8")
+            root_fd = os.open(root, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(sandy, "_fd_mount_id", return_value=2):
+                    with self.assertRaisesRegex(
+                        PermissionError,
+                        "mount boundary",
+                    ):
+                        sandy._remove_directory_contents(
+                            root_fd,
+                            os.fstat(root_fd).st_dev,
+                            1,
+                        )
+            finally:
+                os.close(root_fd)
+            self.assertEqual(entry.read_text(encoding="utf-8"), "keep")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            entry = root / "changed-file"
+            entry.write_text("keep", encoding="utf-8")
+            root_fd = os.open(root, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(sandy, "_same_inode", return_value=False):
+                    with self.assertRaisesRegex(
+                        PermissionError,
+                        "Entry changed",
+                    ):
+                        sandy._remove_directory_contents(
+                            root_fd,
+                            os.fstat(root_fd).st_dev,
+                            sandy._fd_mount_id(root_fd),
+                        )
+            finally:
+                os.close(root_fd)
+            self.assertEqual(entry.read_text(encoding="utf-8"), "keep")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            entry = root / "replaced-file"
+            entry.write_text("keep", encoding="utf-8")
+            root_fd = os.open(root, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(
+                    sandy,
+                    "_same_inode",
+                    side_effect=[True, False],
+                ):
+                    with self.assertRaisesRegex(
+                        PermissionError,
+                        "Entry changed",
+                    ):
+                        sandy._remove_directory_contents(
+                            root_fd,
+                            os.fstat(root_fd).st_dev,
+                            sandy._fd_mount_id(root_fd),
+                        )
+            finally:
+                os.close(root_fd)
+            self.assertEqual(entry.read_text(encoding="utf-8"), "keep")
+
+    def test_remove_managed_tree_revalidates_target_before_and_after_recursion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            target = parent / "sandy.test"
+            target.mkdir()
+
+            with self.opened_parent(parent, target.name):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(sandy, "_same_inode", return_value=False):
+                        with self.assertRaises(PermissionError):
+                            sandy._remove_managed_tree("/managed/sandy.test")
+            self.assertTrue(target.is_dir())
+
+            (target / "nested").mkdir()
+            with self.opened_parent(parent, target.name):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(
+                        sandy,
+                        "_same_inode",
+                        side_effect=[True, False],
+                    ):
+                        with self.assertRaises(PermissionError):
+                            sandy._remove_managed_tree("/managed/sandy.test")
+            self.assertTrue(target.is_dir())
+
+            with self.opened_parent(parent, target.name):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    with patch.object(
+                        sandy,
+                        "_fd_mount_id",
+                        side_effect=[1, 1, 2],
+                    ):
+                        with self.assertRaises(PermissionError):
+                            sandy._remove_managed_tree("/managed/sandy.test")
+            self.assertTrue((target / "nested").is_dir())
+
+    def test_mkdir_uses_parent_descriptor_and_cleans_failed_verification(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            with self.opened_parent(parent, "sandy.test"):
+                with patch.object(sandy, "_verify_owned_directory"):
+                    sandy._mkdir("/managed/sandy.test")
+            self.assertTrue((parent / "sandy.test").is_dir())
+            self.assertEqual(
+                stat.S_IMODE((parent / "sandy.test").stat().st_mode),
+                0o700,
+            )
+
+            with self.opened_parent(parent, "sandy.failed"):
+                with patch.object(
+                    sandy,
+                    "_verify_owned_directory",
+                    side_effect=PermissionError("unsafe"),
+                ):
+                    with self.assertRaises(PermissionError):
+                        sandy._mkdir("/managed/sandy.failed")
+            self.assertFalse((parent / "sandy.failed").exists())
+
+    def test_write_atomically_replaces_regular_file_and_sets_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            destination = parent / "state"
+            destination.write_text("old", encoding="utf-8")
+
+            with self.opened_parent(parent):
+                sandy._write("/managed/state", "safe content", mode=0o640)
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "safe content")
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o640)
+            self.assertEqual(list(parent.glob(".sandy-*.tmp")), [])
+
+    def test_write_rejects_invalid_inputs_and_destination_owner(self):
+        with self.assertRaises(ValueError):
+            sandy._write("/managed/state", b"bytes")
+
+        for mode in (True, -1, 0o1000, "0600"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError):
+                    sandy._write("/managed/state", "content", mode=mode)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            destination = parent / "state"
+            destination.write_text("old", encoding="utf-8")
+            with self.opened_parent(parent):
+                with patch.object(
+                    sandy.os,
+                    "geteuid",
+                    return_value=os.geteuid() + 1,
+                ):
+                    with self.assertRaises(PermissionError):
+                        sandy._write("/managed/state", "unsafe")
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old")
+
+    def test_write_fails_closed_on_temporary_file_collisions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            collision = parent / ".sandy-collision.tmp"
+            collision.write_text("keep", encoding="utf-8")
+
+            with self.opened_parent(parent):
+                with patch.object(
+                    sandy.secrets,
+                    "token_hex",
+                    return_value="collision",
+                ):
+                    with self.assertRaises(FileExistsError):
+                        sandy._write("/managed/state", "content")
+
+            self.assertEqual(collision.read_text(encoding="utf-8"), "keep")
+            self.assertFalse((parent / "state").exists())
+
+    def test_write_rejects_invalid_temporary_inode_and_zero_progress(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            invalid_temporary = self.safe_stat(
+                mode=stat.S_IFREG | 0o600,
+                uid=os.geteuid() + 1,
+            )
+
+            with self.opened_parent(parent):
+                with patch.object(
+                    sandy.os,
+                    "fstat",
+                    return_value=invalid_temporary,
+                ):
+                    with self.assertRaises(PermissionError):
+                        sandy._write("/managed/state", "content")
+            self.assertEqual(list(parent.iterdir()), [])
+
+            with self.opened_parent(parent):
+                with patch.object(sandy.os, "write", return_value=0):
+                    with self.assertRaises(OSError):
+                        sandy._write("/managed/state", "content")
+            self.assertEqual(list(parent.iterdir()), [])
+
+    def test_write_detects_post_replace_inode_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            with self.opened_parent(parent):
+                with patch.object(sandy, "_same_inode", return_value=False):
+                    with self.assertRaises(PermissionError):
+                        sandy._write("/managed/state", "content")
+
+            self.assertEqual(
+                (parent / "state").read_text(encoding="utf-8"),
+                "content",
+            )
+            self.assertEqual(list(parent.glob(".sandy-*.tmp")), [])
+
+    def test_write_rejects_absolute_relative_and_magic_symlinks(self):
+        link_targets = ("absolute", "relative", "magic")
+        for link_type in link_targets:
+            with self.subTest(link_type=link_type):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    parent = root / "managed"
+                    external = root / "external"
+                    parent.mkdir()
+                    external.write_text("keep", encoding="utf-8")
+
+                    magic_fd = None
+                    if link_type == "absolute":
+                        link_target = str(external)
+                    elif link_type == "relative":
+                        link_target = "../external"
+                    else:
+                        magic_fd = os.open(external, os.O_RDONLY)
+                        link_target = f"/proc/self/fd/{magic_fd}"
+                    try:
+                        (parent / "state").symlink_to(link_target)
+                        with self.opened_parent(parent):
+                            with self.assertRaises(PermissionError):
+                                sandy._write("/managed/state", "unsafe")
+                    finally:
+                        if magic_fd is not None:
+                            os.close(magic_fd)
+
+                    self.assertEqual(
+                        external.read_text(encoding="utf-8"),
+                        "keep",
+                    )
+                    self.assertTrue((parent / "state").is_symlink())
+
+    def test_write_rejects_hard_link_destination(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            external = parent / "external"
+            destination = parent / "state"
+            external.write_text("keep", encoding="utf-8")
+            os.link(external, destination)
+
+            with self.opened_parent(parent):
+                with self.assertRaises(PermissionError):
+                    sandy._write("/managed/state", "unsafe")
+
+            self.assertEqual(external.read_text(encoding="utf-8"), "keep")
+            self.assertEqual(destination.read_text(encoding="utf-8"), "keep")
+
+    def test_write_uses_open_parent_after_path_replacement(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            parent = root / "managed"
+            moved_parent = root / "moved"
+            parent.mkdir()
+
+            def replace_parent(_path):
+                parent_fd = os.open(parent, sandy.DIRECTORY_OPEN_FLAGS)
+                parent.rename(moved_parent)
+                parent.mkdir()
+                return parent_fd, "state"
+
+            with patch.object(
+                sandy,
+                "_open_verified_parent",
+                side_effect=replace_parent,
+            ):
+                sandy._write("/managed/state", "anchored")
+
+            self.assertEqual(
+                (moved_parent / "state").read_text(encoding="utf-8"),
+                "anchored",
+            )
+            self.assertFalse((parent / "state").exists())
+
+    def test_write_cleans_temporary_file_after_interruption(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            with self.opened_parent(parent):
+                with patch.object(
+                    sandy.os,
+                    "write",
+                    side_effect=OSError("interrupted"),
+                ):
+                    with self.assertRaises(OSError):
+                        sandy._write("/managed/state", "content")
+
+            self.assertFalse((parent / "state").exists())
+            self.assertEqual(list(parent.iterdir()), [])
+
+    def test_write_cleans_temporary_file_after_failed_rename(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir)
+            destination = parent / "state"
+            destination.write_text("old", encoding="utf-8")
+
+            with self.opened_parent(parent):
+                with patch.object(
+                    sandy.os,
+                    "replace",
+                    side_effect=OSError("rename failed"),
+                ):
+                    with self.assertRaises(OSError):
+                        sandy._write("/managed/state", "new")
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "old")
+            self.assertEqual(list(parent.glob(".sandy-*.tmp")), [])
 
 
 class GuestFileTests(unittest.TestCase):
@@ -1356,9 +2666,9 @@ class GuestFileTests(unittest.TestCase):
                     with patch.object(
                         sandy.ipaddress,
                         "ip_network",
-                        side_effect=ValueError("invalid"),
+                        side_effect=ValueError("invalid\nforged"),
                     ):
-                        with captured_output():
+                        with captured_output() as (stdout, _):
                             sandy._create_guest_files(
                                 "/machine",
                                 "test-box",
@@ -1366,6 +2676,8 @@ class GuestFileTests(unittest.TestCase):
                                 "10.20.30.1",
                             )
         self.assertEqual(write.call_count, 1)
+        self.assertNotIn("invalid\nforged", stdout.getvalue())
+        self.assertIn("invalid\\nforged", stdout.getvalue())
 
         directories = [
             "/var/lib/machines/sandy.__cache",
@@ -1665,6 +2977,10 @@ class SystemUtilityTests(unittest.TestCase):
                 instance._get_port_mappings_path(),
                 "/machines/sandy.__cache/port_mappings.json",
             )
+            self.assertEqual(
+                instance._get_port_mappings_lock_path(),
+                "/machines/sandy.__cache/port_mappings.lock",
+            )
 
     def test_existing_cache_directory_is_verified(self):
         instance = make_sandy()
@@ -1712,24 +3028,51 @@ class SystemUtilityTests(unittest.TestCase):
                     follow_symlinks=False,
                 )
 
+        with patch.object(
+            instance,
+            "_get_cache_dir",
+            return_value="/cache",
+        ):
+            with patch.object(sandy.os.path, "exists", return_value=False):
+                with patch.object(
+                    sandy,
+                    "_mkdir",
+                    side_effect=FileExistsError,
+                ):
+                    with patch.object(sandy, "_verify_safe_dir") as verify:
+                        with patch.object(sandy.os, "chmod"):
+                            self.assertEqual(
+                                instance._ensure_cache_dir(),
+                                "/cache",
+                            )
+        verify.assert_called_once_with("/cache")
+
     def test_running_container_enumeration_skips_cache(self):
         instance = make_sandy()
         paths = [
             "/var/lib/machines/sandy.one",
             "/var/lib/machines/sandy.two",
+            "/var/lib/machines/sandy.bad\n\x1b[31m",
             "/var/lib/machines/sandy.__cache",
         ]
+        checked_names = []
+
+        def is_running(name):
+            checked_names.append(name)
+            return "123" if name == "one" else None
+
         with patch.object(sandy.os.path, "exists", return_value=True):
             with patch.object(sandy.glob, "glob", return_value=paths):
                 with patch.object(
                     instance,
                     "_is_container_running",
-                    side_effect=lambda name: "123" if name == "one" else None,
+                    side_effect=is_running,
                 ):
                     self.assertEqual(
                         instance._get_running_sandy_containers(),
                         ["one"],
                     )
+        self.assertEqual(checked_names, ["one", "two"])
 
         with patch.object(sandy.os.path, "exists", return_value=False):
             self.assertEqual(instance._get_running_sandy_containers(), [])
@@ -1903,6 +3246,109 @@ class NetworkCoreTests(unittest.TestCase):
                         network = sandy.SandyNet()
         self.assertEqual(network.firewall_backend, "nftables")
         self.assertTrue(network.configured)
+
+    def test_preview_bridge_network_reuses_existing_bridge_without_mutation(self):
+        def detect_existing(preview):
+            preview.network = "10.222.5.0"
+            preview.network_cidr = "10.222.5.0/24"
+            preview.gateway = "10.222.5.1"
+            return True
+
+        with patch.object(
+            sandy.SandyNet,
+            "_bridge_exists",
+            autospec=True,
+            return_value=True,
+        ):
+            with patch.object(
+                sandy.SandyNet,
+                "_detect_existing_config",
+                autospec=True,
+                side_effect=detect_existing,
+            ):
+                with patch.object(
+                    sandy.SandyNet,
+                    "_find_unused_network",
+                    autospec=True,
+                ) as find_unused:
+                    with patch.object(
+                        sandy.SandyNet,
+                        "_setup_bridge",
+                        autospec=True,
+                    ) as setup:
+                        guest_network, planned_network = (
+                            sandy.SandyNet.preview_bridge_network()
+                        )
+
+        self.assertEqual(guest_network, ("10.222.5.0/24", "10.222.5.1"))
+        self.assertIsNone(planned_network)
+        find_unused.assert_not_called()
+        setup.assert_not_called()
+
+    def test_preview_bridge_network_plans_unused_network_without_mutation(self):
+        planned = ("10.222.5.0", "10.222.5.0/24", "10.222.5.1")
+        with patch.object(
+            sandy.SandyNet,
+            "_bridge_exists",
+            autospec=True,
+            return_value=False,
+        ):
+            with patch.object(
+                sandy.SandyNet,
+                "_find_unused_network",
+                autospec=True,
+                return_value=planned,
+            ) as find_unused:
+                with patch.object(
+                    sandy.SandyNet,
+                    "_setup_bridge",
+                    autospec=True,
+                ) as setup:
+                    guest_network, planned_network = (
+                        sandy.SandyNet.preview_bridge_network()
+                    )
+
+        self.assertEqual(guest_network, ("10.222.5.0/24", "10.222.5.1"))
+        self.assertEqual(planned_network, planned)
+        find_unused.assert_called_once()
+        setup.assert_not_called()
+
+    def test_preview_bridge_network_rejects_invalid_existing_or_missing_plan(self):
+        def detect_public_network(preview):
+            preview.network = "8.8.8.0"
+            preview.network_cidr = "8.8.8.0/24"
+            preview.gateway = "8.8.8.1"
+            return True
+
+        with patch.object(
+            sandy.SandyNet,
+            "_bridge_exists",
+            autospec=True,
+            return_value=True,
+        ):
+            with patch.object(
+                sandy.SandyNet,
+                "_detect_existing_config",
+                autospec=True,
+                side_effect=detect_public_network,
+            ):
+                with self.assertRaisesRegex(PermissionError, "Invalid Sandy network"):
+                    sandy.SandyNet.preview_bridge_network()
+
+        with patch.object(
+            sandy.SandyNet,
+            "_bridge_exists",
+            autospec=True,
+            return_value=False,
+        ):
+            with patch.object(
+                sandy.SandyNet,
+                "_find_unused_network",
+                autospec=True,
+                return_value=None,
+            ):
+                with self.assertRaisesRegex(PermissionError, "unused network"):
+                    sandy.SandyNet.preview_bridge_network()
 
     def test_bridge_exists(self):
         network = make_network()
@@ -2102,6 +3548,66 @@ class NetworkCoreTests(unittest.TestCase):
                 if backend == "nftables":
                     nft.assert_called_once_with("10.210.1.0/24")
 
+    def test_setup_bridge_uses_valid_plan_and_skips_discovery(self):
+        network = make_network()
+        network.firewall_backend = None
+        planned = ("10.222.5.0", "10.222.5.0/24", "10.222.5.1")
+        with patch.object(network, "_find_unused_network") as find_unused:
+            with patch.object(
+                network,
+                "_check_network_conflict",
+                return_value=False,
+            ) as conflict:
+                with patch.object(network, "_create_bridge", return_value=True):
+                    with patch.object(network, "_enable_ip_forwarding"):
+                        with patch.object(network, "_enable_route_localnet"):
+                            with patch.object(
+                                network,
+                                "_configure_bridge_ip",
+                                return_value=True,
+                            ):
+                                with captured_output():
+                                    self.assertTrue(network._setup_bridge(planned))
+
+        find_unused.assert_not_called()
+        conflict.assert_called_once_with("10.222.5.0/24")
+        self.assertEqual(network.network, "10.222.5.0")
+        self.assertEqual(network.network_cidr, "10.222.5.0/24")
+        self.assertEqual(network.gateway, "10.222.5.1")
+
+    def test_setup_bridge_rejects_invalid_plans_before_mutation(self):
+        cases = (
+            ("10.222.5.0", "not-cidr", "10.222.5.1"),
+            ("10.222.6.0", "10.222.5.0/24", "10.222.5.1"),
+            ("10.222.5.0", "10.222.5.0/24", "10.222.6.1"),
+        )
+        for planned in cases:
+            with self.subTest(planned=planned):
+                network = make_network()
+                with patch.object(network, "_find_unused_network") as find_unused:
+                    with patch.object(network, "_create_bridge") as create_bridge:
+                        with captured_output():
+                            self.assertFalse(network._setup_bridge(planned))
+                find_unused.assert_not_called()
+                create_bridge.assert_not_called()
+
+    def test_setup_bridge_rejects_conflicting_plan_before_mutation(self):
+        network = make_network()
+        planned = ("10.222.5.0", "10.222.5.0/24", "10.222.5.1")
+        with patch.object(network, "_find_unused_network") as find_unused:
+            with patch.object(
+                network,
+                "_check_network_conflict",
+                return_value=True,
+            ) as conflict:
+                with patch.object(network, "_create_bridge") as create_bridge:
+                    with captured_output():
+                        self.assertFalse(network._setup_bridge(planned))
+
+        find_unused.assert_not_called()
+        conflict.assert_called_once_with("10.222.5.0/24")
+        create_bridge.assert_not_called()
+
     def test_cleanup_nftables_and_bridge(self):
         network = make_network()
         network.firewall_backend = "nftables"
@@ -2195,6 +3701,25 @@ class NetworkCoreTests(unittest.TestCase):
                 ):
                     with captured_output():
                         self.assertFalse(network._ensure_gateway())
+
+    def test_gateway_detection_escapes_wrapper_error_once(self):
+        network = make_network()
+        network.gateway = None
+        network.network_cidr = None
+        error = subprocess.CalledProcessError(
+            1,
+            ["ip"],
+            stderr="bad\nforged",
+        )
+
+        with patch.object(sandy.subprocess, "run", side_effect=error):
+            with captured_output() as (stdout, _):
+                self.assertFalse(network._ensure_gateway())
+
+        output = stdout.getvalue()
+        self.assertIn("'bad\\nforged'", output)
+        self.assertNotIn("bad\nforged", output)
+        self.assertNotIn("bad\\\\nforged", output)
 
         payload = json.dumps(
             [
@@ -2989,43 +4514,154 @@ class PortStateTests(unittest.TestCase):
     def test_port_mapping_lock_handles_missing_and_existing_files(self):
         instance = make_sandy()
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "ports.json"
+            state_path = Path(temp_dir) / "ports.json"
+            lock_path = Path(temp_dir) / "ports.lock"
+
+            def open_lock(_path):
+                return lock_path.open("a+", encoding="utf-8")
+
+            def open_state(_path):
+                try:
+                    return state_path.open("r", encoding="utf-8")
+                except FileNotFoundError:
+                    return None
+
             with patch.object(
                 instance,
                 "_get_port_mappings_path",
-                return_value=str(path),
+                return_value=str(state_path),
             ):
-                with instance._port_mapping_lock(exclusive=False) as handle:
-                    self.assertIsNone(handle)
+                with patch.object(
+                    instance,
+                    "_get_port_mappings_lock_path",
+                    return_value=str(lock_path),
+                ):
+                    with patch.object(instance, "_ensure_cache_dir"):
+                        with patch.object(
+                            sandy,
+                            "_open_stable_lock_file",
+                            side_effect=open_lock,
+                        ):
+                            with patch.object(
+                                sandy,
+                                "_open_existing_managed_text_file",
+                                side_effect=open_state,
+                            ):
+                                with instance._port_mapping_lock(
+                                    exclusive=False
+                                ) as handle:
+                                    self.assertIsNone(handle)
 
-                with patch.object(instance, "_ensure_cache_dir"):
-                    with instance._port_mapping_lock(
-                        exclusive=True,
-                        create=True,
-                    ) as handle:
-                        self.assertIsNotNone(handle)
-                        handle.write("{}")
-            self.assertEqual(path.read_text(), "{}")
+                                state_path.write_text("{}\n", encoding="utf-8")
+                                with instance._port_mapping_lock(
+                                    exclusive=True,
+                                ) as handle:
+                                    self.assertIsNotNone(handle)
+                                    self.assertEqual(handle.read(), "{}\n")
+            self.assertTrue(lock_path.is_file())
 
     def test_port_mapping_lock_tolerates_unlock_failure(self):
         instance = make_sandy()
-        handle = MagicMock()
-        handle.fileno.return_value = 10
-        opened = MagicMock(return_value=handle)
-        with patch.object(
-            instance,
-            "_get_port_mappings_path",
-            return_value="/cache/ports.json",
-        ):
-            with patch("builtins.open", opened):
+        lock_handle = MagicMock()
+        lock_handle.fileno.return_value = 10
+        state_handle = MagicMock()
+        with patch.object(instance, "_ensure_cache_dir"):
+            with patch.object(
+                sandy,
+                "_open_stable_lock_file",
+                return_value=lock_handle,
+            ):
                 with patch.object(
-                    sandy.fcntl,
-                    "flock",
-                    side_effect=[None, OSError("unlock failed")],
+                    sandy,
+                    "_open_existing_managed_text_file",
+                    return_value=state_handle,
                 ):
-                    with instance._port_mapping_lock(exclusive=False) as locked:
-                        self.assertIs(locked, handle)
-        handle.close.assert_called_once_with()
+                    with patch.object(
+                        sandy.fcntl,
+                        "flock",
+                        side_effect=[None, OSError("unlock failed")],
+                    ):
+                        with instance._port_mapping_lock(exclusive=False) as locked:
+                            self.assertIs(locked, state_handle)
+        state_handle.close.assert_called_once_with()
+        lock_handle.close.assert_called_once_with()
+
+    def test_port_mapping_waiter_reads_state_only_after_stable_lock(self):
+        instance = make_sandy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "ports.json"
+            lock_path = Path(temp_dir) / "ports.lock"
+            state_path.write_text("old\n", encoding="utf-8")
+            lock_path.touch()
+            original_lock_stat = lock_path.stat()
+
+            waiter_opened_lock = threading.Event()
+            waiter_acquired_lock = threading.Event()
+            waiter_result = []
+            waiter_errors = []
+            main_thread = threading.current_thread()
+
+            def open_lock(_path):
+                handle = lock_path.open("r+", encoding="utf-8")
+                if threading.current_thread() is not main_thread:
+                    waiter_opened_lock.set()
+                return handle
+
+            def open_state(_path):
+                return state_path.open("r", encoding="utf-8")
+
+            def wait_for_state():
+                try:
+                    with instance._port_mapping_lock(exclusive=True) as state_handle:
+                        waiter_acquired_lock.set()
+                        self.assertIsNotNone(state_handle)
+                        waiter_result.append(state_handle.read())
+                except BaseException as exc:
+                    waiter_errors.append(exc)
+
+            with patch.object(instance, "_ensure_cache_dir"):
+                with patch.object(
+                    instance,
+                    "_get_port_mappings_lock_path",
+                    return_value=str(lock_path),
+                ):
+                    with patch.object(
+                        instance,
+                        "_get_port_mappings_path",
+                        return_value=str(state_path),
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_open_stable_lock_file",
+                            side_effect=open_lock,
+                        ):
+                            with patch.object(
+                                sandy,
+                                "_open_existing_managed_text_file",
+                                side_effect=open_state,
+                            ):
+                                with instance._port_mapping_lock(exclusive=True):
+                                    waiter = threading.Thread(
+                                        target=wait_for_state,
+                                    )
+                                    waiter.start()
+                                    self.assertTrue(waiter_opened_lock.wait(timeout=2))
+                                    self.assertFalse(
+                                        waiter_acquired_lock.wait(timeout=0.05)
+                                    )
+                                    replacement = state_path.with_suffix(".new")
+                                    replacement.write_text(
+                                        "new\n",
+                                        encoding="utf-8",
+                                    )
+                                    os.replace(replacement, state_path)
+
+                                waiter.join(timeout=2)
+
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(waiter_errors, [])
+            self.assertEqual(waiter_result, ["new\n"])
+            self.assertTrue(sandy._same_inode(original_lock_stat, lock_path.stat()))
 
     def test_state_none_and_missing_unlink_are_safe(self):
         instance = make_sandy()
@@ -3130,62 +4766,28 @@ class PortStateTests(unittest.TestCase):
     def test_clear_port_mapping_state_is_locked(self):
         instance = make_sandy()
 
-        @contextmanager
-        def locked():
-            yield io.StringIO("{}")
+        for handle in (io.StringIO("{}"), None):
+            with self.subTest(handle=handle):
 
-        with patch.object(
-            instance,
-            "_get_port_mappings_path",
-            return_value="/cache/ports.json",
-        ):
-            with patch.object(sandy.os.path, "exists", return_value=True):
+                @contextmanager
+                def locked():
+                    yield handle
+
                 with patch.object(
                     instance,
                     "_port_mapping_lock",
                     return_value=locked(),
-                ):
-                    with patch.object(
-                        instance,
-                        "_persist_port_mapping_state",
-                    ) as persist:
-                        instance._clear_port_mapping_state()
-        persist.assert_called_once_with({})
-
-        with patch.object(
-            instance,
-            "_get_port_mappings_path",
-            return_value="/cache/ports.json",
-        ):
-            with patch.object(sandy.os.path, "exists", return_value=False):
-                with patch.object(
-                    instance,
-                    "_port_mapping_lock",
                 ) as lock:
-                    instance._clear_port_mapping_state()
-        lock.assert_not_called()
-
-        @contextmanager
-        def missing_handle():
-            yield None
-
-        with patch.object(
-            instance,
-            "_get_port_mappings_path",
-            return_value="/cache/ports.json",
-        ):
-            with patch.object(sandy.os.path, "exists", return_value=True):
-                with patch.object(
-                    instance,
-                    "_port_mapping_lock",
-                    return_value=missing_handle(),
-                ):
                     with patch.object(
                         instance,
                         "_persist_port_mapping_state",
                     ) as persist:
                         instance._clear_port_mapping_state()
-        persist.assert_not_called()
+                lock.assert_called_once_with(exclusive=True)
+                if handle is None:
+                    persist.assert_not_called()
+                else:
+                    persist.assert_called_once_with({})
 
     def test_update_empty_port_state_removes_own_stale_entries(self):
         instance = make_sandy()
@@ -3423,7 +5025,7 @@ class CacheTests(unittest.TestCase):
                             with patch.dict(sandy.os.environ, {}, clear=True):
                                 with captured_output():
                                     instance._build()
-        cached.assert_called_once_with("/cache/key.tar", "/machine")
+        cached.assert_called_once_with("/cache/key.tar", "/machine", None)
         fresh.assert_not_called()
 
     def test_build_can_disable_cache(self):
@@ -3437,7 +5039,7 @@ class CacheTests(unittest.TestCase):
                         clear=True,
                     ):
                         instance._build()
-        fresh.assert_called_once_with("/machine", False)
+        fresh.assert_called_once_with("/machine", False, None)
 
     def test_build_skips_existing_machine_and_uses_fresh_cache_miss(self):
         instance = make_sandy()
@@ -3468,7 +5070,7 @@ class CacheTests(unittest.TestCase):
                     ) as fresh:
                         with patch.dict(sandy.os.environ, {}, clear=True):
                             instance._build()
-        fresh.assert_called_once_with("/machine", True)
+        fresh.assert_called_once_with("/machine", True, None)
 
     def test_cache_path_combines_manifest_hash(self):
         instance = make_sandy()
@@ -3492,22 +5094,32 @@ class CacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = Path(temp_dir)
             state = cache / sandy.PORT_MAPPINGS_FILENAME
+            lock = cache / sandy.PORT_MAPPINGS_LOCK_FILENAME
             archive = cache / "cache.tar"
             directory = cache / "partial"
+            state_alias = cache / "state-alias"
+            directory_alias = cache / "directory-alias"
             state.write_text("{}")
+            lock.write_text("")
             archive.write_text("archive")
             directory.mkdir()
             (directory / "file").write_text("partial")
+            state_alias.symlink_to(state)
+            directory_alias.symlink_to(directory, target_is_directory=True)
             with patch.object(instance, "_get_cache_dir", return_value=temp_dir):
                 with patch.object(
                     instance,
                     "_get_port_mappings_path",
                     return_value=str(state),
                 ):
-                    with patch.object(sandy, "_rmtree") as rmtree:
+                    with patch.object(sandy, "_remove_managed_tree") as rmtree:
                         self.assertTrue(instance._clear_cache_contents())
             self.assertTrue(state.exists())
+            self.assertTrue(lock.exists())
             self.assertFalse(archive.exists())
+            self.assertFalse(state_alias.exists())
+            self.assertFalse(directory_alias.exists())
+            self.assertTrue(directory.exists())
             rmtree.assert_called_once_with(str(directory))
 
     def test_create_cache_writes_manifest_and_hardened_tar_command(self):
@@ -3612,8 +5224,8 @@ class CacheTests(unittest.TestCase):
                         return_value=["vanished"],
                     ):
                         with patch.object(
-                            sandy.os.path,
-                            "samefile",
+                            sandy.os,
+                            "lstat",
                             side_effect=FileNotFoundError,
                         ):
                             self.assertFalse(instance._clear_cache_contents())
@@ -3623,25 +5235,37 @@ class CacheTests(unittest.TestCase):
         instance.network = make_network()
         instance.network._ensure_gateway = MagicMock(return_value=True)
         success = SimpleNamespace(returncode=0)
-        with patch.object(sandy, "_verify_safe_dir") as verify:
-            with patch.object(sandy, "_mkdir") as mkdir:
-                with patch.object(
-                    sandy,
-                    "_run_secure_subprocess",
-                    return_value=success,
-                ) as run:
-                    with patch.object(sandy, "_create_guest_files") as guest:
-                        with captured_output():
-                            instance._new_machine_from_cache(
-                                "/cache/key.tar",
-                                "/machine",
-                            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+            with patch.object(sandy, "_verify_safe_dir") as verify:
+                with patch.object(sandy, "_mkdir") as mkdir:
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        return_value=machine_fd,
+                    ) as open_dir:
+                        with patch.object(
+                            sandy,
+                            "_run_secure_subprocess",
+                            return_value=success,
+                        ) as run:
+                            with patch.object(sandy, "_create_guest_files") as guest:
+                                with captured_output():
+                                    instance._new_machine_from_cache(
+                                        "/cache/key.tar",
+                                        "/machine",
+                                    )
 
         verify.assert_called_once_with("/cache")
         mkdir.assert_called_once_with("/machine")
+        open_dir.assert_called_once_with("/machine")
         self.assertEqual(run.call_count, 2)
         extract = run.call_args_list[0].args[0]
         self.assertEqual(extract[:4], ["tar", "--extract", "--file", "/cache/key.tar"])
+        machine_id = run.call_args_list[1]
+        self.assertEqual(machine_id.args[0][0], "systemd-machine-id-setup")
+        self.assertRegex(machine_id.args[0][1], r"^--root=/proc/self/fd/[0-9]+$")
+        self.assertEqual(len(machine_id.kwargs["pass_fds"]), 1)
         guest.assert_called_once_with(
             "/machine",
             "ai-dev",
@@ -3677,45 +5301,59 @@ class CacheTests(unittest.TestCase):
             "_run_secure_subprocess",
             return_value=success,
         ) as run:
-            with patch.object(sandy, "_verify_safe_dir") as verify:
-                with patch.object(
-                    sandy.os.path,
-                    "exists",
-                    return_value=False,
-                ):
-                    with patch(
-                        "builtins.open",
-                        mock_open(read_data=setup_content),
-                    ):
-                        with patch.object(sandy, "_write") as write:
-                            with patch.object(
-                                sandy,
-                                "_create_guest_files",
-                            ) as guest:
-                                with patch.object(
-                                    instance,
-                                    "_create_cache",
-                                ) as create_cache:
-                                    with captured_output():
-                                        instance._new_machine_from_scratch(
-                                            "/machine",
-                                            cache_enabled=True,
-                                        )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                machine_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+                with patch.object(sandy, "_verify_safe_dir") as verify:
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        return_value=machine_fd,
+                    ) as open_dir:
+                        with patch.object(
+                            sandy.os.path,
+                            "exists",
+                            return_value=False,
+                        ):
+                            with patch(
+                                "builtins.open",
+                                mock_open(read_data=setup_content),
+                            ):
+                                with patch.object(sandy, "_write") as write:
+                                    with patch.object(
+                                        sandy,
+                                        "_create_guest_files",
+                                    ) as guest:
+                                        with patch.object(
+                                            instance,
+                                            "_create_cache",
+                                        ) as create_cache:
+                                            with captured_output():
+                                                instance._new_machine_from_scratch(
+                                                    "/machine",
+                                                    cache_enabled=True,
+                                                )
 
         self.assertEqual(
             run.call_args_list[0].args[0],
             [instance.bootstrap_script, "/machine", instance.base_image],
         )
         verify.assert_called_once_with("/machine")
+        open_dir.assert_called_once_with("/machine")
         written_content = write.call_args.args[1]
         self.assertIn("user=developer", written_content)
         self.assertNotIn("%%MACHINE_USER%%", written_content)
+        machine_id = run.call_args_list[1]
+        self.assertEqual(machine_id.args[0][0], "systemd-machine-id-setup")
+        self.assertRegex(machine_id.args[0][1], r"^--root=/proc/self/fd/[0-9]+$")
+        self.assertEqual(len(machine_id.kwargs["pass_fds"]), 1)
         setup_call = run.call_args_list[2]
         self.assertEqual(setup_call.args[0][0], "systemd-nspawn")
+        self.assertRegex(setup_call.args[0][1], r"^--directory=/proc/self/fd/[0-9]+$")
         self.assertEqual(
             setup_call.kwargs["env"],
             sandy._container_environment("root", "/root"),
         )
+        self.assertEqual(len(setup_call.kwargs["pass_fds"]), 1)
         guest.assert_called_once_with(
             "/machine",
             "ai-dev",
@@ -3746,50 +5384,74 @@ class CacheTests(unittest.TestCase):
             "_run_secure_subprocess",
             return_value=success,
         ) as run:
-            with patch.object(sandy, "_verify_safe_dir"):
-                with patch.object(sandy.os.path, "exists", return_value=True):
-                    with patch.object(sandy, "_write") as write:
-                        with captured_output():
-                            instance._new_machine_from_scratch("/machine")
+            with tempfile.TemporaryDirectory() as temp_dir:
+                machine_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+                with patch.object(sandy, "_verify_safe_dir"):
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        return_value=machine_fd,
+                    ):
+                        with patch.object(sandy.os.path, "exists", return_value=True):
+                            with patch.object(sandy, "_write") as write:
+                                with captured_output():
+                                    instance._new_machine_from_scratch("/machine")
         self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[1].args[0][0], "systemd-machine-id-setup")
+        self.assertRegex(run.call_args_list[1].args[0][1], r"^--root=/proc/self/fd/")
         write.assert_not_called()
 
     def test_purge_cache_all_outcomes(self):
         instance = make_sandy()
         cases = (
-            (False, False, False, "No cache directory"),
-            (True, True, True, "except port mapping state"),
-            (True, False, False, "Purged cache directory"),
-            (True, False, True, "retained only port mapping state"),
+            (False, False, "No cache directory"),
+            (
+                True,
+                True,
+                "except port mapping coordination state",
+            ),
+            (
+                True,
+                False,
+                "retained only port mapping coordination state",
+            ),
         )
-        for cache_exists, removed, state_exists, message in cases:
+        for cache_exists, removed, message in cases:
             with self.subTest(message=message):
+
+                @contextmanager
+                def locked():
+                    yield None
+
                 with patch.object(
                     instance,
                     "_get_cache_dir",
                     return_value="/cache",
                 ):
                     with patch.object(
-                        instance,
-                        "_get_port_mappings_path",
-                        return_value="/cache/ports.json",
+                        sandy.os.path,
+                        "exists",
+                        return_value=cache_exists,
                     ):
                         with patch.object(
-                            sandy.os.path,
-                            "exists",
-                            side_effect=[cache_exists, state_exists],
-                        ):
+                            instance,
+                            "_port_mapping_lock",
+                            return_value=locked(),
+                        ) as lock:
                             with patch.object(
                                 instance,
                                 "_clear_cache_contents",
                                 return_value=removed,
-                            ):
-                                with patch.object(sandy, "_rmtree") as rmtree:
-                                    with captured_output() as (stdout, _):
-                                        instance._purge_cache()
+                            ) as clear:
+                                with captured_output() as (stdout, _):
+                                    instance._purge_cache()
                 self.assertIn(message, stdout.getvalue())
-                if cache_exists and not removed and not state_exists:
-                    rmtree.assert_called_once_with("/cache")
+                if cache_exists:
+                    lock.assert_called_once_with(exclusive=True)
+                    clear.assert_called_once_with(preserve_state=True)
+                else:
+                    lock.assert_not_called()
+                    clear.assert_not_called()
 
 
 class ExecutionTests(unittest.TestCase):
@@ -3904,9 +5566,10 @@ class ExecutionTests(unittest.TestCase):
         instance = make_sandy()
         spinner = threading.Event()
 
-        def run_pty(command, *, master_read, stdin_read, environment):
+        def run_pty(command, *, master_read, stdin_read, environment, pass_fds):
             self.assertEqual(command, ["tool"])
             self.assertEqual(environment, {"PATH": sandy.CONTAINER_PATH})
+            self.assertEqual(pass_fds, ())
             with patch.object(sandy.os, "read", return_value=b"output"):
                 self.assertEqual(master_read(10), b"output")
                 self.assertEqual(stdin_read(0), b"output")
@@ -3945,16 +5608,72 @@ class ExecutionTests(unittest.TestCase):
                     self.assertTrue(instance._wait_for_container_ready())
         sleep.assert_called_once_with(1)
 
+    def test_wait_for_container_ready_times_out_without_running_machine(self):
+        instance = make_sandy()
+        with patch.object(instance, "_is_container_running", return_value=None):
+            with patch.object(sandy, "_run_secure_subprocess") as run:
+                with patch("time.monotonic", side_effect=[0, 0, 1]):
+                    with patch("time.sleep") as sleep:
+                        self.assertFalse(instance._wait_for_container_ready(timeout=1))
+        run.assert_not_called()
+        sleep.assert_not_called()
+
     def test_get_container_ip(self):
         instance = make_sandy()
         with tempfile.TemporaryDirectory() as temp_dir:
             init_script = Path(temp_dir) / "init.sh"
             init_script.write_text('CONTAINER_IP="10.20.30.10"\n')
+            init_script.chmod(0o644)
+
+            def open_machine(path):
+                return os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+
             with patch.object(instance, "_get_machine_dir", return_value=temp_dir):
-                self.assertEqual(instance._get_container_ip(), "10.20.30.10")
+                with patch.object(
+                    sandy,
+                    "_open_verified_dir",
+                    side_effect=open_machine,
+                ):
+                    self.assertEqual(instance._get_container_ip(), "10.20.30.10")
             init_script.write_text("no address")
+            init_script.chmod(0o644)
             with patch.object(instance, "_get_machine_dir", return_value=temp_dir):
-                self.assertIsNone(instance._get_container_ip())
+                with patch.object(
+                    sandy,
+                    "_open_verified_dir",
+                    side_effect=open_machine,
+                ):
+                    self.assertIsNone(instance._get_container_ip())
+
+    def test_get_container_ip_rejects_oversized_invalid_and_out_of_network_init(self):
+        instance = make_sandy()
+        instance.network = make_network()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            init_script = Path(temp_dir) / "init.sh"
+
+            def open_machine(path):
+                return os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+
+            cases = (
+                ('CONTAINER_IP="999.1.1.1"\n', "invalid IP"),
+                ('CONTAINER_IP="10.20.30.10"\n', "outside the Sandy network"),
+                ("#" * (sandy.INIT_SCRIPT_MAX_BYTES + 1), "too large"),
+            )
+            for content, expected in cases:
+                with self.subTest(expected=expected):
+                    init_script.write_text(content, encoding="utf-8")
+                    init_script.chmod(0o644)
+                    with patch.object(
+                        instance, "_get_machine_dir", return_value=temp_dir
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_open_verified_dir",
+                            side_effect=open_machine,
+                        ):
+                            with captured_output() as (stdout, _):
+                                self.assertIsNone(instance._get_container_ip())
+                    self.assertIn(expected, stdout.getvalue())
 
     def test_run_init_script_conditions_and_success(self):
         instance = make_sandy()
@@ -3975,7 +5694,7 @@ class ExecutionTests(unittest.TestCase):
                     ) as execute:
                         with captured_output():
                             self.assertTrue(instance._run_init_script())
-        execute.assert_called_once_with("/init.sh")
+        execute.assert_called_once_with("/bin/sh /init.sh")
 
     def test_spinner_finishes_once_with_optional_suffix(self):
         event = threading.Event()
@@ -4004,8 +5723,9 @@ class ExecutionTests(unittest.TestCase):
         instance = make_sandy()
         spinner = threading.Event()
 
-        def run_pty(_command, *, master_read, stdin_read, environment):
+        def run_pty(_command, *, master_read, stdin_read, environment, pass_fds):
             self.assertEqual(environment, {"PATH": sandy.CONTAINER_PATH})
+            self.assertEqual(pass_fds, ())
             with patch.object(sandy.os, "read", side_effect=OSError):
                 self.assertEqual(master_read(10), b"")
                 self.assertEqual(stdin_read(0), b"")
@@ -4063,16 +5783,19 @@ class ExecutionTests(unittest.TestCase):
             "_get_machine_dir",
             return_value="/machine",
         ):
-            with patch.object(sandy.os.path, "exists", return_value=False):
-                self.assertIsNone(instance._get_container_ip())
+            with patch.object(
+                sandy, "_open_verified_dir", side_effect=FileNotFoundError
+            ):
+                with captured_output() as (stdout, _):
+                    self.assertIsNone(instance._get_container_ip())
 
-            with patch.object(sandy.os.path, "exists", return_value=True):
-                with patch(
-                    "builtins.open",
-                    side_effect=OSError("denied"),
-                ):
-                    with captured_output() as (stdout, _):
-                        self.assertIsNone(instance._get_container_ip())
+            with patch.object(
+                sandy,
+                "_open_verified_dir",
+                side_effect=PermissionError("denied"),
+            ):
+                with captured_output() as (stdout, _):
+                    self.assertIsNone(instance._get_container_ip())
         self.assertIn("Could not read container IP", stdout.getvalue())
 
     def test_run_init_script_skips_or_reports_readiness_failure(self):
@@ -4128,6 +5851,9 @@ class PortForwardingTests(unittest.TestCase):
         instance = make_sandy()
         instance.port_mappings = [("tcp", 8080, 80)]
         instance.network = make_network()
+        instance.network.network = "10.20.30.0"
+        instance.network.network_cidr = "10.20.30.0/24"
+        instance.network.gateway = "10.20.30.1"
         instance.network.firewall_backend = backend
         instance.network._ensure_gateway = MagicMock(return_value=True)
         instance.network._run_iptables = MagicMock(return_value=True)
@@ -4154,6 +5880,18 @@ class PortForwardingTests(unittest.TestCase):
                             instance._setup_port_forwarding_rules()
                 update.assert_called_once_with("ai-dev", "10.20.30.10")
                 setup.assert_called_once_with("10.20.30.10")
+
+        instance = self.configured_instance()
+        with patch.object(instance, "_get_container_ip") as get_ip:
+            with patch.object(
+                instance,
+                "_update_port_mapping_state",
+            ) as update:
+                with patch.object(instance, "_setup_port_forwarding_ipt") as setup:
+                    instance._setup_port_forwarding_rules("10.20.30.10")
+        get_ip.assert_not_called()
+        update.assert_called_once_with("ai-dev", "10.20.30.10")
+        setup.assert_called_once_with("10.20.30.10")
 
     def test_iptables_setup_and_cleanup_create_five_rules(self):
         instance = self.configured_instance()
@@ -4235,6 +5973,15 @@ class PortForwardingTests(unittest.TestCase):
             with captured_output() as (stdout, _):
                 instance._setup_port_forwarding_rules()
         self.assertIn("Could not determine container IP", stdout.getvalue())
+
+        with patch.object(instance, "_get_container_ip") as get_ip:
+            with captured_output() as (stdout, _):
+                instance._setup_port_forwarding_rules(None)
+        get_ip.assert_not_called()
+        self.assertIn("Could not determine container IP", stdout.getvalue())
+
+        with self.assertRaisesRegex(ValueError, "Container IP override"):
+            instance._setup_port_forwarding_rules(object())
 
     def test_forwarding_without_backend_persists_but_skips_rules(self):
         instance = self.configured_instance()
@@ -4385,6 +6132,7 @@ class CommandMethodTests(unittest.TestCase):
         instance = make_sandy()
         paths = [
             "/var/lib/machines/sandy.zed",
+            "/var/lib/machines/sandy.bad\n\x1b[31m",
             "/var/lib/machines/sandy.alpha",
             "/var/lib/machines/sandy.__cache",
         ]
@@ -4405,6 +6153,7 @@ class CommandMethodTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("alpha", output)
         self.assertIn("running", output)
+        self.assertNotIn("\x1b", output)
         self.assertLess(output.index("alpha"), output.index("zed"))
 
     def test_down_powers_off(self):
@@ -4419,16 +6168,72 @@ class RemovalTests(unittest.TestCase):
         instance = make_sandy()
         path = "/var/lib/machines/sandy.test"
         with patch.object(instance, "_confirm", return_value=False):
-            with patch.object(sandy, "_rmtree") as rmtree:
+            with patch.object(sandy, "_remove_managed_tree") as rmtree:
                 with captured_output():
                     instance._remove_machine_dir(path)
         rmtree.assert_not_called()
 
         with patch.object(instance, "_confirm", return_value=True):
-            with patch.object(sandy, "_rmtree") as rmtree:
+            with patch.object(sandy, "_remove_managed_tree") as rmtree:
                 with captured_output():
                     instance._remove_machine_dir(path)
         rmtree.assert_called_once_with(path)
+
+    def test_remove_machine_dir_rejects_invalid_name_before_display(self):
+        instance = make_sandy()
+        path = "/var/lib/machines/sandy.bad\n\x1b[31m"
+
+        with patch.object(instance, "_confirm") as confirm:
+            with patch.object(sandy, "_remove_managed_tree") as remove:
+                with captured_output() as (stdout, _):
+                    instance._remove_machine_dir(path)
+
+        output = stdout.getvalue().rstrip("\n")
+        confirm.assert_not_called()
+        remove.assert_not_called()
+        self.assertFalse(sandy._contains_control_character(output))
+        self.assertNotIn(path, output)
+        self.assertIn("sandy.bad\\n\\x1b[31m", output)
+
+    def test_rm_all_skips_invalid_filesystem_names_before_display(self):
+        instance = make_sandy()
+        invalid_path = "/var/lib/machines/sandy.bad\n\x1b[31m"
+        valid_path = "/var/lib/machines/sandy.valid"
+        args = SimpleNamespace(container=None, force=True)
+
+        with patch.object(sandy.os.path, "exists", return_value=True):
+            with patch.object(
+                instance,
+                "_get_cache_dir",
+                return_value="/var/lib/machines/sandy.__cache",
+            ):
+                with patch.object(
+                    sandy.glob,
+                    "glob",
+                    return_value=[invalid_path, valid_path],
+                ):
+                    with patch.object(
+                        instance,
+                        "_is_container_running",
+                        return_value=None,
+                    ) as running:
+                        with patch.object(
+                            instance,
+                            "_cleanup_port_mappings_for_container",
+                        ) as cleanup:
+                            with patch.object(
+                                instance, "_remove_machine_dir"
+                            ) as remove:
+                                with captured_output() as (stdout, _):
+                                    instance.run_rm(args, all=True)
+
+        output = stdout.getvalue().rstrip("\n")
+        self.assertFalse(sandy._contains_control_character(output))
+        self.assertNotIn(invalid_path, output)
+        self.assertIn("sandy.bad\\n\\x1b[31m", output)
+        running.assert_called_once_with("valid")
+        cleanup.assert_called_once_with("valid")
+        remove.assert_called_once_with(valid_path, prompt=False)
 
     def test_rm_rejects_incompatible_cache_options(self):
         instance = make_sandy()
@@ -4687,6 +6492,18 @@ class RemovalTests(unittest.TestCase):
 
 
 class RunUpTests(unittest.TestCase):
+    def setUp(self):
+        def open_runtime_machine(path):
+            return os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+
+        verifier = patch.object(
+            sandy,
+            "_open_verified_dir",
+            side_effect=open_runtime_machine,
+        )
+        verifier.start()
+        self.addCleanup(verifier.stop)
+
     def arguments(self, **overrides):
         values = {
             "ports": None,
@@ -4757,10 +6574,12 @@ class RunUpTests(unittest.TestCase):
         self.assertTrue(
             any(argument.startswith("--system-call-filter=") for argument in command)
         )
+        self.assertRegex(command[1], r"^--directory=/proc/self/fd/[0-9]+$")
         self.assertFalse(
             any(argument.startswith("--network-bridge=") for argument in command)
         )
         self.assertEqual(popen.call_args.kwargs["start_new_session"], True)
+        self.assertEqual(len(popen.call_args.kwargs["pass_fds"]), 1)
         environment = popen.call_args.kwargs["env"]
         self.assertEqual(environment["HOME"], "/home/developer")
         self.assertEqual(environment["USER"], "developer")
@@ -4799,7 +6618,7 @@ class RunUpTests(unittest.TestCase):
                                     instance.run_up(args)
 
         self.assertEqual(instance.port_mappings, [("tcp", 8080, 80)])
-        forwarding.assert_called_once_with()
+        forwarding.assert_called_once_with(None)
         command = popen.call_args.args[0]
         self.assertIn("--network-bridge=sandybr0", command)
         self.assertNotIn("--ephemeral", command)
@@ -4824,7 +6643,9 @@ class RunUpTests(unittest.TestCase):
             host_shared.mkdir()
             (container_home / "workspace").mkdir(parents=True)
             (container_home / "shared").mkdir()
-            (machine / "init.sh").write_text("#!/bin/sh\n")
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+            init_script.chmod(0o644)
             instance.workspace = str(host_workspace)
             instance.shared = str(host_shared)
 
@@ -4861,13 +6682,17 @@ class RunUpTests(unittest.TestCase):
                                                 "machine",
                                                 return_value="unknown-cpu",
                                             ):
-                                                with captured_output() as (
-                                                    stdout,
-                                                    _,
-                                                ):
-                                                    instance.run_up(args)
+                                                with patch.object(
+                                                    sandy.os,
+                                                    "fchown",
+                                                ) as fchown:
+                                                    with captured_output() as (
+                                                        stdout,
+                                                        _,
+                                                    ):
+                                                        instance.run_up(args)
 
-        setup_forwarding.assert_called_once_with()
+        setup_forwarding.assert_called_once_with("10.200.1.10")
         self.assertEqual(setfacl.call_count, 2)
         init.assert_called_once()
         cleanup.assert_called_once_with()
@@ -4875,6 +6700,11 @@ class RunUpTests(unittest.TestCase):
         self.assertEqual(
             remove_state.call_args_list,
             [call("ai-dev"), call("ai-dev")],
+        )
+        fchown.assert_called_once()
+        self.assertEqual(
+            fchown.call_args.args[1:],
+            (sandy.CONTAINER_BASE_UID, sandy.CONTAINER_BASE_UID),
         )
         command = interactive.call_args.args[0]
         environment = interactive.call_args.kwargs["environment"]
@@ -4894,11 +6724,115 @@ class RunUpTests(unittest.TestCase):
             command,
         )
         self.assertIn("--chdir=/home/developer/workspace", command)
-        self.assertIn(
-            f"--bind-ro={machine}/init.sh:/init.sh",
-            command,
+        self.assertRegex(command[1], r"^--directory=/proc/self/fd/[0-9]+$")
+        bind_ro = [
+            argument for argument in command if argument.startswith("--bind-ro=")
+        ]
+        self.assertEqual(len(bind_ro), 1)
+        self.assertTrue(
+            bind_ro[0].startswith(f"--bind-ro={tempfile.gettempdir()}/sandy-init-")
         )
+        self.assertTrue(bind_ro[0].endswith("/init.sh:/init.sh"))
+        bind_source = bind_ro[0].removeprefix("--bind-ro=").split(":", 1)[0]
+        self.assertFalse(Path(bind_source).parent.exists())
+        self.assertEqual(len(interactive.call_args.kwargs["pass_fds"]), 1)
         self.assertIn("unknown architecture", stdout.getvalue())
+
+    def test_modern_init_bind_uses_idmapped_read_only_mount(self):
+        instance = make_sandy()
+        instance.workspace = None
+        args = self.arguments(network="host", persistent=True)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+            init_script.chmod(0o644)
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(instance, "_remove_port_mappings_from_state"):
+                    with patch.object(
+                        instance,
+                        "_get_machine_dir",
+                        return_value=str(machine),
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_run_secure_subprocess_popen",
+                        ) as popen:
+                            with patch.object(
+                                instance,
+                                "_run_init_script",
+                                return_value=False,
+                            ):
+                                with captured_output():
+                                    instance.run_up(args)
+
+        command = popen.call_args.args[0]
+        bind_ro = [
+            argument for argument in command if argument.startswith("--bind-ro=")
+        ]
+        self.assertEqual(len(bind_ro), 1)
+        self.assertTrue(bind_ro[0].endswith("/init.sh:/init.sh:idmap"))
+
+    def test_init_bind_copy_is_cleaned_after_prelaunch_failure(self):
+        instance = make_sandy()
+        instance.workspace = None
+        created_dirs = []
+        opened_fds = []
+        real_create_init_bind_copy = sandy._create_init_bind_copy
+
+        def open_machine(path):
+            machine_fd = os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+            opened_fds.append(machine_fd)
+            return machine_fd
+
+        def create_init_bind_copy(*args, **kwargs):
+            result = real_create_init_bind_copy(*args, **kwargs)
+            created_dirs.append(result[0])
+            return result
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+            init_script.chmod(0o644)
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value=str(machine),
+                ):
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        side_effect=open_machine,
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_create_init_bind_copy",
+                            side_effect=create_init_bind_copy,
+                        ):
+                            with patch.object(
+                                instance,
+                                "_remove_port_mappings_from_state",
+                                side_effect=RuntimeError("port state failure"),
+                            ):
+                                with self.assertRaisesRegex(
+                                    RuntimeError,
+                                    "port state failure",
+                                ):
+                                    with captured_output():
+                                        instance.run_up(
+                                            self.arguments(
+                                                network="host",
+                                                persistent=True,
+                                            )
+                                        )
+
+        self.assertEqual(len(created_dirs), 1)
+        self.assertFalse(Path(created_dirs[0]).exists())
+        self.assertEqual(len(opened_fds), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened_fds[0])
 
     def test_mount_validation_skips_missing_host_and_container_paths(self):
         instance = make_sandy()
@@ -4956,7 +6890,258 @@ class RunUpTests(unittest.TestCase):
                             with captured_output():
                                 with self.assertRaises(SystemExit):
                                     instance.run_up(self.arguments(build=True))
-        build.assert_called_once_with()
+        build.assert_called_once_with(None)
+
+    def test_lenient_build_plans_network_and_configures_after_validation(self):
+        instance = make_sandy()
+        instance.workspace = None
+        configured = make_network()
+        planned = ("10.200.1.0", "10.200.1.0/24", "10.200.1.1")
+        guest_network = ("10.200.1.0/24", "10.200.1.1")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir) / "machine"
+
+            def build(planned_guest_network):
+                self.assertIsNone(instance.network)
+                self.assertEqual(planned_guest_network, guest_network)
+                machine.mkdir()
+
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(instance, "_remove_port_mappings_from_state"):
+                    with patch.object(
+                        sandy,
+                        "SandyNet",
+                        return_value=configured,
+                    ) as network_type:
+                        network_type.preview_bridge_network.return_value = (
+                            guest_network,
+                            planned,
+                        )
+                        with patch.object(
+                            instance, "_build", side_effect=build
+                        ) as build:
+                            with patch.object(
+                                instance,
+                                "_get_machine_dir",
+                                return_value=str(machine),
+                            ):
+                                with patch.object(
+                                    sandy, "_run_secure_subprocess_popen"
+                                ):
+                                    with patch.object(
+                                        instance,
+                                        "_run_init_script",
+                                        return_value=False,
+                                    ):
+                                        with captured_output():
+                                            instance.run_up(
+                                                self.arguments(
+                                                    build=True,
+                                                    network="lenient",
+                                                )
+                                            )
+
+        network_type.preview_bridge_network.assert_called_once_with()
+        network_type.assert_called_once_with(planned)
+        build.assert_called_once_with(guest_network)
+
+    def test_lenient_build_existing_unsafe_image_rejects_before_network(self):
+        instance = make_sandy()
+        instance.workspace = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir) / "machine"
+            machine.mkdir()
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value=str(machine),
+                ):
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        side_effect=PermissionError("unsafe image"),
+                    ):
+                        with patch.object(sandy, "SandyNet") as network_type:
+                            with patch.object(
+                                sandy,
+                                "_run_secure_subprocess_popen",
+                            ) as popen:
+                                with captured_output() as (stdout, _):
+                                    with self.assertRaises(SystemExit):
+                                        instance.run_up(
+                                            self.arguments(
+                                                build=True,
+                                                network="lenient",
+                                            )
+                                        )
+
+        network_type.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("Unsafe machine image", stdout.getvalue())
+
+    def test_rejects_unsafe_machine_image_before_start(self):
+        instance = make_sandy()
+        instance.workspace = None
+        with patch.object(instance, "_is_container_running", return_value=None):
+            with patch.object(instance, "_remove_port_mappings_from_state"):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value="/var/lib/machines/sandy.ai-dev",
+                ):
+                    with patch.object(
+                        sandy,
+                        "_open_verified_dir",
+                        side_effect=PermissionError(
+                            "Machine image symlink targets the managed root"
+                        ),
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_run_secure_subprocess_popen",
+                        ) as popen:
+                            with captured_output() as (stdout, _):
+                                with self.assertRaises(SystemExit):
+                                    instance.run_up(self.arguments())
+
+        popen.assert_not_called()
+        self.assertIn("Unsafe machine image", stdout.getvalue())
+
+    def test_rejects_init_script_symlink_before_start(self):
+        instance = make_sandy()
+        instance.workspace = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            (machine / "init.sh").symlink_to("/etc/passwd")
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(instance, "_remove_port_mappings_from_state"):
+                    with patch.object(
+                        instance,
+                        "_get_machine_dir",
+                        return_value=str(machine),
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_run_secure_subprocess_popen",
+                        ) as popen:
+                            with captured_output() as (stdout, _):
+                                with self.assertRaises(SystemExit):
+                                    instance.run_up(self.arguments())
+
+        popen.assert_not_called()
+        self.assertIn("Unsafe machine image /init.sh", stdout.getvalue())
+
+    def test_rejects_invalid_init_content_before_network_setup(self):
+        instance = make_sandy()
+        instance.workspace = None
+        args = self.arguments(network="lenient")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="999.1.1.1"\n', encoding="utf-8")
+            init_script.chmod(0o644)
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value=str(machine),
+                ):
+                    with patch.object(
+                        sandy.SandyNet,
+                        "preview_bridge_network",
+                    ) as preview:
+                        with patch.object(
+                            sandy.SandyNet,
+                            "__init__",
+                            return_value=None,
+                        ) as network_init:
+                            with patch.object(
+                                sandy,
+                                "_run_secure_subprocess_popen",
+                            ) as popen:
+                                with captured_output() as (stdout, _):
+                                    with self.assertRaises(SystemExit):
+                                        instance.run_up(args)
+
+        preview.assert_not_called()
+        network_init.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("Unsafe machine image /init.sh", stdout.getvalue())
+
+    def test_rejects_out_of_network_init_before_network_setup(self):
+        instance = make_sandy()
+        instance.workspace = None
+        args = self.arguments(network="lenient")
+        planned_network = ("10.200.1.0", "10.200.1.0/24", "10.200.1.1")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="10.20.30.10"\n', encoding="utf-8")
+            init_script.chmod(0o644)
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value=str(machine),
+                ):
+                    with patch.object(
+                        sandy.SandyNet,
+                        "preview_bridge_network",
+                        return_value=(("10.200.1.0/24", "10.200.1.1"), planned_network),
+                    ) as preview:
+                        with patch.object(
+                            sandy.SandyNet,
+                            "__init__",
+                            return_value=None,
+                        ) as network_init:
+                            with patch.object(
+                                sandy,
+                                "_run_secure_subprocess_popen",
+                            ) as popen:
+                                with captured_output() as (stdout, _):
+                                    with self.assertRaises(SystemExit):
+                                        instance.run_up(args)
+
+        preview.assert_called_once_with()
+        network_init.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("outside the Sandy network", stdout.getvalue())
+
+    def test_rejects_invalid_init_ip_before_port_forwarding_setup(self):
+        instance = make_sandy()
+        instance.workspace = None
+        instance.network = make_network()
+        args = self.arguments(
+            network="lenient",
+            ports=["tcp:8080:80"],
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            init_script = machine / "init.sh"
+            init_script.write_text('CONTAINER_IP="10.20.30.10"\n', encoding="utf-8")
+            init_script.chmod(0o644)
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(
+                    instance,
+                    "_get_machine_dir",
+                    return_value=str(machine),
+                ):
+                    with patch.object(
+                        instance,
+                        "_setup_port_forwarding_rules",
+                    ) as setup_forwarding:
+                        with patch.object(
+                            sandy,
+                            "_run_secure_subprocess_popen",
+                        ) as popen:
+                            with captured_output() as (stdout, _):
+                                with self.assertRaises(SystemExit):
+                                    instance.run_up(args)
+
+        setup_forwarding.assert_not_called()
+        popen.assert_not_called()
+        self.assertIn("Unsafe machine image /init.sh", stdout.getvalue())
 
     def test_lenient_network_is_constructed_and_detach_waits(self):
         instance = make_sandy()
