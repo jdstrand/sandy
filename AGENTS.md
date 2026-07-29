@@ -66,12 +66,17 @@ Use `_run_secure_subprocess`, `_run_secure_subprocess_popen`, or
 
 ### Filesystem and Deletion Safety
 
-Use `_verify_safe_dir`, `_rmtree`, `_mkdir`, and `_write` for managed host
-paths.
+Use `_verify_safe_dir`, `_remove_managed_tree`, `_mkdir`, and `_write` for
+managed host paths.
 
 * Never derive a host path directly from unvalidated CLI or environment input.
-* Reject traversal, unexpected absolute paths, symlinks, ownership changes,
-  unsafe permissions, inode mismatches, and non-directory components.
+* Reject traversal, unexpected absolute paths, magic links, ownership changes,
+  unsafe permissions, inode mismatches, and non-directory components. Treat
+  symlinks as untrusted by default. Permit systemd's documented root-owned,
+  administrator-controlled top-level machine-image links and ordinary
+  image-internal symlinks only through descriptor-anchored resolution that pins
+  the image root and prevents escape. Removing a top-level image link must
+  unlink the reference without recursively deleting its external target.
 * Never delete the managed root or anything outside the expected
   `/var/lib/machines/sandy.*` scope.
 * Verify the exact target immediately before destructive operations and account
@@ -99,6 +104,9 @@ Preserve equivalent documented isolation for iptables and nftables.
 
 * On every load, discard unknown, derived, or invalid state fields. Preserve
   locking and atomic updates.
+* Lock mutable state through a dedicated stable inode. Acquire that lock before
+  opening the current state file, and never replace or remove the lock inode
+  during atomic state replacement or cache cleanup.
 * Sanitize untrusted terminal and log output with the existing sanitizer.
 * Do not log control characters, credentials, tokens, private keys, or
   unnecessary host details.
@@ -131,12 +139,21 @@ Unit tests must run unprivileged without Sandy runtime tools.
   firewalls, and timing.
 * Mock `subprocess.run` or `subprocess.Popen` directly only in wrapper tests;
   elsewhere, mock Sandy's wrapper boundary.
+* For each security property, identify which parts unit tests replace with
+  mocks. When correctness depends on real root privileges, kernel filesystem or
+  namespace semantics, mounts, systemd, networking, firewall behavior, or
+  external-tool integration, add a focused E2E case in a disposable VM. Unit
+  mocks remain useful for deterministic failure paths, but are not sufficient
+  evidence for behavior they cannot exercise.
 * Assert exact arguments, ordering, rollback, cleanup, and error paths. Cover
   malformed input, boundaries, partial failure, conflicts, and repeated
   cleanup.
 * Add a regression test for each bug fix.
-* Maintain the configured 95 percent combined branch and statement coverage;
-  do not add low-value tests solely to reach 100 percent.
+* Treat the configured 95 percent combined branch and statement coverage as a
+  minimum regression floor, not a target. Add practical tests for testable
+  behavior and failure paths, especially security-sensitive control flow, even
+  after the floor is met. Do not add low-value tests solely to reach 100
+  percent.
 
 ## Development and Validation
 
@@ -156,7 +173,9 @@ Run the smallest validation set that covers the change:
 * Python: focused tests, then `make check`.
 * Shell: `make shell-check` plus relevant tests.
 * Security-sensitive control flow: `make coverage`.
-* E2E: only when explicitly required and inside a verified disposable VM.
+* E2E: required when the relevant behavior crosses a root-only, kernel, host
+  integration, or container-runtime boundary that unit tests mock; run it only
+  inside a verified disposable VM.
 
 Report checks that fail or cannot run. Repeat checks only after a failure or
 material uncertainty. Do not delete an existing virtual environment, install
@@ -171,8 +190,14 @@ E2E tests perform real root-only host and container operations.
 * Require root and `SANDY_E2E=1`; never bypass or weaken these guards.
 * Confirm the VM has no pre-existing Sandy machines, bridge, firewall state, or
   caches.
-* Use `sudo env SANDY_E2E=1 make e2e`. Use `e2e-full` only when complete
-  provisioning behavior needs verification.
+* Prefer focused E2E cases for security properties that mocked unit tests
+  cannot establish. Track every host resource created by a test, clean only
+  resources proven to belong to that run, and assert clean postconditions.
+* Use `sudo env SANDY_E2E=1 make e2e`. Run `e2e-full` only when executable
+  behavior in `setup-container.sh` changes and complete provisioning therefore
+  needs verification (comment-only changes and updates limited to global
+  version variables do not require `e2e-full` when ShellCheck passes on this
+  script).
 
 ## Communication and Handoff
 

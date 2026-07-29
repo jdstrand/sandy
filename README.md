@@ -32,7 +32,13 @@ wrapper written by Trevor Hilton (@hiltontj).
   bridged networking
 - Root privileges
 - Directory layout: currently manages root filesystems in `/var/lib/machines`
-  (all prefixed with `sandy.`
+  (all prefixed with `sandy.`).
+
+Root-owned `sandy.<name>` image symlinks in `/var/lib/machines` are supported,
+matching `machinectl`'s documented image layout. Symlinks inside an image are
+resolved within that image's pinned root and cannot escape to the host. Removing
+a symlinked image removes the link, not the administrator-managed external
+target.
 
 
 ### Getting Started
@@ -142,6 +148,11 @@ When `--network lenient` (default), `sandy` creates `sandybr0`, enables IP
 forwarding, and creates firewall rules to block RFC1918/ULA ranges while
 allowing loopback-published services via port mappings. Host networking
 (`--network host`) skips bridge configuration entirely.
+
+Port mapping state uses a persistent `0600` coordination lock in
+`/var/lib/machines/sandy.__cache`. Once created, `rm --cache` retains that
+empty lock and its directory so concurrent Sandy processes always coordinate
+on the same inode; it contains no port mappings or cache payload.
 
 
 ## Security

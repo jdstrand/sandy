@@ -2,6 +2,7 @@
 
 import argparse
 import array
+import errno
 import fcntl
 import glob
 import hashlib
@@ -12,6 +13,7 @@ import platform
 import pty
 import random
 import re
+import secrets
 import select
 import shlex
 import shutil
@@ -33,10 +35,24 @@ CONTAINER_BASE_UID: Final = (
     1000000  # Fallback base UID for fixed user namespace mapping
 )
 PORT_MAPPINGS_FILENAME: Final = "port_mappings.json"
+PORT_MAPPINGS_LOCK_FILENAME: Final = "port_mappings.lock"
 CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 DEFAULT_CONTAINER_TERM: Final = "xterm-256color"
 ENVIRONMENT_KEY_PATTERN: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 TERMINAL_TYPE_PATTERN: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._-]{0,63}$")
+CONTROL_CHARACTER_PATTERN: Final = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+DIRECTORY_OPEN_FLAGS: Final = (
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+TEMPORARY_FILE_OPEN_FLAGS: Final = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+LOCK_FILE_OPEN_FLAGS: Final = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+READ_FILE_OPEN_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+PATH_OPEN_FLAGS: Final = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+# Sandy resolves only short, known image paths. Use the POSIX minimum limit to
+# bound work from an untrusted image without rejecting normal filesystem layouts.
+MAX_SYMLINK_RESOLUTIONS: Final = 8
 
 
 # Input validation functions
@@ -88,10 +104,19 @@ def _validate_workspace_path(path: str) -> bool:
     return True
 
 
-def _sanitize_log_output(message: str) -> str:
-    """Sanitize log output to prevent log injection"""
-    # Remove or escape newlines and control characters
-    return re.sub(r"[\r\n\t\x00-\x1f\x7f-\x9f]", "", str(message))
+def _strip_control_characters(message: str) -> str:
+    """Return message text with C0, DEL, and C1 control characters removed."""
+    return CONTROL_CHARACTER_PATTERN.sub("", str(message))
+
+
+def _terminal_safe_repr(value: str) -> str:
+    """Return an ASCII representation safe for terminal diagnostics."""
+    return ascii(value)
+
+
+def _contains_control_character(value: str) -> bool:
+    """Return whether text contains a C0, DEL, or C1 control character."""
+    return CONTROL_CHARACTER_PATTERN.search(value) is not None
 
 
 def _finish_spinner_line(spinner_event: Optional[threading.Event], suffix: str = ""):
@@ -268,26 +293,18 @@ def _validate_port_mapping(port_spec: str) -> Optional[Tuple[str, int, int]]:
 
 
 def _run_secure_subprocess(cmd: list, **kwargs) -> subprocess.CompletedProcess:
-    """Run subprocess with security hardening"""
+    """Run subprocess with security hardening.
+
+    Captured stdout and stderr are preserved verbatim. Callers that display
+    command output must sanitize it at the terminal or log boundary.
+    """
     if kwargs.get("shell") not in (None, False):
         raise ValueError("Shell execution is not permitted")
     kwargs["shell"] = False
 
     _validate_command_args(cmd)
 
-    # Sanitize any error output for logging
-    try:
-        result = subprocess.run(cmd, **kwargs)
-        return result
-    except subprocess.CalledProcessError as e:
-        # Sanitize error output before logging
-        sanitized_stderr = _sanitize_log_output(str(e.stderr)) if e.stderr else ""
-        raise subprocess.CalledProcessError(
-            e.returncode,
-            e.cmd,
-            output=e.stdout,
-            stderr=sanitized_stderr,
-        )
+    return subprocess.run(cmd, **kwargs)
 
 
 def _run_secure_subprocess_popen(cmd: list, **kwargs) -> subprocess.Popen:
@@ -341,7 +358,10 @@ def _run_secure_subprocess_pty(
         try:
             os.execvpe(cmd[0], cmd, child_environment)
         except OSError as exc:
-            sys.stderr.write(f"Failed to execute {cmd[0]}: {exc}\n")
+            sys.stderr.write(
+                "Failed to execute "
+                f"{_terminal_safe_repr(cmd[0])}: {_terminal_safe_repr(str(exc))}\n"
+            )
             os._exit(1)
 
     # Parent process - get the PTY peer path for signaling on resize
@@ -450,96 +470,735 @@ def _run_secure_subprocess_pty(
 
 
 # Helper functions
-def _verify_safe_dir(dir: str):
-    """Securely verify SYSTEMD_MACHINES directory safety using file descriptors"""
-    dir_rp = os.path.realpath(dir)
-    if dir_rp != SYSTEMD_MACHINES and not dir_rp.startswith(f"{SYSTEMD_MACHINES}/"):
-        raise ValueError(f"'{dir_rp}' does not start with '{SYSTEMD_MACHINES}'")
-
-    # Parse path components, excluding empty strings
-    path_components = [comp for comp in dir.split("/") if comp]
-
-    # Open root directory with O_DIRECTORY flag for security
-    current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-
-    # Verify root directory ownership and permissions
-    root_stat = os.fstat(current_fd)
-    if root_stat.st_uid != 0 or root_stat.st_gid != 0:
-        os.close(current_fd)
-        raise PermissionError("Root directory not owned by root:root")
-    if root_stat.st_mode & stat.S_IWOTH:
-        os.close(current_fd)
-        raise PermissionError("Root directory has world write permission")
-
-    # Traverse each path component using openat for security
-    for component in path_components:
-        # Use openat to open relative to current fd (prevents TOCTOU attacks)
-        next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY, dir_fd=current_fd)
-
-        # Get file stats using the file descriptor
-        dir_stat = os.fstat(next_fd)
-
-        # Security checks
-        if not stat.S_ISDIR(dir_stat.st_mode):
-            os.close(next_fd)
-            os.close(current_fd)
-            raise PermissionError(f"Path component '{component}' is not a directory")
-
-        if dir_stat.st_uid != 0 or dir_stat.st_gid != 0:
-            os.close(next_fd)
-            os.close(current_fd)
-            raise PermissionError(f"Directory '{component}' not owned by root:root")
-
-        if dir_stat.st_mode & stat.S_IWOTH:
-            os.close(next_fd)
-            os.close(current_fd)
-            raise PermissionError(f"Directory '{component}' has world write permission")
-
-        # Close previous fd and move to next
-        os.close(current_fd)
-        current_fd = next_fd
-
-    # Final verification that we reached the expected directory
-    final_stat = os.fstat(current_fd)
-    os.close(current_fd)
-
-    # Double-check by comparing with direct stat (should match)
-    direct_stat = os.stat(dir)
+def _managed_path_components(path: str, *, allow_managed_root: bool) -> Tuple[str, ...]:
+    """Validate a normalized absolute path in Sandy's managed filesystem scope."""
     if (
-        final_stat.st_dev != direct_stat.st_dev
-        or final_stat.st_ino != direct_stat.st_ino
+        not isinstance(path, str)
+        or not path
+        or len(path) > 4096
+        or _contains_control_character(path)
     ):
-        raise PermissionError("Path verification mismatch - possible symlink attack")
+        raise ValueError("Invalid managed path")
+
+    managed_root = os.path.normpath(SYSTEMD_MACHINES)
+    if (
+        not os.path.isabs(SYSTEMD_MACHINES)
+        or SYSTEMD_MACHINES != managed_root
+        or path != os.path.normpath(path)
+        or not os.path.isabs(path)
+    ):
+        raise ValueError("Managed paths must be normalized absolute paths")
+
+    root_components = tuple(
+        component for component in managed_root.split(os.sep) if component
+    )
+    path_components = tuple(component for component in path.split(os.sep) if component)
+    if path_components[: len(root_components)] != root_components:
+        raise ValueError(f"Managed path is outside '{SYSTEMD_MACHINES}'")
+
+    relative_components = path_components[len(root_components) :]
+    if not relative_components:
+        if not allow_managed_root:
+            raise ValueError(f"Refusing to target managed root '{SYSTEMD_MACHINES}'")
+        return path_components
+
+    managed_name = relative_components[0]
+    if not managed_name.startswith("sandy.") or len(managed_name) <= len("sandy."):
+        raise ValueError("Managed path must begin with a Sandy-owned directory")
+
+    return path_components
 
 
-def _rmtree(dir: str):
-    """Safely remove directory under SYSTEMD_MACHINES"""
-    if os.path.realpath(dir) == os.path.realpath(SYSTEMD_MACHINES):
-        # Don't ever remove SYSTEMD_MACHINES
-        raise ValueError(f"'{dir}' does not point to a subdir of '{SYSTEMD_MACHINES}'")
-    _verify_safe_dir(dir)
-
-    # Let the exceptions propagate up
-    shutil.rmtree(dir)
-
-
-def _mkdir(dir: str):
-    """Safely create directory under SYSTEMD_MACHINES"""
-    _verify_safe_dir(os.path.dirname(dir))
-
-    # Let the exceptions propagate up (FileExistsError, FileNotFoundError, etc)
-    os.mkdir(dir, mode=0o700)
-    _verify_safe_dir(dir)
+def _verify_owned_directory(directory_stat: os.stat_result, label: str) -> None:
+    """Verify directory type, ownership, and non-writable trust boundary."""
+    safe_label = _terminal_safe_repr(label)
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise PermissionError(f"Path component {safe_label} is not a directory")
+    if directory_stat.st_uid != 0 or directory_stat.st_gid != 0:
+        raise PermissionError(f"Directory {safe_label} has unexpected ownership")
+    if directory_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PermissionError(f"Directory {safe_label} is writable by other users")
 
 
-def _write(fn: str, content: str, mode=0o0600):
-    """Safely write file under SYSTEMD_MACHINES"""
-    _verify_safe_dir(os.path.dirname(fn))
+def _verify_owned_symlink(link_stat: os.stat_result, label: str) -> None:
+    """Verify that a symlink is an administrator-controlled filesystem entry."""
+    safe_label = _terminal_safe_repr(label)
+    if not stat.S_ISLNK(link_stat.st_mode):
+        raise PermissionError(f"Path component {safe_label} is not a symlink")
+    if link_stat.st_uid != 0 or link_stat.st_gid != 0:
+        raise PermissionError(f"Symlink {safe_label} has unexpected ownership")
 
-    with open(fn, "w") as f:
-        f.write(content)
-        f.flush()
-    os.chmod(fn, mode, follow_symlinks=False)
+
+def _read_verified_symlink(
+    parent_fd: int,
+    component: str,
+) -> Tuple[str, os.stat_result]:
+    """Read a symlink through a pinned no-follow descriptor."""
+    link_fd = os.open(
+        component,
+        PATH_OPEN_FLAGS,
+        dir_fd=parent_fd,
+    )
+    try:
+        link_stat = os.fstat(link_fd)
+        _verify_owned_symlink(link_stat, component)
+        target = os.readlink("", dir_fd=link_fd)
+    finally:
+        os.close(link_fd)
+
+    if not target or len(target) > 4096 or _contains_control_character(target):
+        safe_component = _terminal_safe_repr(component)
+        raise PermissionError(f"Symlink {safe_component} has an invalid target")
+    return target, link_stat
+
+
+def _open_verified_host_directory(path: str) -> int:
+    """Open a normalized host directory without following path-component links."""
+    if (
+        not isinstance(path, str)
+        or not path
+        or len(path) > 4096
+        or not os.path.isabs(path)
+        or path != os.path.normpath(path)
+        or _contains_control_character(path)
+    ):
+        raise ValueError("Invalid host directory path")
+
+    path_components = tuple(component for component in path.split(os.sep) if component)
+    current_fd = os.open("/", DIRECTORY_OPEN_FLAGS)
+    root_stat = os.fstat(current_fd)
+    try:
+        _verify_owned_directory(root_stat, "/")
+        for component in path_components:
+            try:
+                next_fd = os.open(
+                    component,
+                    DIRECTORY_OPEN_FLAGS,
+                    dir_fd=current_fd,
+                )
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    safe_component = _terminal_safe_repr(component)
+                    raise PermissionError(
+                        f"Unsafe managed path component {safe_component}"
+                    ) from exc
+                raise
+
+            try:
+                _verify_owned_directory(os.fstat(next_fd), component)
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+
+        if _same_inode(root_stat, os.fstat(current_fd)):
+            raise PermissionError("Refusing to use the host root as a machine image")
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _open_machine_image_symlink(managed_root_fd: int, managed_name: str) -> int:
+    """Resolve systemd's documented administrator-controlled image symlink."""
+    if managed_name == "sandy.__cache":
+        raise PermissionError("The Sandy cache directory may not be a symlink")
+
+    target, _ = _read_verified_symlink(managed_root_fd, managed_name)
+    if os.path.isabs(target):
+        target_path = os.path.normpath(target)
+    else:
+        target_path = os.path.normpath(os.path.join(SYSTEMD_MACHINES, target))
+
+    # machinectl(1) explicitly supports image links in /var/lib/machines. The
+    # one administrator-controlled image link is followed here, while target
+    # path components and the shared cache remain strictly no-follow.
+    managed_root = os.path.normpath(SYSTEMD_MACHINES)
+    if target_path == managed_root or managed_root.startswith(f"{target_path}/"):
+        raise PermissionError("Machine image symlink targets a managed-root ancestor")
+
+    target_fd = _open_verified_host_directory(target_path)
+    if _same_inode(os.fstat(target_fd), os.fstat(managed_root_fd)):
+        os.close(target_fd)
+        raise PermissionError("Machine image symlink targets the managed root")
+    return target_fd
+
+
+def _image_symlink_components(
+    resolved_components: Tuple[str, ...],
+    target: str,
+    pending_components: Tuple[str, ...],
+) -> Tuple[str, ...]:
+    """Resolve symlink text with chroot-style semantics inside an image root."""
+    if os.path.isabs(target):
+        combined = []
+    else:
+        combined = list(resolved_components)
+
+    for component in target.split(os.sep):
+        if component in ("", "."):
+            continue
+        if component == "..":
+            if combined:
+                combined.pop()
+            continue
+        combined.append(component)
+
+    combined.extend(pending_components)
+    return tuple(combined)
+
+
+def _open_image_directory(image_root_fd: int, components: Tuple[str, ...]) -> int:
+    """Resolve an image directory while containing symlinks inside its root."""
+    image_root_stat = os.fstat(image_root_fd)
+    image_mount_id = _fd_mount_id(image_root_fd)
+    current_fd = os.dup(image_root_fd)
+    resolved_components: Tuple[str, ...] = ()
+    pending_components = components
+    symlink_count = 0
+
+    try:
+        while pending_components:
+            component = pending_components[0]
+            pending_components = pending_components[1:]
+            try:
+                next_fd = os.open(
+                    component,
+                    DIRECTORY_OPEN_FLAGS,
+                    dir_fd=current_fd,
+                )
+            except OSError as exc:
+                if exc.errno not in (errno.ELOOP, errno.ENOTDIR):
+                    raise
+
+                target, _ = _read_verified_symlink(current_fd, component)
+                symlink_count += 1
+                if symlink_count > MAX_SYMLINK_RESOLUTIONS:
+                    raise PermissionError("Too many symlinks in machine image path")
+
+                pending_components = _image_symlink_components(
+                    resolved_components,
+                    target,
+                    pending_components,
+                )
+                os.close(current_fd)
+                current_fd = os.dup(image_root_fd)
+                resolved_components = ()
+                continue
+
+            try:
+                next_stat = os.fstat(next_fd)
+                _verify_owned_directory(next_stat, component)
+                if next_stat.st_dev != image_root_stat.st_dev:
+                    raise PermissionError(
+                        "Refusing to cross an image filesystem boundary"
+                    )
+                if _fd_mount_id(next_fd) != image_mount_id:
+                    raise PermissionError("Refusing to cross an image mount boundary")
+            except Exception:
+                os.close(next_fd)
+                raise
+
+            os.close(current_fd)
+            current_fd = next_fd
+            resolved_components = (*resolved_components, component)
+
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _open_verified_dir(path: str) -> int:
+    """Open a managed directory with image-root-contained symlink resolution."""
+    path_components = _managed_path_components(path, allow_managed_root=True)
+    managed_root_components = tuple(
+        component
+        for component in os.path.normpath(SYSTEMD_MACHINES).split(os.sep)
+        if component
+    )
+    relative_components = path_components[len(managed_root_components) :]
+
+    current_fd = os.open("/", DIRECTORY_OPEN_FLAGS)
+    try:
+        _verify_owned_directory(os.fstat(current_fd), "/")
+        for component in managed_root_components:
+            try:
+                next_fd = os.open(
+                    component,
+                    DIRECTORY_OPEN_FLAGS,
+                    dir_fd=current_fd,
+                )
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    safe_component = _terminal_safe_repr(component)
+                    raise PermissionError(
+                        f"Unsafe managed-root component {safe_component}"
+                    ) from exc
+                raise
+
+            try:
+                _verify_owned_directory(os.fstat(next_fd), component)
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+
+        if not relative_components:
+            return current_fd
+
+        managed_name = relative_components[0]
+        try:
+            image_fd = os.open(
+                managed_name,
+                DIRECTORY_OPEN_FLAGS,
+                dir_fd=current_fd,
+            )
+        except OSError as exc:
+            if exc.errno not in (errno.ELOOP, errno.ENOTDIR):
+                raise
+            image_fd = _open_machine_image_symlink(current_fd, managed_name)
+        else:
+            try:
+                _verify_owned_directory(os.fstat(image_fd), managed_name)
+            except Exception:
+                os.close(image_fd)
+                raise
+
+        if len(relative_components) == 1:
+            os.close(current_fd)
+            return image_fd
+
+        try:
+            resolved_fd = _open_image_directory(
+                image_fd,
+                relative_components[1:],
+            )
+        finally:
+            os.close(image_fd)
+        os.close(current_fd)
+        return resolved_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _open_verified_parent(path: str) -> Tuple[int, str]:
+    """Open a target's verified parent and return its descriptor and basename."""
+    _managed_path_components(path, allow_managed_root=False)
+    parent_path = os.path.dirname(path)
+    basename = os.path.basename(path)
+    return _open_verified_dir(parent_path), basename
+
+
+def _container_name_from_machine_path(path: str) -> str:
+    """Extract and validate a Sandy container name from a managed machine path."""
+    path_components = _managed_path_components(path, allow_managed_root=False)
+    managed_root_components = tuple(
+        component
+        for component in os.path.normpath(SYSTEMD_MACHINES).split(os.sep)
+        if component
+    )
+    relative_components = path_components[len(managed_root_components) :]
+    if len(relative_components) != 1:
+        raise ValueError("Machine path is not a top-level Sandy container")
+
+    basename = relative_components[0]
+    prefix = "sandy."
+    container_name = basename.removeprefix(prefix)
+    if not _validate_container_name(container_name):
+        raise ValueError("Machine path contains an invalid Sandy container name")
+    return container_name
+
+
+def _verify_safe_dir(path: str) -> None:
+    """Verify a managed directory through contained descriptor resolution."""
+    directory_fd = _open_verified_dir(path)
+    os.close(directory_fd)
+
+
+def _same_inode(first: os.stat_result, second: os.stat_result) -> bool:
+    """Return whether two stat results identify the same filesystem object."""
+    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+
+
+def _fd_mount_id(fd: int) -> int:
+    """Read and strictly validate the kernel mount ID for an open descriptor."""
+    if not isinstance(fd, int) or isinstance(fd, bool) or fd < 0:
+        raise ValueError("Invalid file descriptor")
+
+    mount_id: Optional[int] = None
+    with open(f"/proc/self/fdinfo/{fd}", "r", encoding="ascii") as fdinfo:
+        for line in fdinfo:
+            if not line.startswith("mnt_id:"):
+                continue
+            value = line.removeprefix("mnt_id:").strip()
+            if (
+                mount_id is not None
+                or not value.isascii()
+                or not value.isdecimal()
+                or len(value) > 20
+            ):
+                raise PermissionError("Invalid descriptor mount metadata")
+            mount_id = int(value)
+
+    if mount_id is None or mount_id <= 0:
+        raise PermissionError("Missing descriptor mount metadata")
+    return mount_id
+
+
+def _remove_directory_contents(
+    directory_fd: int,
+    root_device: int,
+    root_mount_id: int,
+) -> None:
+    """Recursively remove entries relative to an already verified directory."""
+    for entry in os.listdir(directory_fd):
+        entry_stat = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(entry_stat.st_mode):
+            if entry_stat.st_dev != root_device:
+                raise PermissionError("Refusing to cross a filesystem boundary")
+
+            child_fd = os.open(
+                entry,
+                DIRECTORY_OPEN_FLAGS,
+                dir_fd=directory_fd,
+            )
+            try:
+                opened_stat = os.fstat(child_fd)
+                if not _same_inode(entry_stat, opened_stat):
+                    raise PermissionError(
+                        "Directory changed during descriptor-anchored removal"
+                    )
+                if _fd_mount_id(child_fd) != root_mount_id:
+                    raise PermissionError("Refusing to cross a mount boundary")
+                _remove_directory_contents(
+                    child_fd,
+                    root_device,
+                    root_mount_id,
+                )
+            finally:
+                os.close(child_fd)
+
+            current_stat = os.stat(
+                entry,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if not _same_inode(entry_stat, current_stat):
+                raise PermissionError(
+                    "Directory changed during descriptor-anchored removal"
+                )
+            os.rmdir(entry, dir_fd=directory_fd)
+        else:
+            entry_fd = os.open(
+                entry,
+                PATH_OPEN_FLAGS,
+                dir_fd=directory_fd,
+            )
+            try:
+                opened_stat = os.fstat(entry_fd)
+                if not _same_inode(entry_stat, opened_stat):
+                    raise PermissionError(
+                        "Entry changed during descriptor-anchored removal"
+                    )
+                if _fd_mount_id(entry_fd) != root_mount_id:
+                    raise PermissionError("Refusing to cross a mount boundary")
+            finally:
+                os.close(entry_fd)
+
+            current_stat = os.stat(
+                entry,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if not _same_inode(entry_stat, current_stat):
+                raise PermissionError(
+                    "Entry changed during descriptor-anchored removal"
+                )
+            os.unlink(entry, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+
+
+def _remove_managed_tree(path: str) -> None:
+    """Remove a Sandy-owned tree without post-verification path operations."""
+    parent_fd, basename = _open_verified_parent(path)
+    target_fd: Optional[int] = None
+    try:
+        target_stat = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if stat.S_ISLNK(target_stat.st_mode):
+            path_components = _managed_path_components(
+                path,
+                allow_managed_root=False,
+            )
+            managed_root_components = tuple(
+                component
+                for component in os.path.normpath(SYSTEMD_MACHINES).split(os.sep)
+                if component
+            )
+            if (
+                len(path_components) != len(managed_root_components) + 1
+                or basename == "sandy.__cache"
+            ):
+                raise PermissionError("Refusing to remove a non-image managed symlink")
+
+            _, opened_link_stat = _read_verified_symlink(parent_fd, basename)
+            current_stat = os.stat(
+                basename,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if not _same_inode(opened_link_stat, current_stat):
+                raise PermissionError("Machine image symlink changed before removal")
+
+            # Removing a systemd image link removes only Sandy's reference.
+            # Recursively deleting its administrator-owned target would turn a
+            # supported storage indirection into an unsafe deletion primitive.
+            os.unlink(basename, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            return
+        if not stat.S_ISDIR(target_stat.st_mode):
+            raise PermissionError("Managed removal target is not a directory")
+        _verify_owned_directory(target_stat, basename)
+
+        target_fd = os.open(
+            basename,
+            DIRECTORY_OPEN_FLAGS,
+            dir_fd=parent_fd,
+        )
+        opened_stat = os.fstat(target_fd)
+        if not _same_inode(target_stat, opened_stat):
+            raise PermissionError("Managed removal target changed during open")
+        parent_mount_id = _fd_mount_id(parent_fd)
+        target_mount_id = _fd_mount_id(target_fd)
+        if target_mount_id != parent_mount_id:
+            raise PermissionError("Refusing to remove a mounted managed target")
+
+        _remove_directory_contents(
+            target_fd,
+            opened_stat.st_dev,
+            target_mount_id,
+        )
+        os.close(target_fd)
+        target_fd = None
+
+        current_stat = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not _same_inode(opened_stat, current_stat):
+            raise PermissionError("Managed removal target changed before removal")
+        os.rmdir(basename, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+        os.close(parent_fd)
+
+
+def _mkdir(path: str) -> None:
+    """Create and verify a Sandy-owned directory relative to its parent."""
+    parent_fd, basename = _open_verified_parent(path)
+    created = False
+    try:
+        os.mkdir(basename, mode=0o700, dir_fd=parent_fd)
+        created = True
+        directory_fd = os.open(
+            basename,
+            DIRECTORY_OPEN_FLAGS,
+            dir_fd=parent_fd,
+        )
+        try:
+            _verify_owned_directory(os.fstat(directory_fd), basename)
+        finally:
+            os.close(directory_fd)
+        os.fsync(parent_fd)
+    except Exception:
+        if created:
+            try:
+                os.rmdir(basename, dir_fd=parent_fd)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(parent_fd)
+
+
+def _validate_existing_write_target(parent_fd: int, basename: str) -> None:
+    """Reject unsafe existing destinations before atomic replacement."""
+    try:
+        destination_stat = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+
+    # Parent-directory symlinks have already been resolved inside the pinned
+    # image root. The final destination is deliberately not followed: Sandy
+    # owns this exact file, and following it would restore the host-write bug.
+    if not stat.S_ISREG(destination_stat.st_mode):
+        raise PermissionError("Existing write destination is not a regular file")
+    if (
+        destination_stat.st_uid != os.geteuid()
+        or destination_stat.st_gid != os.getegid()
+    ):
+        raise PermissionError("Existing write destination has unexpected ownership")
+    if destination_stat.st_nlink != 1:
+        raise PermissionError("Existing write destination has multiple links")
+
+
+def _write(path: str, content: str, mode: int = 0o0600) -> None:
+    """Atomically write a file relative to a verified managed directory."""
+    if not isinstance(content, str):
+        raise ValueError("Managed file content must be text")
+    if not isinstance(mode, int) or isinstance(mode, bool) or mode < 0 or mode & ~0o777:
+        raise ValueError("Invalid managed file mode")
+
+    parent_fd, basename = _open_verified_parent(path)
+    temporary_fd: Optional[int] = None
+    temporary_name: Optional[str] = None
+    try:
+        _validate_existing_write_target(parent_fd, basename)
+
+        for _ in range(16):
+            candidate = f".sandy-{secrets.token_hex(16)}.tmp"
+            try:
+                temporary_fd = os.open(
+                    candidate,
+                    TEMPORARY_FILE_OPEN_FLAGS,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                temporary_name = candidate
+                break
+            except FileExistsError:
+                continue
+        if temporary_fd is None or temporary_name is None:
+            raise FileExistsError("Could not create an unpredictable temporary file")
+
+        temporary_stat = os.fstat(temporary_fd)
+        if (
+            not stat.S_ISREG(temporary_stat.st_mode)
+            or temporary_stat.st_uid != os.geteuid()
+            or temporary_stat.st_gid != os.getegid()
+            or temporary_stat.st_nlink != 1
+        ):
+            raise PermissionError("Temporary write destination failed validation")
+
+        remaining = memoryview(content.encode("utf-8"))
+        while remaining:
+            written = os.write(temporary_fd, remaining)
+            if written <= 0:
+                raise OSError("Managed file write made no progress")
+            remaining = remaining[written:]
+
+        os.fchmod(temporary_fd, mode)
+        os.fsync(temporary_fd)
+        os.replace(
+            temporary_name,
+            basename,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+
+        destination_stat = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not _same_inode(temporary_stat, destination_stat):
+            raise PermissionError("Atomic write destination identity mismatch")
+        os.fsync(parent_fd)
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
+
+
+def _verify_owned_regular_file(
+    file_stat: os.stat_result,
+    label: str,
+    *,
+    expected_mode: int,
+) -> None:
+    """Verify a single-link regular file owned by the effective identity."""
+    safe_label = _terminal_safe_repr(label)
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise PermissionError(f"Managed file {safe_label} is not a regular file")
+    if file_stat.st_uid != os.geteuid() or file_stat.st_gid != os.getegid():
+        raise PermissionError(f"Managed file {safe_label} has unexpected ownership")
+    if file_stat.st_nlink != 1:
+        raise PermissionError(f"Managed file {safe_label} has multiple links")
+    if stat.S_IMODE(file_stat.st_mode) != expected_mode:
+        raise PermissionError(f"Managed file {safe_label} has unsafe permissions")
+
+
+def _open_stable_lock_file(path: str) -> Any:
+    """Open or create a stable managed lock inode without following links."""
+    parent_fd, basename = _open_verified_parent(path)
+    lock_fd: Optional[int] = None
+    try:
+        lock_fd = os.open(
+            basename,
+            LOCK_FILE_OPEN_FLAGS,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        lock_stat = os.fstat(lock_fd)
+        _verify_owned_regular_file(lock_stat, basename, expected_mode=0o600)
+        current_stat = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not _same_inode(lock_stat, current_stat):
+            raise PermissionError("Managed lock file changed during open")
+        os.fsync(parent_fd)
+        handle = os.fdopen(lock_fd, "r+", encoding="utf-8")
+        lock_fd = None
+        return handle
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        os.close(parent_fd)
+
+
+def _open_existing_managed_text_file(path: str) -> Optional[Any]:
+    """Open an existing managed text file through its verified parent."""
+    parent_fd, basename = _open_verified_parent(path)
+    file_fd: Optional[int] = None
+    try:
+        try:
+            file_fd = os.open(
+                basename,
+                READ_FILE_OPEN_FLAGS,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return None
+        file_stat = os.fstat(file_fd)
+        _verify_owned_regular_file(file_stat, basename, expected_mode=0o600)
+        handle = os.fdopen(file_fd, "r", encoding="utf-8")
+        file_fd = None
+        return handle
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(parent_fd)
 
 
 def _check_systemd_version():
@@ -555,7 +1214,7 @@ def _check_systemd_version():
                 version = int(version_str.split(".")[0])
                 return version
     except (subprocess.CalledProcessError, ValueError, IndexError) as e:
-        print(f"W: Could not determine systemd version: {_sanitize_log_output(str(e))}")
+        print(f"W: Could not determine systemd version: {_terminal_safe_repr(str(e))}")
 
     print(
         "W: Could not determine systemd version, assuming older version where --private-users-ownership=auto not supported"
@@ -595,13 +1254,13 @@ def _create_guest_files(
         # Validate network configuration for security
         if not _validate_network_cidr(network_cidr):
             print(
-                f"W: Invalid network CIDR '{_sanitize_log_output(network_cidr)}', skipping /init.sh creation"
+                f"W: Invalid network CIDR '{_strip_control_characters(network_cidr)}', skipping /init.sh creation"
             )
             return
 
         if not _validate_ip_address(gateway):
             print(
-                f"W: Invalid gateway IP '{_sanitize_log_output(gateway)}', skipping /init.sh creation"
+                f"W: Invalid gateway IP '{_strip_control_characters(gateway)}', skipping /init.sh creation"
             )
             return
 
@@ -609,7 +1268,10 @@ def _create_guest_files(
             # Parse network to get available IPs
             network = ipaddress.ip_network(network_cidr)
         except (ValueError, ipaddress.AddressValueError) as e:
-            print(f"W: Invalid network configuration, skipping /init.sh creation: {e}")
+            print(
+                "W: Invalid network configuration, skipping /init.sh creation: "
+                f"{_terminal_safe_repr(str(e))}"
+            )
             return
 
         # Find used IP addresses by scanning existing init.sh files
@@ -781,12 +1443,12 @@ class SandyNet:
         except subprocess.CalledProcessError as e:
             err_output = e.stderr or e.stdout or str(e)
             print(
-                f"E: Failed to query bridge '{_sanitize_log_output(self.bridge_name)}' address: {_sanitize_log_output(err_output)}"
+                f"E: Failed to query bridge '{_strip_control_characters(self.bridge_name)}' address: {_terminal_safe_repr(str(err_output))}"
             )
             return False
         except Exception as e:
             print(
-                f"E: Error querying bridge '{_sanitize_log_output(self.bridge_name)}' address: {_sanitize_log_output(str(e))}"
+                f"E: Error querying bridge '{_strip_control_characters(self.bridge_name)}' address: {_terminal_safe_repr(str(e))}"
             )
             return False
 
@@ -794,7 +1456,7 @@ class SandyNet:
             data = json.loads(result.stdout)
         except json.JSONDecodeError as e:
             print(
-                f"E: Could not decode address data for '{_sanitize_log_output(self.bridge_name)}': {_sanitize_log_output(str(e))}"
+                f"E: Could not decode address data for '{_strip_control_characters(self.bridge_name)}': {_terminal_safe_repr(str(e))}"
             )
             return False
 
@@ -818,7 +1480,7 @@ class SandyNet:
                 return True
 
         print(
-            f"E: No IPv4 gateway detected for bridge '{_sanitize_log_output(self.bridge_name)}'"
+            f"E: No IPv4 gateway detected for bridge '{_strip_control_characters(self.bridge_name)}'"
         )
         return False
 
@@ -841,7 +1503,7 @@ class SandyNet:
         try:
             test_net = ipaddress.ip_network(network_cidr)
         except Exception as e:
-            print(f"W: Error checking network conflict: {e}")
+            print(f"W: Error checking network conflict: {_terminal_safe_repr(str(e))}")
             return True  # Assume conflict on error
 
         # Check routing table
@@ -912,7 +1574,9 @@ class SandyNet:
                 check=False,
             )
             if result.returncode != 0:
-                print(f"E: Failed to create bridge: {result.stderr}")
+                print(
+                    f"E: Failed to create bridge: {_terminal_safe_repr(str(result.stderr))}"
+                )
                 return False
 
             # Bring bridge up
@@ -923,12 +1587,14 @@ class SandyNet:
                 check=False,
             )
             if result.returncode != 0:
-                print(f"E: Failed to bring bridge up: {result.stderr}")
+                print(
+                    f"E: Failed to bring bridge up: {_terminal_safe_repr(str(result.stderr))}"
+                )
                 return False
 
             return True
         except Exception as e:
-            print(f"E: Error creating bridge: {e}")
+            print(f"E: Error creating bridge: {_terminal_safe_repr(str(e))}")
             return False
 
     def _configure_bridge_ip(self, gateway: str) -> bool:
@@ -942,12 +1608,14 @@ class SandyNet:
                 check=False,
             )
             if result.returncode != 0:
-                print(f"E: Failed to add IP to bridge: {result.stderr}")
+                print(
+                    f"E: Failed to add IP to bridge: {_terminal_safe_repr(str(result.stderr))}"
+                )
                 return False
 
             return True
         except Exception as e:
-            print(f"E: Error configuring bridge IP: {e}")
+            print(f"E: Error configuring bridge IP: {_terminal_safe_repr(str(e))}")
             return False
 
     def _enable_ip_forwarding(self) -> bool:
@@ -960,11 +1628,13 @@ class SandyNet:
                 check=False,
             )
             if result.returncode != 0:
-                print(f"W: Failed to enable IP forwarding: {result.stderr}")
+                print(
+                    f"W: Failed to enable IP forwarding: {_terminal_safe_repr(str(result.stderr))}"
+                )
                 return False
             return True
         except Exception as e:
-            print(f"W: Error enabling IP forwarding: {e}")
+            print(f"W: Error enabling IP forwarding: {_terminal_safe_repr(str(e))}")
             return False
 
     def _enable_route_localnet(self) -> bool:
@@ -978,12 +1648,14 @@ class SandyNet:
             )
             if result.returncode != 0:
                 print(
-                    f"W: Failed to enable route_localnet for '{self.bridge_name}': {result.stderr}"
+                    f"W: Failed to enable route_localnet for '{self.bridge_name}': {_terminal_safe_repr(str(result.stderr))}"
                 )
                 return False
             return True
         except Exception as e:
-            print(f"W: Error enabling route_localnet for '{self.bridge_name}': {e}")
+            print(
+                f"W: Error enabling route_localnet for '{self.bridge_name}': {_terminal_safe_repr(str(e))}"
+            )
             return False
 
     def _run_iptables(
@@ -1003,11 +1675,13 @@ class SandyNet:
                 cmd, capture_output=True, text=True, check=False
             )
             if result.returncode != 0:
-                print(f"W: {error_prefix} failed: {result.stderr}")
+                print(
+                    f"W: {error_prefix} failed: {_terminal_safe_repr(str(result.stderr))}"
+                )
                 return False
             return True
         except Exception as e:
-            print(f"W: Error running {error_prefix}: {e}")
+            print(f"W: Error running {error_prefix}: {_terminal_safe_repr(str(e))}")
             return False
 
     def _run_ip6tables(
@@ -1027,11 +1701,13 @@ class SandyNet:
                 cmd, capture_output=True, text=True, check=False
             )
             if result.returncode != 0:
-                print(f"W: {error_prefix} failed: {result.stderr}")
+                print(
+                    f"W: {error_prefix} failed: {_terminal_safe_repr(str(result.stderr))}"
+                )
                 return False
             return True
         except Exception as e:
-            print(f"W: Error running {error_prefix}: {e}")
+            print(f"W: Error running {error_prefix}: {_terminal_safe_repr(str(e))}")
             return False
 
     def _iptables_chain_exists(self, chain: str, table: Optional[str] = None) -> bool:
@@ -1073,11 +1749,13 @@ class SandyNet:
                 cmd, capture_output=True, text=True, check=False
             )
             if result.returncode != 0:
-                print(f"W: {error_prefix} failed: {result.stderr}")
+                print(
+                    f"W: {error_prefix} failed: {_terminal_safe_repr(str(result.stderr))}"
+                )
                 return False
             return True
         except Exception as e:
-            print(f"W: Error running {error_prefix}: {e}")
+            print(f"W: Error running {error_prefix}: {_terminal_safe_repr(str(e))}")
             return False
 
     def _nft_table_exists(self, family: str, table: str) -> bool:
@@ -1243,20 +1921,20 @@ class SandyNet:
 
             return True
         except Exception as e:
-            print(f"E: Error setting up nftables base: {e}")
+            print(f"E: Error setting up nftables base: {_terminal_safe_repr(str(e))}")
             return False
 
     def _setup_iptables_chains(self, network_cidr) -> bool:
         """Create or flush iptables chains"""
         if not self._ensure_gateway():
             print(
-                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.bridge_name)}'"
+                f"E: Could not determine gateway for bridge '{_strip_control_characters(self.bridge_name)}'"
             )
             return False
 
         if not self.gateway:
             print(
-                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.bridge_name)}'"
+                f"E: Gateway value missing for bridge '{_strip_control_characters(self.bridge_name)}'"
             )
             return False
 
@@ -1474,7 +2152,7 @@ class SandyNet:
 
             return True
         except Exception as e:
-            print(f"E: Error setting up iptables chains: {e}")
+            print(f"E: Error setting up iptables chains: {_terminal_safe_repr(str(e))}")
             return False
 
     # TODO: currently we setup private networking with a bridge, then add
@@ -1610,7 +2288,7 @@ class SandyNet:
 
             return True
         except Exception as e:
-            print(f"E: Error configuring NAT rules: {e}")
+            print(f"E: Error configuring NAT rules: {_terminal_safe_repr(str(e))}")
             return False
 
     def _setup_ipv6_firewall_ipt(self) -> bool:
@@ -1709,20 +2387,22 @@ class SandyNet:
 
             return True
         except Exception as e:
-            print(f"W: Error setting up IPv6 firewall rules: {e}")
+            print(
+                f"W: Error setting up IPv6 firewall rules: {_terminal_safe_repr(str(e))}"
+            )
             return False
 
     def _setup_ipv4_firewall_nft(self, network_cidr: str) -> bool:
         """Configure NAT and forwarding rules using nftables"""
         if not self._ensure_gateway():
             print(
-                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.bridge_name)}'"
+                f"E: Could not determine gateway for bridge '{_strip_control_characters(self.bridge_name)}'"
             )
             return False
 
         if not self.gateway:
             print(
-                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.bridge_name)}'"
+                f"E: Gateway value missing for bridge '{_strip_control_characters(self.bridge_name)}'"
             )
             return False
 
@@ -1843,20 +2523,22 @@ class SandyNet:
 
             return True
         except Exception as e:
-            print(f"E: Error configuring nftables NAT rules: {e}")
+            print(
+                f"E: Error configuring nftables NAT rules: {_terminal_safe_repr(str(e))}"
+            )
             return False
 
     def _setup_output_firewall_nft(self, network_cidr: str) -> bool:
         """Configure OUTPUT firewall rules using nftables for host->container traffic control"""
         if not self._ensure_gateway():
             print(
-                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.bridge_name)}'"
+                f"E: Could not determine gateway for bridge '{_strip_control_characters(self.bridge_name)}'"
             )
             return False
 
         if not self.gateway:
             print(
-                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.bridge_name)}'"
+                f"E: Gateway value missing for bridge '{_strip_control_characters(self.bridge_name)}'"
             )
             return False
 
@@ -1964,7 +2646,9 @@ class SandyNet:
 
             return True
         except Exception as e:
-            print(f"E: Error configuring nftables OUTPUT rules: {e}")
+            print(
+                f"E: Error configuring nftables OUTPUT rules: {_terminal_safe_repr(str(e))}"
+            )
             return False
 
     def _setup_ipv6_firewall_nft(self) -> bool:
@@ -2047,7 +2731,10 @@ class SandyNet:
 
             return True
         except Exception as e:
-            print(f"W: Error setting up nftables IPv6 firewall rules: {e}")
+            print(
+                "W: Error setting up nftables IPv6 firewall rules: "
+                f"{_terminal_safe_repr(str(e))}"
+            )
             return False
 
     def _setup_bridge(self) -> bool:
@@ -2347,7 +3034,9 @@ class SandyNet:
             check=False,
         )
         if result.returncode != 0:
-            print(f"W: Failed to remove bridge: {result.stderr}")
+            print(
+                f"W: Failed to remove bridge: {_terminal_safe_repr(str(result.stderr))}"
+            )
             success = False
         else:
             print(f"I: Bridge {self.bridge_name} removed successfully")
@@ -2500,7 +3189,7 @@ class Sandy:
                 self.base_image = "debian:trixie"
         else:
             print(
-                f"E: Invalid bootstrap method '{_sanitize_log_output(method)}'. Use 'oci' or 'debootstrap'"
+                f"E: Invalid bootstrap method '{_strip_control_characters(method)}'. Use 'oci' or 'debootstrap'"
             )
             sys.exit(1)
 
@@ -2509,7 +3198,7 @@ class Sandy:
         if base_override:
             if not _validate_image_name(base_override):
                 print(
-                    f"E: Invalid base image '{_sanitize_log_output(base_override)}' - must be valid image name"
+                    f"E: Invalid base image '{_strip_control_characters(base_override)}' - must be valid image name"
                 )
                 sys.exit(1)
             self.base_image = base_override
@@ -2564,7 +3253,7 @@ class Sandy:
         try:
             host_uid = self._get_host_uid(container_name)
         except ValueError as e:
-            print(f"W: {e}")
+            print(f"W: {_terminal_safe_repr(str(e))}")
             return
 
         # Check if ACLs are already applied to the workspace directory (without -R)
@@ -2634,14 +3323,17 @@ class Sandy:
         # Execute ACL commands
         result = _run_secure_subprocess(acl_cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"W: Failed to add ACL: {result.stderr}")
+            print(f"W: Failed to add ACL: {_terminal_safe_repr(str(result.stderr))}")
 
         # Set default ACLs for new files
         result_default = _run_secure_subprocess(
             acl_default_cmd, capture_output=True, text=True
         )
         if result_default.returncode != 0:
-            print(f"W: Failed to add default ACL: {result_default.stderr}")
+            print(
+                "W: Failed to add default ACL: "
+                f"{_terminal_safe_repr(str(result_default.stderr))}"
+            )
 
         print(f"I: Finished setting ACLs. Undo with '{' '.join(remove_acl_cmd)}'")
 
@@ -2669,19 +3361,29 @@ class Sandy:
 
     def _remove_machine_dir(self, mdir, prompt=True):
         """Remove a machine directory with safety checks"""
-        con = os.path.basename(mdir).split(".", maxsplit=1)[1]
+        try:
+            con = _container_name_from_machine_path(mdir)
+        except ValueError as exc:
+            print(
+                "E: Refusing to remove invalid Sandy machine entry "
+                f"{_terminal_safe_repr(mdir)}: {_terminal_safe_repr(str(exc))}"
+            )
+            return
+
+        safe_con = _terminal_safe_repr(con)
+        safe_mdir = _terminal_safe_repr(mdir)
 
         # Prompt for confirmation unless disabled
         if prompt:
-            if not self._confirm(f"Remove container '{con}' ('{mdir}')"):
-                print(f"I: Skipped removal of '{con}'")
+            if not self._confirm(f"Remove container {safe_con} ({safe_mdir})"):
+                print(f"I: Skipped removal of {safe_con}")
                 return
 
         try:
-            _rmtree(mdir)  # calls _verify_safe_dir()
-            print(f"I: Removed container '{con}' ('{mdir}')")
+            _remove_managed_tree(mdir)
+            print(f"I: Removed container {safe_con} ({safe_mdir})")
         except Exception as e:
-            print(f"E: Problem removing '{con}': {e}")
+            print(f"E: Problem removing {safe_con}: {_terminal_safe_repr(str(e))}")
 
     def _is_container_running(self, container_name=None):
         """Check if container is running and return PID if so, None otherwise"""
@@ -2711,8 +3413,10 @@ class Sandy:
                 if mdir.endswith(".__cache"):
                     continue
 
-                # Extract container name from directory
-                container_name = os.path.basename(mdir).replace("sandy.", "")
+                try:
+                    container_name = _container_name_from_machine_path(mdir)
+                except ValueError:
+                    continue
 
                 # Check if this container is running
                 if self._is_container_running(container_name):
@@ -2732,49 +3436,54 @@ class Sandy:
         """Return the path to the persistent port mapping state file."""
         return os.path.join(self._get_cache_dir(), PORT_MAPPINGS_FILENAME)
 
+    def _get_port_mappings_lock_path(self):
+        """Return the path to the stable port mapping transaction lock."""
+        return os.path.join(self._get_cache_dir(), PORT_MAPPINGS_LOCK_FILENAME)
+
     def _ensure_cache_dir(self):
         """Ensure the cache directory exists with restrictive permissions."""
         cache_dir = self._get_cache_dir()
         if not os.path.exists(cache_dir):
-            _mkdir(cache_dir)  # calls _verify_safe_dir()
+            try:
+                _mkdir(cache_dir)
+            except FileExistsError:
+                # A concurrent state transaction may have created it first.
+                _verify_safe_dir(cache_dir)
         else:
             _verify_safe_dir(cache_dir)
         os.chmod(cache_dir, 0o700, follow_symlinks=False)
         return cache_dir
 
     @contextmanager  # ensures flock acquisition/release is paired at the call site
-    def _port_mapping_lock(self, exclusive: bool, create: bool = False):
+    def _port_mapping_lock(self, exclusive: bool):
         """
-        Acquire an advisory lock around the port mapping state file.
+        Acquire the stable port mapping coordination lock.
 
         Args:
             exclusive: When True, take an exclusive lock suitable for writes.
-            create: When True, create the file if it does not exist.
         """
-        path = self._get_port_mappings_path()
-        handle = None
+        self._ensure_cache_dir()
+        lock_handle = _open_stable_lock_file(self._get_port_mappings_lock_path())
+        state_handle = None
         try:
-            if create:
-                self._ensure_cache_dir()
-                handle = open(path, "a+", encoding="utf-8")
-            else:
-                try:
-                    handle = open(path, "r+", encoding="utf-8")
-                except FileNotFoundError:
-                    yield None
-                    return
-
             lock_type = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-            fcntl.flock(handle.fileno(), lock_type)
-            handle.seek(0)
-            yield handle
+            fcntl.flock(lock_handle.fileno(), lock_type)
+
+            # Open state only after acquiring the stable lock. Opening it
+            # before flock() would pin an obsolete inode while another holder
+            # atomically replaces the state path.
+            state_handle = _open_existing_managed_text_file(
+                self._get_port_mappings_path()
+            )
+            yield state_handle
         finally:
-            if handle is not None:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                handle.close()
+            if state_handle is not None:
+                state_handle.close()
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_handle.close()
 
     def _serialize_port_mapping_state(self, state: Dict[str, Any]) -> str:
         """Serialize the in-memory state to JSON."""
@@ -2887,7 +3596,7 @@ class Sandy:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
             print(
-                f"W: Port mapping state is invalid JSON: {_sanitize_log_output(str(exc))}"
+                f"W: Port mapping state is invalid JSON: {_terminal_safe_repr(str(exc))}"
             )
             return {}
         if not isinstance(data, dict):
@@ -2896,7 +3605,7 @@ class Sandy:
 
     def _remove_port_mappings_from_state(self, container_name: str) -> list:
         """Remove a container's entry from state and return its ports."""
-        with self._port_mapping_lock(exclusive=True, create=False) as handle:
+        with self._port_mapping_lock(exclusive=True) as handle:
             if handle is None:
                 return []
 
@@ -2921,10 +3630,7 @@ class Sandy:
 
     def _clear_port_mapping_state(self):
         """Remove the entire port mapping state file, if present."""
-        path = self._get_port_mappings_path()
-        if not os.path.exists(path):
-            return
-        with self._port_mapping_lock(exclusive=True, create=False) as handle:
+        with self._port_mapping_lock(exclusive=True) as handle:
             if handle is None:
                 return
             self._persist_port_mapping_state({})
@@ -2955,8 +3661,7 @@ class Sandy:
         if container_ip and _validate_ip_address(container_ip):
             sanitized_ip = container_ip
 
-        create_file = bool(deduped)
-        with self._port_mapping_lock(exclusive=True, create=create_file) as handle:
+        with self._port_mapping_lock(exclusive=True) as handle:
             if handle is None and not deduped:
                 return
 
@@ -2981,9 +3686,9 @@ class Sandy:
                 if existing and existing.get("container") != container_name:
                     print(
                         "E: Port "
-                        f"{_sanitize_log_output(proto)}:{_sanitize_log_output(str(host_port))} "
+                        f"{_strip_control_characters(proto)}:{_strip_control_characters(str(host_port))} "
                         f"is already allocated to container "
-                        f"'{_sanitize_log_output(existing['container'])}'"
+                        f"'{_strip_control_characters(existing['container'])}'"
                     )
                     print("   Stop the existing container or choose a different port")
                     sys.exit(1)
@@ -3018,7 +3723,7 @@ class Sandy:
 
             if not container_ip:
                 print(
-                    f"W: Could not determine IP for '{_sanitize_log_output(container_name)}' during cleanup"
+                    f"W: Could not determine IP for '{_strip_control_characters(container_name)}' during cleanup"
                 )
                 return
 
@@ -3124,7 +3829,7 @@ class Sandy:
             os.unlink(manifest_path)
 
     def _clear_cache_contents(self, preserve_state: bool = True) -> bool:
-        """Remove cache directory contents, optionally preserving port state file."""
+        """Clear cache contents while preserving transaction coordination."""
         cache_dir = self._get_cache_dir()
         if not os.path.exists(cache_dir):
             return False
@@ -3133,6 +3838,10 @@ class Sandy:
         removed_any = False
         for entry in os.listdir(cache_dir):
             entry_path = os.path.join(cache_dir, entry)
+            if entry == PORT_MAPPINGS_LOCK_FILENAME:
+                # This inode is the permanent transaction lock. Removing it
+                # could split queued and new processes across different locks.
+                continue
             try:
                 if (
                     preserve_state
@@ -3144,7 +3853,7 @@ class Sandy:
                 continue
 
             if os.path.isdir(entry_path):
-                _rmtree(entry_path)
+                _remove_managed_tree(entry_path)
             else:
                 try:
                     os.remove(entry_path)
@@ -3160,7 +3869,7 @@ class Sandy:
         print(f"I: Creating new machine from cache: {cache_path}")
 
         # we need to create the directory to untar to it with -C/--directory
-        _mkdir(mdir)  # calls _verify_safe_dir()
+        _mkdir(mdir)
 
         # Extract tar with full preservation of all attributes
         cmd = [
@@ -3194,7 +3903,7 @@ class Sandy:
                 gateway = self.network.gateway
             else:
                 print(
-                    f"W: Could not refresh network configuration for '{_sanitize_log_output(self.network.bridge_name)}', creating guest files without network init"
+                    f"W: Could not refresh network configuration for '{_strip_control_characters(self.network.bridge_name)}', creating guest files without network init"
                 )
         _create_guest_files(mdir, self.container, network_cidr, gateway)
 
@@ -3261,7 +3970,7 @@ class Sandy:
                     gateway = self.network.gateway
                 else:
                     print(
-                        f"W: Could not refresh network configuration for '{_sanitize_log_output(self.network.bridge_name)}', creating guest files without network init"
+                        f"W: Could not refresh network configuration for '{_strip_control_characters(self.network.bridge_name)}', creating guest files without network init"
                     )
             _create_guest_files(mdir, self.container, network_cidr, gateway)
 
@@ -3270,19 +3979,18 @@ class Sandy:
                 self._create_cache(mdir)
 
     def _purge_cache(self):
-        """Remove entire cache directory"""
+        """Remove cache payloads while retaining stable coordination state."""
         cache_dir = self._get_cache_dir()
         if os.path.exists(cache_dir):
-            if self._clear_cache_contents(preserve_state=True):
+            with self._port_mapping_lock(exclusive=True):
+                removed_any = self._clear_cache_contents(preserve_state=True)
+            if removed_any:
                 print(
-                    f"I: Purged cache directory ('{cache_dir}') except port mapping state"
+                    f"I: Purged cache directory ('{cache_dir}') except port mapping coordination state"
                 )
-            elif not os.path.exists(self._get_port_mappings_path()):
-                _rmtree(cache_dir)  # calls _verify_safe_dir()
-                print(f"I: Purged cache directory ('{cache_dir}')")
             else:
                 print(
-                    f"I: Cache directory retained only port mapping state ('{cache_dir}')"
+                    f"I: Cache directory retained only port mapping coordination state ('{cache_dir}')"
                 )
         else:
             print(f"I: No cache directory to purge")
@@ -3461,7 +4169,10 @@ class Sandy:
                 if match:
                     return match.group(1)
         except Exception as e:
-            print(f"W: Could not read container IP from init script: {e}")
+            print(
+                "W: Could not read container IP from init script: "
+                f"{_terminal_safe_repr(str(e))}"
+            )
 
         return None
 
@@ -3501,13 +4212,13 @@ class Sandy:
 
         if not self.network._ensure_gateway():
             print(
-                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+                f"E: Could not determine gateway for bridge '{_strip_control_characters(self.network.bridge_name)}'"
             )
             return False
 
         if not self.network.gateway:
             print(
-                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+                f"E: Gateway value missing for bridge '{_strip_control_characters(self.network.bridge_name)}'"
             )
             return False
 
@@ -3620,7 +4331,7 @@ class Sandy:
 
             return True
         except Exception as e:
-            print(f"E: Error setting up port forwarding: {e}")
+            print(f"E: Error setting up port forwarding: {_terminal_safe_repr(str(e))}")
             return False
 
     def _nft_dnat_rule_args(
@@ -3726,13 +4437,13 @@ class Sandy:
 
         if not self.network._ensure_gateway():
             print(
-                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+                f"E: Could not determine gateway for bridge '{_strip_control_characters(self.network.bridge_name)}'"
             )
             return False
 
         if not self.network.gateway:
             print(
-                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+                f"E: Gateway value missing for bridge '{_strip_control_characters(self.network.bridge_name)}'"
             )
             return False
 
@@ -3794,7 +4505,10 @@ class Sandy:
 
             return True
         except Exception as e:
-            print(f"E: Error setting up nftables port forwarding: {e}")
+            print(
+                "E: Error setting up nftables port forwarding: "
+                f"{_terminal_safe_repr(str(e))}"
+            )
             return False
 
     def _cleanup_port_forwarding_rules(
@@ -3827,13 +4541,13 @@ class Sandy:
 
         if not self.network._ensure_gateway():
             print(
-                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+                f"E: Could not determine gateway for bridge '{_strip_control_characters(self.network.bridge_name)}'"
             )
             return False
 
         if not self.network.gateway:
             print(
-                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+                f"E: Gateway value missing for bridge '{_strip_control_characters(self.network.bridge_name)}'"
             )
             return False
         try:
@@ -3936,7 +4650,10 @@ class Sandy:
                 )
             return True
         except Exception as e:
-            print(f"E: Error cleaning up iptables port forwarding: {e}")
+            print(
+                "E: Error cleaning up iptables port forwarding: "
+                f"{_terminal_safe_repr(str(e))}"
+            )
             return False
 
     def _cleanup_port_forwarding_nft(self, container_ip: str) -> bool:
@@ -3949,13 +4666,13 @@ class Sandy:
 
         if not self.network._ensure_gateway():
             print(
-                f"E: Could not determine gateway for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+                f"E: Could not determine gateway for bridge '{_strip_control_characters(self.network.bridge_name)}'"
             )
             return False
 
         if not self.network.gateway:
             print(
-                f"E: Gateway value missing for bridge '{_sanitize_log_output(self.network.bridge_name)}'"
+                f"E: Gateway value missing for bridge '{_strip_control_characters(self.network.bridge_name)}'"
             )
             return False
         gateway = self.network.gateway
@@ -4008,7 +4725,10 @@ class Sandy:
                 )
             return True
         except Exception as e:
-            print(f"E: Error cleaning up nftables port forwarding: {e}")
+            print(
+                "E: Error cleaning up nftables port forwarding: "
+                f"{_terminal_safe_repr(str(e))}"
+            )
             return False
 
     def _run_init_script(
@@ -4102,7 +4822,7 @@ class Sandy:
                 validated = _validate_port_mapping(port_spec)
                 if validated is None:
                     print(
-                        f"E: Invalid port specification '{_sanitize_log_output(port_spec)}'"
+                        f"E: Invalid port specification '{_strip_control_characters(port_spec)}'"
                     )
                     print(
                         "   Format: proto:host_port:container_port (e.g., tcp:8080:80)"
@@ -4391,19 +5111,26 @@ class Sandy:
 
         # Process each container directory
         for mdir in mdirs_to_remove:
-            # Extract container name from directory path
-            con_name = os.path.basename(mdir).split(".", maxsplit=1)[1]
+            try:
+                con_name = _container_name_from_machine_path(mdir)
+            except ValueError as exc:
+                print(
+                    "W: Skipping invalid Sandy machine entry "
+                    f"{_terminal_safe_repr(mdir)}: {_terminal_safe_repr(str(exc))}"
+                )
+                continue
+            safe_con_name = _terminal_safe_repr(con_name)
 
             container_was_powered_off = False
             if self._is_container_running(con_name):
                 # Container is running, ask to power off
                 if args.force or self._confirm(
-                    f"Container '{con_name}' is running. Power off and remove the container"
+                    f"Container {safe_con_name} is running. Power off and remove the container"
                 ):
                     self._machine_poweroff(con_name)
                     container_was_powered_off = True
                 else:
-                    print(f"I: Skipping removal of running container '{con_name}'")
+                    print(f"I: Skipping removal of running container {safe_con_name}")
                     continue
 
             # If user already confirmed poweroff, don't prompt again for removal
@@ -4476,8 +5203,10 @@ class Sandy:
             if mdir == self._get_cache_dir():
                 continue
 
-            # Extract container name from directory path
-            con_name = os.path.basename(mdir).split(".", maxsplit=1)[1]
+            try:
+                con_name = _container_name_from_machine_path(mdir)
+            except ValueError:
+                continue
 
             # Check if container is running
             is_running = self._is_container_running(con_name) is not None
@@ -4722,39 +5451,45 @@ def main():
     # Set global options with proper validation
     if args.workspace:
         if not _validate_workspace_path(args.workspace):
-            print(f"E: Invalid workspace path '{_sanitize_log_output(args.workspace)}'")
+            print(
+                f"E: Invalid workspace path '{_strip_control_characters(args.workspace)}'"
+            )
             sys.exit(1)
         sandy.workspace = args.workspace
 
     if args.shared:
         if not _validate_workspace_path(args.shared):
-            print(f"E: Invalid shared path '{_sanitize_log_output(args.shared)}'")
+            print(f"E: Invalid shared path '{_strip_control_characters(args.shared)}'")
             sys.exit(1)
         sandy.shared = args.shared
 
     if args.container:
         if not _validate_container_name(args.container):
-            print(f"E: Invalid container name '{_sanitize_log_output(args.container)}'")
+            print(
+                f"E: Invalid container name '{_strip_control_characters(args.container)}'"
+            )
             sys.exit(1)
         sandy.container = args.container
     else:
         # Validate default container name too
         if not _validate_container_name(sandy.container):
             print(
-                f"E: Invalid default container name '{_sanitize_log_output(sandy.container)}'"
+                f"E: Invalid default container name '{_strip_control_characters(sandy.container)}'"
             )
             sys.exit(1)
 
     if args.user:
         if not _validate_username(args.user):
-            print(f"E: Invalid username '{_sanitize_log_output(args.user)}'")
+            print(f"E: Invalid username '{_strip_control_characters(args.user)}'")
             sys.exit(1)
         sandy.user = args.user
         sandy.user_home = "/root" if sandy.user == "root" else f"/home/{sandy.user}"
     else:
         # Validate default username too
         if not _validate_username(sandy.user):
-            print(f"E: Invalid default username '{_sanitize_log_output(sandy.user)}'")
+            print(
+                f"E: Invalid default username '{_strip_control_characters(sandy.user)}'"
+            )
             sys.exit(1)
 
     # Execute command

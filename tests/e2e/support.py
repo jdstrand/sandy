@@ -28,6 +28,7 @@ INSTALL_DIR = Path("/usr/local/lib/sandy")
 SYSTEMD_MACHINES = Path("/var/lib/machines")
 CACHE_DIR = SYSTEMD_MACHINES / "sandy.__cache"
 PORT_STATE = CACHE_DIR / "port_mappings.json"
+PORT_LOCK = CACHE_DIR / "port_mappings.lock"
 BRIDGE_NAME = "sandybr0"
 NAME_PATTERN = re.compile(r"^e2e-[a-z0-9-]{1,48}$")
 DEFAULT_TIMEOUT = 120
@@ -110,6 +111,7 @@ class E2EContext:
         suffix = secrets.token_hex(3)
         self.cache_name = f"e2e-cache-{suffix}"
         self.cache_miss_name = f"e2e-cache-miss-{suffix}"
+        self.filesystem_name = f"e2e-filesystem-{suffix}"
         self.main_name = f"e2e-main-{suffix}"
         self.full_name = f"e2e-full-{suffix}"
         self.cache_user = "developer"
@@ -127,6 +129,11 @@ class E2EContext:
         for mount_path in (self.workspace, self.shared):
             os.chown(mount_path, CONTAINER_USER_ID, CONTAINER_USER_ID)
 
+        self.filesystem_image_root = Path("/var/lib") / f"sandy-e2e-image-{suffix}"
+        self.filesystem_host_target = Path("/var/lib") / f"sandy-e2e-host-{suffix}"
+        self.filesystem_machine_link = (
+            SYSTEMD_MACHINES / f"sandy.{self.filesystem_name}"
+        )
         self.owned_containers: dict[str, str] = {}
         self.fixture_processes: list[subprocess.Popen[str]] = []
         self.full_build_started = False
@@ -134,11 +141,14 @@ class E2EContext:
         self._ip_forward_original: str | None = None
         self._host_state_owned = False
         self._install_dir_owned = False
+        self._filesystem_fixtures_owned = False
+        self._filesystem_mounts: list[Path] = []
 
     def _validate_names(self) -> None:
         for name in (
             self.cache_name,
             self.cache_miss_name,
+            self.filesystem_name,
             self.main_name,
             self.full_name,
         ):
@@ -273,6 +283,15 @@ class E2EContext:
             raise E2EFailure(f"Missing {SYSTEMD_MACHINES}")
         if INSTALL_DIR.exists() or INSTALL_DIR.is_symlink():
             raise E2EFailure(f"Refusing to replace existing install: {INSTALL_DIR}")
+        for fixture_path in (
+            self.filesystem_image_root,
+            self.filesystem_host_target,
+            self.filesystem_machine_link,
+        ):
+            if fixture_path.exists() or fixture_path.is_symlink():
+                raise E2EFailure(
+                    f"Refusing to replace existing filesystem fixture: {fixture_path}"
+                )
 
         required_tools = (
             "curl",
@@ -282,6 +301,7 @@ class E2EContext:
             "iptables",
             "machinectl",
             "make",
+            "mount",
             "nft",
             "nsenter",
             "runuser",
@@ -291,6 +311,7 @@ class E2EContext:
             "systemd-machine-id-setup",
             "systemd-nspawn",
             "tar",
+            "umount",
             "umoci",
         )
         missing = [tool for tool in required_tools if shutil.which(tool) is None]
@@ -314,6 +335,7 @@ class E2EContext:
         # Every global Sandy namespace was absent at preflight, so subsequent
         # Sandy state belongs to this run and is safe for cleanup to remove.
         self._host_state_owned = True
+        self._filesystem_fixtures_owned = True
 
     def claim_install_dir(self) -> None:
         """Claim the known-absent default install path for guarded cleanup."""
@@ -359,7 +381,15 @@ class E2EContext:
 
     def sandy_state_artifacts(self) -> list[str]:
         """Return persistent Sandy machine, bridge, and firewall state."""
-        artifacts = [str(path) for path in sorted(SYSTEMD_MACHINES.glob("sandy.*"))]
+        artifacts = []
+        for path in sorted(SYSTEMD_MACHINES.glob("sandy.*")):
+            if (
+                path == CACHE_DIR
+                and self._persistent_port_lock_is_safe()
+                and list(CACHE_DIR.iterdir()) == [PORT_LOCK]
+            ):
+                continue
+            artifacts.append(str(path))
         if self.bridge_exists():
             artifacts.append(f"bridge {BRIDGE_NAME}")
         artifacts.extend(self.firewall_artifacts())
@@ -370,6 +400,76 @@ class E2EContext:
         artifacts = self.sandy_state_artifacts()
         if artifacts:
             raise E2EFailure("Sandy state remains: " + ", ".join(artifacts))
+
+    def remove_filesystem_fixtures(self) -> None:
+        """Remove only root filesystem fixtures proven absent at preflight."""
+        if not self._filesystem_fixtures_owned:
+            raise E2EFailure("Filesystem fixtures are not owned by this E2E run")
+        if self._filesystem_mounts:
+            raise E2EFailure(
+                "Refusing to remove filesystem fixtures while tracked mounts remain"
+            )
+        for fixture_path in (
+            self.filesystem_machine_link,
+            self.filesystem_image_root,
+            self.filesystem_host_target,
+        ):
+            if fixture_path.is_symlink() or fixture_path.is_file():
+                fixture_path.unlink()
+            elif fixture_path.is_dir():
+                shutil.rmtree(fixture_path)
+
+    def mount_filesystem_file(
+        self,
+        source_path: Path,
+        mount_path: Path,
+    ) -> None:
+        """Bind mount one owned fixture file and track it before host mutation."""
+        if not self._filesystem_fixtures_owned:
+            raise E2EFailure("Filesystem fixtures are not owned by this E2E run")
+        expected_parents = (
+            (source_path, self.filesystem_host_target),
+            (mount_path, self.filesystem_machine_link),
+        )
+        for path, expected_parent in expected_parents:
+            try:
+                path_stat = path.lstat()
+            except OSError as exc:
+                raise E2EFailure(
+                    f"Could not inspect filesystem fixture {path}"
+                ) from exc
+            if (
+                path.parent != expected_parent
+                or not stat.S_ISREG(path_stat.st_mode)
+                or (path_stat.st_uid, path_stat.st_gid) != (0, 0)
+            ):
+                raise E2EFailure(f"Unsafe filesystem fixture file: {path}")
+        if mount_path in self._filesystem_mounts:
+            raise E2EFailure(f"Filesystem fixture is already mounted: {mount_path}")
+
+        # Register before invoking mount so global cleanup covers command
+        # interruption or a command failure after the kernel creates the mount.
+        self._filesystem_mounts.append(mount_path)
+        self.run(
+            [
+                "mount",
+                "--bind",
+                str(source_path),
+                str(mount_path),
+            ]
+        )
+
+    def unmount_filesystem_file(self, mount_path: Path) -> None:
+        """Unmount one tracked fixture and forget it only after success."""
+        if mount_path not in self._filesystem_mounts:
+            raise E2EFailure(f"Filesystem fixture mount is not tracked: {mount_path}")
+        result = self.run(
+            ["umount", "--", str(mount_path)],
+            expected=None,
+        )
+        if result.returncode != 0:
+            raise E2EFailure(f"Could not unmount filesystem fixture: {mount_path}")
+        self._filesystem_mounts.remove(mount_path)
 
     def register_container(self, name: str, user: str) -> None:
         if not NAME_PATTERN.fullmatch(name):
@@ -560,6 +660,13 @@ class E2EContext:
     def purge_cache(self) -> None:
         if CACHE_DIR.exists():
             self.sandy(["rm", "--cache", "--force"])
+        if PORT_LOCK.exists() or PORT_LOCK.is_symlink():
+            if not self._persistent_port_lock_is_safe():
+                raise E2EFailure(f"Unsafe persistent port lock: {PORT_LOCK}")
+            # Product code never removes this stable inode because a waiter
+            # could still hold it. The harness owns the otherwise-clean VM and
+            # removes it only after all Sandy operations have stopped.
+            PORT_LOCK.unlink()
         if CACHE_DIR.exists() and not any(CACHE_DIR.iterdir()):
             CACHE_DIR.rmdir()
         if CACHE_DIR.exists():
@@ -567,6 +674,18 @@ class E2EContext:
             raise E2EFailure(
                 f"Cache directory remains after purge: {CACHE_DIR} ({remaining})"
             )
+
+    def _persistent_port_lock_is_safe(self) -> bool:
+        """Return whether the persistent lock has its exact safe metadata."""
+        if not PORT_LOCK.exists() or PORT_LOCK.is_symlink():
+            return False
+        lock_stat = PORT_LOCK.lstat()
+        return (
+            stat.S_ISREG(lock_stat.st_mode)
+            and (lock_stat.st_uid, lock_stat.st_gid) == (0, 0)
+            and stat.S_IMODE(lock_stat.st_mode) == 0o600
+            and lock_stat.st_nlink == 1
+        )
 
     def bridge_exists(self) -> bool:
         return (
@@ -637,6 +756,18 @@ class E2EContext:
                 self.remove_container(name, user)
             except Exception as exc:  # cleanup must continue through every target
                 errors.append(f"container {name}: {exc}")
+
+        for mount_path in reversed(tuple(self._filesystem_mounts)):
+            try:
+                self.unmount_filesystem_file(mount_path)
+            except Exception as exc:
+                errors.append(f"filesystem mount {mount_path}: {exc}")
+
+        if self._filesystem_fixtures_owned:
+            try:
+                self.remove_filesystem_fixtures()
+            except Exception as exc:
+                errors.append(f"filesystem fixtures: {exc}")
 
         if self._host_state_owned:
             try:
