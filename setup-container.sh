@@ -269,6 +269,9 @@ if [ ! -e "/home/$AI_USER/.local/bin/claude" ]; then
   chown "$AI_USER:$AI_USER" "/home/$AI_USER/.claude.json"
   chmod 600 "/home/$AI_USER/.claude.json"
 
+  echo -e "\nI: Disable mouse click in the new TUI"
+  echo "export CLAUDE_CODE_DISABLE_MOUSE=1" >> "/home/$AI_USER/.bashrc"
+
   # install plugins (lsp improves efficiency (doesn't need compiler))
   echo -e "\nI: claude plugin marketplace add anthropics/claude-plugins-official"
   su -l "$AI_USER" -c "claude plugin marketplace add anthropics/claude-plugins-official"
@@ -314,7 +317,6 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/gemini ; then
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @google/gemini-cli"
   ai_tools+=("gemini (https://github.com/google-gemini/gemini-cli; newline: ctrl+j or alt+enter)")
 
-  # adjust path for go and ~/.local/bin
   echo -e "\nI: Add gemini alias for NO_BROWSER=true"
   echo "alias gemini='NO_BROWSER=true gemini'" >> "/home/$AI_USER/.bashrc"
 fi
