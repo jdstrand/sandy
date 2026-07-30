@@ -186,15 +186,18 @@ host packages, or weaken checks merely to obtain a passing result.
   `setup-container.sh` changes requiring complete provisioning; comment-only
   or global-version changes require only ShellCheck.
 
-## Communication and Handoff
+## Communication
 
-* Use ASD-STE100 Simplified Technical English, Issue 9, for all authored prose,
-  including agent messages, documentation, code comments, commit messages,
-  issue content, and pull request content.
-* Report progress only for material findings or changes in direction.
-* Lead the final response with the outcome, checks, gaps, risks, and
-  assumptions; omit filler and repeated summaries.
-* Match deliverable length to the task. Update tests, `--help`, and `README.md`
-  when user-visible behavior or security assumptions change.
-* Do not modify sudoers, install files as root, or run destructive cleanup as
-  ordinary verification.
+* Use ASD-STE100 Simplified Technical English, Issue 9, as the reference
+  standard for all authored prose, including agent messages, review findings,
+  summaries, issue content, and pull request content. In practice: short
+  sentences (approximately 20 words or fewer), active voice, one meaning per
+  word, no idioms, no metaphors or other figurative language. Use a necessary
+  technical term even when the STE dictionary does not contain it.
+* Use a neutral, direct tone. Lead with findings and omit generic praise,
+  reassurance, and filler.
+* Do not send interim progress updates. Report only material findings and
+  changes of scope.
+* Make each claim proportional to its evidence. Label inference and uncertainty.
+* Match the response length to the findings. Preserve evidence, caveats, and
+  gaps; omit repeated summaries. Keep code excerpts short.
