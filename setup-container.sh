@@ -92,7 +92,20 @@ set_title() {
     fi
     local TITLE="\[\e]2;$*\a\]"
     PS1="${ORIG_PS1}${TITLE}"
+
+    # claude
     export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1
+
+    # codex workaround
+    SANDY_CODEX_ALIAS_DISABLE_TERMINAL=1
+}
+
+_sandy_codex() {
+  if [ "$SANDY_CODEX_ALIAS_DISABLE_TERMINAL" = 1 ]; then
+      command codex -c 'tui.terminal_title=[]' "$@"
+  else
+      command codex "$@"
+  fi
 }
 EOF
 
@@ -300,6 +313,10 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/codex ; then
   echo -e '[agents]\nmax_threads = 10\n' >> "/home/$AI_USER/.codex/config.toml"
   chown "$AI_USER:$AI_USER" "/home/$AI_USER/.codex/config.toml"
   chmod 600 "/home/$AI_USER/.codex/config.toml"
+
+  # add alias so we can disable terminal title updates
+  echo -e "\nI: Add 'codex' alias for _sandy_codex for terminal title"
+  echo "alias codex=_sandy_codex" >> "/home/$AI_USER/.bashrc"
 fi
 
 # Install copilot cli
