@@ -350,7 +350,7 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/influxdb-mcp-server ; the
   echo -e "\nI: Install influxdb-mcp-server"
   # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
   # PATH as part of nvm install
-  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && git clone https://github.com/influxdata/influxdb3_mcp_server.git .influxdb3_mcp_server && cd ./.influxdb3_mcp_server && npm install && npm run build && npm link"
+  su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g @influxdata/influxdb3-mcp-server"
   ai_tools+=("influxdb-mcp-server (https://github.com/influxdata/influxdb3_mcp_server)")
 fi
 
