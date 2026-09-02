@@ -354,6 +354,12 @@ if ! test -e "/home/$AI_USER"/.nvm/versions/node/*/bin/influxdb-mcp-server ; the
   ai_tools+=("influxdb-mcp-server (https://github.com/influxdata/influxdb3_mcp_server)")
 fi
 
+# globally git ignore .influx-review
+if ! grep -q '\.influx-review/' "/home/$AI_USER"/.config/git/ignore ; then
+    echo -e "\nI: globally git ignore .influx-review"
+    su -l "$AI_USER" -c "mkdir -p \"/home/$AI_USER/.config/git\" ; echo '.influx-review/' >> \"/home/$AI_USER\"/.config/git/ignore"
+fi
+
 # do this last so all the tools are listed
 if ! grep -q "AI tools:" "/home/$AI_USER/.bashrc" ; then
   {
