@@ -128,6 +128,7 @@ apt-get update  # for command-not-found
 
 echo -e "\nI: Install tools for AI"
 apt-get install -y \
+  binutils \
   bsdextrautils \
   ca-certificates \
   curl \
