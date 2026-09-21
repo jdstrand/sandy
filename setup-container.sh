@@ -144,6 +144,7 @@ apt-get install -y \
   rsync \
   shellcheck \
   sqlite3 \
+  unzip \
   wget
 
 echo -e "\nI: Install build tools"
