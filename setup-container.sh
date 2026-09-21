@@ -287,6 +287,9 @@ if [ ! -e "/home/$AI_USER/.local/bin/claude" ]; then
   echo -e "\nI: Disable mouse click in the new TUI"
   echo "export CLAUDE_CODE_DISABLE_MOUSE=1" >> "/home/$AI_USER/.bashrc"
 
+  echo -e "\nI: Claude-Session in commit messages"
+  echo "export CLAUDE_CODE_SUPPRESS_SESSION_ATTRIBUTION=1" >> "/home/$AI_USER/.bashrc"
+
   # install plugins (lsp improves efficiency (doesn't need compiler))
   echo -e "\nI: claude plugin marketplace add anthropics/claude-plugins-official"
   su -l "$AI_USER" -c "claude plugin marketplace add anthropics/claude-plugins-official"
