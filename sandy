@@ -2,6 +2,7 @@
 
 import argparse
 import array
+import ctypes
 import errno
 import fcntl
 import glob
@@ -1436,6 +1437,216 @@ def _open_existing_managed_text_file(path: str) -> Optional[Any]:
         if file_fd is not None:
             os.close(file_fd)
         os.close(parent_fd)
+
+
+# Kernel interfaces for confined container entry. Python 3.10 has no os.setns,
+# and glibc declares ptrace and prctl as variadic, so every call goes through
+# syscall(2) with a fixed argument count. Only 64-bit x86_64 and aarch64 are
+# supported; any other architecture fails closed.
+ENTRY_SYSCALL_NUMBERS: Final[Mapping[str, Mapping[str, int]]] = {
+    "x86_64": {"ptrace": 101, "prctl": 157, "setns": 308, "seccomp": 317},
+    "aarch64": {"ptrace": 117, "prctl": 167, "setns": 268, "seccomp": 277},
+}
+SYSCALL_ARGUMENT_COUNT: Final = 6
+PTRACE_ATTACH: Final = 16
+PTRACE_DETACH: Final = 17
+PTRACE_SECCOMP_GET_FILTER: Final = 0x420C
+PR_CAPBSET_READ: Final = 23
+PR_CAPBSET_DROP: Final = 24
+SECCOMP_SET_MODE_FILTER: Final = 1
+# The kernel limits one classic BPF program to BPF_MAXINSNS instructions.
+BPF_MAXINSNS: Final = 4096
+# MAX_INSNS_PER_PATH in kernel/seccomp.c bounds the instructions of all
+# filters of a task, so it also bounds the filter index.
+SECCOMP_MAX_INSNS_PER_PATH: Final = 32768
+# PID_MAX_LIMIT on 64-bit kernels; a valid PID is always below it.
+PID_MAX_LIMIT: Final = 4194304
+# Capability numbers are bits in the 64-bit CapBnd mask.
+CAPABILITY_MAX: Final = 63
+# Namespace types in the only order that works for entry: the user namespace
+# is last, because joining it drops the host capabilities that the other
+# setns calls need.
+CLONE_NEWNS: Final = 0x00020000
+CLONE_NEWCGROUP: Final = 0x02000000
+CLONE_NEWUTS: Final = 0x04000000
+CLONE_NEWIPC: Final = 0x08000000
+CLONE_NEWUSER: Final = 0x10000000
+CLONE_NEWPID: Final = 0x20000000
+CLONE_NEWNET: Final = 0x40000000
+NAMESPACE_ENTRY_ORDER: Final[Tuple[Tuple[str, int], ...]] = (
+    ("cgroup", CLONE_NEWCGROUP),
+    ("ipc", CLONE_NEWIPC),
+    ("uts", CLONE_NEWUTS),
+    ("net", CLONE_NEWNET),
+    ("pid", CLONE_NEWPID),
+    ("mnt", CLONE_NEWNS),
+    ("user", CLONE_NEWUSER),
+)
+_LIBC: Optional[Any] = None
+
+
+class _SockFilter(ctypes.Structure):
+    """struct sock_filter from linux/filter.h: one classic BPF instruction."""
+
+    _fields_ = [
+        ("code", ctypes.c_uint16),
+        ("jt", ctypes.c_uint8),
+        ("jf", ctypes.c_uint8),
+        ("k", ctypes.c_uint32),
+    ]
+
+
+class _SockFprog(ctypes.Structure):
+    """struct sock_fprog from linux/filter.h: a classic BPF program."""
+
+    _fields_ = [
+        ("len", ctypes.c_ushort),
+        ("filter", ctypes.POINTER(_SockFilter)),
+    ]
+
+
+SOCK_FILTER_SIZE: Final = ctypes.sizeof(_SockFilter)
+
+
+def _libc() -> Any:
+    """Return the process C library, loaded once with errno capture."""
+    global _LIBC
+    if _LIBC is None:
+        # CDLL(None) uses the symbols already loaded in this process. It does
+        # not search library paths or run helper programs.
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.argtypes = [ctypes.c_long] * (SYSCALL_ARGUMENT_COUNT + 1)
+        libc.syscall.restype = ctypes.c_long
+        _LIBC = libc
+    return _LIBC
+
+
+def _entry_syscall_number(name: str) -> int:
+    """Return the syscall number for this architecture, or fail closed."""
+    machine = platform.machine()
+    numbers = ENTRY_SYSCALL_NUMBERS.get(machine)
+    if numbers is None or ctypes.sizeof(ctypes.c_void_p) != 8:
+        raise OSError(
+            errno.ENOSYS,
+            f"Unsupported architecture for container entry: {_terminal_safe_repr(machine)}",
+        )
+    if name not in numbers:
+        raise ValueError(f"Unsupported container entry syscall: {name!r}")
+    return numbers[name]
+
+
+def _require_int_in_range(value: Any, label: str, minimum: int, maximum: int) -> int:
+    """Return value if it is an int (not bool) in the inclusive range."""
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < minimum
+        or value > maximum
+    ):
+        raise ValueError(f"Invalid {label}")
+    return value
+
+
+def _entry_syscall(name: str, *args: int) -> int:
+    """Call one container entry syscall and raise OSError on failure."""
+    number = _entry_syscall_number(name)
+    if len(args) > SYSCALL_ARGUMENT_COUNT:
+        raise ValueError(f"Too many arguments for {name}")
+    for arg in args:
+        # Each argument fits in a C long; pointers are passed as addresses.
+        _require_int_in_range(arg, f"{name} argument", -(2**63), 2**63 - 1)
+    padded = tuple(args) + (0,) * (SYSCALL_ARGUMENT_COUNT - len(args))
+    result = _libc().syscall(number, *padded)
+    if result == -1:
+        err = ctypes.get_errno() or errno.EIO
+        raise OSError(err, f"{name} failed: {os.strerror(err)}")
+    return result
+
+
+def _require_pid(pid: Any) -> int:
+    """Return a validated positive process ID."""
+    return _require_int_in_range(pid, "process ID", 1, PID_MAX_LIMIT - 1)
+
+
+def _ptrace_attach(pid: int) -> None:
+    """Attach to pid with PTRACE_ATTACH. The caller must wait for the stop."""
+    _entry_syscall("ptrace", PTRACE_ATTACH, _require_pid(pid), 0, 0)
+
+
+def _ptrace_detach(pid: int) -> None:
+    """Detach from pid with PTRACE_DETACH and no signal."""
+    _entry_syscall("ptrace", PTRACE_DETACH, _require_pid(pid), 0, 0)
+
+
+def _ptrace_get_seccomp_filter(pid: int, index: int) -> bytes:
+    """Return the classic BPF program of one seccomp filter of a stopped tracee.
+
+    Index 0 is the oldest filter (measured on kernels 5.15, 6.8, and 6.12).
+    OSError with ENOENT means that no filter exists at index.
+    """
+    pid = _require_pid(pid)
+    index = _require_int_in_range(
+        index, "seccomp filter index", 0, SECCOMP_MAX_INSNS_PER_PATH
+    )
+    count = _entry_syscall("ptrace", PTRACE_SECCOMP_GET_FILTER, pid, index, 0)
+    _require_int_in_range(count, "seccomp filter length", 1, BPF_MAXINSNS)
+    program = (_SockFilter * count)()
+    copied = _entry_syscall(
+        "ptrace",
+        PTRACE_SECCOMP_GET_FILTER,
+        pid,
+        index,
+        ctypes.addressof(program),
+    )
+    if copied != count:
+        raise OSError(errno.EIO, "Seccomp filter length changed during read")
+    return bytes(program)
+
+
+def _capbset_read(capability: int) -> bool:
+    """Return whether capability is in the calling thread's bounding set."""
+    capability = _require_int_in_range(capability, "capability", 0, CAPABILITY_MAX)
+    result = _entry_syscall("prctl", PR_CAPBSET_READ, capability, 0, 0, 0)
+    if result not in (0, 1):
+        raise OSError(errno.EIO, "Unexpected PR_CAPBSET_READ result")
+    return result == 1
+
+
+def _capbset_drop(capability: int) -> None:
+    """Remove capability from the calling thread's bounding set."""
+    capability = _require_int_in_range(capability, "capability", 0, CAPABILITY_MAX)
+    _entry_syscall("prctl", PR_CAPBSET_DROP, capability, 0, 0, 0)
+
+
+def _setns(fd: int, nstype: int) -> None:
+    """Join the namespace of fd; nstype must name exactly that namespace type."""
+    fd = _require_int_in_range(fd, "namespace descriptor", 0, 2**31 - 1)
+    # A zero nstype would accept any namespace type. Require an explicit one.
+    if nstype not in {flag for _, flag in NAMESPACE_ENTRY_ORDER}:
+        raise ValueError("Invalid namespace type")
+    _entry_syscall("setns", fd, nstype)
+
+
+def _seccomp_set_mode_filter(program: bytes) -> None:
+    """Install one classic BPF seccomp program on the calling thread.
+
+    No flags are passed, so the filter applies to this thread only. The caller
+    must be single-threaded and hold CAP_SYS_ADMIN in its user namespace, or
+    have set no_new_privs.
+    """
+    if not isinstance(program, bytes):
+        raise ValueError("Seccomp program must be bytes")
+    count, remainder = divmod(len(program), SOCK_FILTER_SIZE)
+    if remainder or count < 1 or count > BPF_MAXINSNS:
+        raise ValueError("Invalid seccomp program length")
+    instructions = (_SockFilter * count).from_buffer_copy(program)
+    fprog = _SockFprog(count, instructions)
+    _entry_syscall(
+        "seccomp",
+        SECCOMP_SET_MODE_FILTER,
+        0,
+        ctypes.addressof(fprog),
+    )
 
 
 def _check_systemd_version():

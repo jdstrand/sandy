@@ -3078,6 +3078,326 @@ class SystemUtilityTests(unittest.TestCase):
             self.assertEqual(instance._get_running_sandy_containers(), [])
 
 
+@contextmanager
+def mocked_entry_syscall(machine="x86_64", return_value=0, side_effect=None, err=0):
+    """Mock libc syscall(2), the machine name, and errno for entry primitives."""
+    syscall = MagicMock(return_value=return_value, side_effect=side_effect)
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(sandy, "_libc", return_value=SimpleNamespace(syscall=syscall))
+        )
+        stack.enter_context(
+            patch.object(sandy.platform, "machine", return_value=machine)
+        )
+        stack.enter_context(patch.object(sandy.ctypes, "get_errno", return_value=err))
+        yield syscall
+
+
+class EntryPrimitiveTests(unittest.TestCase):
+    """Container entry syscall wrappers.
+
+    Every test mocks libc syscall(2), platform.machine, and ctypes.get_errno.
+    No test calls the kernel. E2E tests in a VM must prove the real behavior.
+    """
+
+    def test_libc_is_loaded_once_from_process_symbols(self):
+        libc = MagicMock()
+        with patch.object(sandy, "_LIBC", None), patch.object(
+            sandy.ctypes, "CDLL", return_value=libc
+        ) as cdll:
+            self.assertIs(sandy._libc(), libc)
+            self.assertIs(sandy._libc(), libc)
+        cdll.assert_called_once_with(None, use_errno=True)
+        self.assertEqual(libc.syscall.argtypes, [sandy.ctypes.c_long] * 7)
+        self.assertIs(libc.syscall.restype, sandy.ctypes.c_long)
+
+    def test_syscall_table_is_exact(self):
+        self.assertEqual(
+            sandy.ENTRY_SYSCALL_NUMBERS,
+            {
+                "x86_64": {"ptrace": 101, "prctl": 157, "setns": 308, "seccomp": 317},
+                "aarch64": {
+                    "ptrace": 117,
+                    "prctl": 167,
+                    "setns": 268,
+                    "seccomp": 277,
+                },
+            },
+        )
+
+    def test_struct_layout_matches_linux_filter_h(self):
+        self.assertEqual(sandy.ctypes.sizeof(sandy._SockFilter), 8)
+        self.assertEqual(sandy._SockFilter.code.offset, 0)
+        self.assertEqual(sandy._SockFilter.jt.offset, 2)
+        self.assertEqual(sandy._SockFilter.jf.offset, 3)
+        self.assertEqual(sandy._SockFilter.k.offset, 4)
+        self.assertEqual(sandy.ctypes.sizeof(sandy._SockFprog), 16)
+        self.assertEqual(sandy._SockFprog.filter.offset, 8)
+
+    def test_namespace_entry_order_joins_user_last(self):
+        self.assertEqual(
+            sandy.NAMESPACE_ENTRY_ORDER,
+            (
+                ("cgroup", 0x02000000),
+                ("ipc", 0x08000000),
+                ("uts", 0x04000000),
+                ("net", 0x40000000),
+                ("pid", 0x20000000),
+                ("mnt", 0x00020000),
+                ("user", 0x10000000),
+            ),
+        )
+
+    def test_unsupported_architecture_fails_closed(self):
+        for machine in ("i686", "armv7l", "riscv64", "", "x86_64 "):
+            with self.subTest(machine=machine):
+                with mocked_entry_syscall(machine=machine) as syscall:
+                    with self.assertRaises(OSError) as raised:
+                        sandy._ptrace_attach(42)
+                self.assertEqual(raised.exception.errno, errno.ENOSYS)
+                syscall.assert_not_called()
+
+    def test_non_64_bit_process_fails_closed(self):
+        with mocked_entry_syscall() as syscall, patch.object(
+            sandy.ctypes, "sizeof", return_value=4
+        ):
+            with self.assertRaises(OSError) as raised:
+                sandy._ptrace_attach(42)
+        self.assertEqual(raised.exception.errno, errno.ENOSYS)
+        syscall.assert_not_called()
+
+    def test_unknown_syscall_name_is_rejected(self):
+        with mocked_entry_syscall() as syscall:
+            with self.assertRaises(ValueError):
+                sandy._entry_syscall("unshare", 0)
+        syscall.assert_not_called()
+
+    def test_invalid_syscall_arguments_are_rejected(self):
+        for args in (
+            (1, 2, 3, 4, 5, 6, 7),
+            (True,),
+            ("1",),
+            (1.0,),
+            (2**63,),
+            (-(2**63) - 1,),
+        ):
+            with self.subTest(args=args):
+                with mocked_entry_syscall() as syscall:
+                    with self.assertRaises(ValueError):
+                        sandy._entry_syscall("prctl", *args)
+                syscall.assert_not_called()
+
+    def test_syscall_failure_raises_errno(self):
+        with mocked_entry_syscall(return_value=-1, err=errno.EPERM):
+            with self.assertRaises(OSError) as raised:
+                sandy._ptrace_attach(42)
+        self.assertEqual(raised.exception.errno, errno.EPERM)
+        self.assertIn("ptrace failed", str(raised.exception))
+
+    def test_syscall_failure_without_errno_still_fails(self):
+        with mocked_entry_syscall(return_value=-1, err=0):
+            with self.assertRaises(OSError) as raised:
+                sandy._capbset_drop(0)
+        self.assertEqual(raised.exception.errno, errno.EIO)
+
+    def test_ptrace_attach_and_detach_exact_calls(self):
+        for machine, number in (("x86_64", 101), ("aarch64", 117)):
+            with self.subTest(machine=machine):
+                with mocked_entry_syscall(machine=machine) as syscall:
+                    sandy._ptrace_attach(42)
+                    sandy._ptrace_detach(42)
+                self.assertEqual(
+                    syscall.call_args_list,
+                    [
+                        call(number, 16, 42, 0, 0, 0, 0),
+                        call(number, 17, 42, 0, 0, 0, 0),
+                    ],
+                )
+
+    def test_invalid_process_ids_are_rejected(self):
+        for pid in (0, -1, True, "42", 42.0, None, sandy.PID_MAX_LIMIT):
+            with self.subTest(pid=pid):
+                with mocked_entry_syscall() as syscall:
+                    for function in (
+                        sandy._ptrace_attach,
+                        sandy._ptrace_detach,
+                        lambda value: sandy._ptrace_get_seccomp_filter(value, 0),
+                    ):
+                        with self.assertRaises(ValueError):
+                            function(pid)
+                syscall.assert_not_called()
+        with mocked_entry_syscall() as syscall:
+            sandy._ptrace_attach(sandy.PID_MAX_LIMIT - 1)
+        syscall.assert_called_once_with(101, 16, sandy.PID_MAX_LIMIT - 1, 0, 0, 0, 0)
+
+    def test_get_seccomp_filter_reads_length_then_program(self):
+        program = bytes(range(16))
+
+        def fake_syscall(number, request, pid, index, address, *rest):
+            if address:
+                sandy.ctypes.memmove(address, program, len(program))
+            return 2
+
+        with mocked_entry_syscall(side_effect=fake_syscall) as syscall:
+            self.assertEqual(sandy._ptrace_get_seccomp_filter(42, 3), program)
+        self.assertEqual(syscall.call_count, 2)
+        self.assertEqual(syscall.call_args_list[0], call(101, 0x420C, 42, 3, 0, 0, 0))
+        second = syscall.call_args_list[1].args
+        self.assertEqual(second[:4], (101, 0x420C, 42, 3))
+        self.assertNotEqual(second[4], 0)
+        self.assertEqual(second[5:], (0, 0))
+
+    def test_get_seccomp_filter_propagates_missing_index(self):
+        with mocked_entry_syscall(return_value=-1, err=errno.ENOENT) as syscall:
+            with self.assertRaises(OSError) as raised:
+                sandy._ptrace_get_seccomp_filter(42, 5)
+        self.assertEqual(raised.exception.errno, errno.ENOENT)
+        syscall.assert_called_once_with(101, 0x420C, 42, 5, 0, 0, 0)
+
+    def test_get_seccomp_filter_rejects_invalid_length(self):
+        for count in (0, sandy.BPF_MAXINSNS + 1):
+            with self.subTest(count=count):
+                with mocked_entry_syscall(return_value=count) as syscall:
+                    with self.assertRaises(ValueError):
+                        sandy._ptrace_get_seccomp_filter(42, 0)
+                syscall.assert_called_once()
+
+    def test_get_seccomp_filter_accepts_maximum_length(self):
+        count = sandy.BPF_MAXINSNS
+        with mocked_entry_syscall(return_value=count) as syscall:
+            program = sandy._ptrace_get_seccomp_filter(42, 0)
+        self.assertEqual(len(program), count * 8)
+        self.assertEqual(syscall.call_count, 2)
+
+    def test_get_seccomp_filter_rejects_changed_length(self):
+        with mocked_entry_syscall(side_effect=[2, 3]):
+            with self.assertRaises(OSError) as raised:
+                sandy._ptrace_get_seccomp_filter(42, 0)
+        self.assertEqual(raised.exception.errno, errno.EIO)
+
+    def test_get_seccomp_filter_rejects_invalid_index(self):
+        for index in (-1, True, "0", sandy.SECCOMP_MAX_INSNS_PER_PATH + 1):
+            with self.subTest(index=index):
+                with mocked_entry_syscall() as syscall:
+                    with self.assertRaises(ValueError):
+                        sandy._ptrace_get_seccomp_filter(42, index)
+                syscall.assert_not_called()
+
+    def test_capbset_read_exact_call_and_result(self):
+        for result, expected in ((1, True), (0, False)):
+            with self.subTest(result=result):
+                with mocked_entry_syscall(
+                    machine="aarch64", return_value=result
+                ) as syscall:
+                    self.assertIs(sandy._capbset_read(21), expected)
+                syscall.assert_called_once_with(167, 23, 21, 0, 0, 0, 0)
+
+    def test_capbset_read_rejects_unexpected_result(self):
+        with mocked_entry_syscall(return_value=2):
+            with self.assertRaises(OSError) as raised:
+                sandy._capbset_read(0)
+        self.assertEqual(raised.exception.errno, errno.EIO)
+
+    def test_capbset_drop_exact_call_and_error(self):
+        with mocked_entry_syscall() as syscall:
+            sandy._capbset_drop(63)
+        syscall.assert_called_once_with(157, 24, 63, 0, 0, 0, 0)
+        with mocked_entry_syscall(return_value=-1, err=errno.EPERM):
+            with self.assertRaises(OSError) as raised:
+                sandy._capbset_drop(12)
+        self.assertEqual(raised.exception.errno, errno.EPERM)
+
+    def test_invalid_capabilities_are_rejected(self):
+        for capability in (-1, 64, True, "0", None):
+            with self.subTest(capability=capability):
+                with mocked_entry_syscall() as syscall:
+                    with self.assertRaises(ValueError):
+                        sandy._capbset_read(capability)
+                    with self.assertRaises(ValueError):
+                        sandy._capbset_drop(capability)
+                syscall.assert_not_called()
+
+    def test_setns_exact_calls_for_each_namespace(self):
+        with mocked_entry_syscall() as syscall:
+            for fd, (_, nstype) in enumerate(sandy.NAMESPACE_ENTRY_ORDER, start=10):
+                sandy._setns(fd, nstype)
+        self.assertEqual(
+            syscall.call_args_list,
+            [
+                call(308, fd, nstype, 0, 0, 0, 0)
+                for fd, (_, nstype) in enumerate(sandy.NAMESPACE_ENTRY_ORDER, start=10)
+            ],
+        )
+
+    def test_setns_error_propagates(self):
+        with mocked_entry_syscall(return_value=-1, err=errno.EINVAL):
+            with self.assertRaises(OSError) as raised:
+                sandy._setns(3, sandy.CLONE_NEWUSER)
+        self.assertEqual(raised.exception.errno, errno.EINVAL)
+
+    def test_setns_rejects_invalid_arguments(self):
+        for fd, nstype in (
+            (3, 0),
+            (3, sandy.CLONE_NEWNET | sandy.CLONE_NEWPID),
+            (3, True),
+            (3, 0x00000100),
+            (3, float(sandy.CLONE_NEWNET)),
+            (-1, sandy.CLONE_NEWNET),
+            (True, sandy.CLONE_NEWNET),
+            (2**31, sandy.CLONE_NEWNET),
+        ):
+            with self.subTest(fd=fd, nstype=nstype):
+                with mocked_entry_syscall() as syscall:
+                    with self.assertRaises(ValueError):
+                        sandy._setns(fd, nstype)
+                syscall.assert_not_called()
+
+    def test_seccomp_installs_program_through_sock_fprog(self):
+        program = bytes(range(24))
+        seen = []
+
+        def fake_syscall(number, operation, flags, address, *rest):
+            fprog = sandy._SockFprog.from_address(address)
+            seen.append(
+                (fprog.len, sandy.ctypes.string_at(fprog.filter, fprog.len * 8))
+            )
+            return 0
+
+        with mocked_entry_syscall(side_effect=fake_syscall) as syscall:
+            sandy._seccomp_set_mode_filter(program)
+        self.assertEqual(seen, [(3, program)])
+        args = syscall.call_args.args
+        self.assertEqual(args[:3], (317, 1, 0))
+        self.assertEqual(args[4:], (0, 0, 0))
+
+    def test_seccomp_uses_aarch64_number(self):
+        with mocked_entry_syscall(machine="aarch64") as syscall:
+            sandy._seccomp_set_mode_filter(bytes(8 * sandy.BPF_MAXINSNS))
+        self.assertEqual(syscall.call_args.args[:3], (277, 1, 0))
+
+    def test_seccomp_error_propagates(self):
+        with mocked_entry_syscall(return_value=-1, err=errno.EACCES):
+            with self.assertRaises(OSError) as raised:
+                sandy._seccomp_set_mode_filter(bytes(8))
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+
+    def test_seccomp_rejects_invalid_programs(self):
+        for program in (
+            b"",
+            bytes(7),
+            bytes(9),
+            bytes(8 * (sandy.BPF_MAXINSNS + 1)),
+            bytearray(8),
+            "12345678",
+            None,
+        ):
+            with self.subTest(length=len(program) if program is not None else None):
+                with mocked_entry_syscall() as syscall:
+                    with self.assertRaises(ValueError):
+                        sandy._seccomp_set_mode_filter(program)
+                syscall.assert_not_called()
+
+
 class AclTests(unittest.TestCase):
     def test_acl_setup_skips_irrelevant_paths_and_new_systemd(self):
         instance = make_sandy()
