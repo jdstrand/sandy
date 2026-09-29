@@ -26,9 +26,20 @@ import sys
 import termios
 import tempfile
 import threading
+import time
 import tty
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Final, Mapping, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Final,
+    Iterator,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Tuple,
+)
 
 # Set environment variable to disable systemd colors
 os.environ["SYSTEMD_COLORS"] = "0"
@@ -38,6 +49,11 @@ CONTAINER_BASE_UID: Final = (
 )
 PORT_MAPPINGS_FILENAME: Final = "port_mappings.json"
 PORT_MAPPINGS_LOCK_FILENAME: Final = "port_mappings.lock"
+# One global lock serializes container entry and, later, attach lifecycle
+# decisions. It is held only for short sections, never for a container start.
+LIFECYCLE_LOCK_FILENAME: Final = "lifecycle.lock"
+LIFECYCLE_LOCK_TIMEOUT: Final = 10
+LIFECYCLE_LOCK_RETRY_INTERVAL: Final = 0.05
 INIT_SCRIPT_MAX_BYTES: Final = 8192
 CONTAINER_READY_TIMEOUT: Final = 60
 CONTAINER_IP_UNSET: Final = object()
@@ -1448,8 +1464,12 @@ ENTRY_SYSCALL_NUMBERS: Final[Mapping[str, Mapping[str, int]]] = {
     "aarch64": {"ptrace": 117, "prctl": 167, "setns": 268, "seccomp": 277},
 }
 SYSCALL_ARGUMENT_COUNT: Final = 6
-PTRACE_ATTACH: Final = 16
 PTRACE_DETACH: Final = 17
+PTRACE_SEIZE: Final = 0x4206
+PTRACE_INTERRUPT: Final = 0x4207
+# __WALL: wait for a tracee that is not a child of the caller.
+WAIT_ALL: Final = 0x40000000
+SIGNAL_MAX: Final = 64
 PTRACE_SECCOMP_GET_FILTER: Final = 0x420C
 PR_CAPBSET_READ: Final = 23
 PR_CAPBSET_DROP: Final = 24
@@ -1568,14 +1588,20 @@ def _require_pid(pid: Any) -> int:
     return _require_int_in_range(pid, "process ID", 1, PID_MAX_LIMIT - 1)
 
 
-def _ptrace_attach(pid: int) -> None:
-    """Attach to pid with PTRACE_ATTACH. The caller must wait for the stop."""
-    _entry_syscall("ptrace", PTRACE_ATTACH, _require_pid(pid), 0, 0)
+def _ptrace_seize(pid: int) -> None:
+    """Attach to pid with PTRACE_SEIZE, which does not stop it or queue SIGSTOP."""
+    _entry_syscall("ptrace", PTRACE_SEIZE, _require_pid(pid), 0, 0)
 
 
-def _ptrace_detach(pid: int) -> None:
-    """Detach from pid with PTRACE_DETACH and no signal."""
-    _entry_syscall("ptrace", PTRACE_DETACH, _require_pid(pid), 0, 0)
+def _ptrace_interrupt(pid: int) -> None:
+    """Ask a seized tracee to stop. The caller must wait for the stop."""
+    _entry_syscall("ptrace", PTRACE_INTERRUPT, _require_pid(pid), 0, 0)
+
+
+def _ptrace_detach(pid: int, signal_number: int = 0) -> None:
+    """Detach from a stopped tracee and deliver signal_number, if not 0."""
+    signal_number = _require_int_in_range(signal_number, "signal", 0, SIGNAL_MAX)
+    _entry_syscall("ptrace", PTRACE_DETACH, _require_pid(pid), 0, signal_number)
 
 
 def _ptrace_get_seccomp_filter(pid: int, index: int) -> bytes:
@@ -1646,6 +1672,242 @@ def _seccomp_set_mode_filter(program: bytes) -> None:
         SECCOMP_SET_MODE_FILTER,
         0,
         ctypes.addressof(fprog),
+    )
+
+
+@contextmanager  # ensures flock acquisition/release is paired at the call site
+def _lifecycle_lock(timeout: float = LIFECYCLE_LOCK_TIMEOUT) -> Iterator[None]:
+    """Hold the global lifecycle lock exclusively, or fail after timeout.
+
+    The cache directory must already exist. The kernel releases the flock when
+    its holder exits, so a killed holder leaves no stale lock. A bounded wait
+    keeps a holder that does not return from blocking every later caller.
+    """
+    lock_path = os.path.join(SYSTEMD_MACHINES, "sandy.__cache", LIFECYCLE_LOCK_FILENAME)
+    lock_handle = _open_stable_lock_file(lock_path)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Timed out waiting for the Sandy lifecycle lock"
+                    ) from None
+                time.sleep(LIFECYCLE_LOCK_RETRY_INTERVAL)
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_handle.close()
+
+
+LEADER_PID_PATTERN: Final = re.compile(r"[1-9][0-9]{0,6}")
+CAPBND_LINE_PATTERN: Final = re.compile(r"CapBnd:\t([0-9a-f]{16})")
+PROC_STATUS_MAX_BYTES: Final = 65536
+
+
+class LeaderConfinement(NamedTuple):
+    """Pinned Leader descriptors and the confinement read from the host side."""
+
+    pidfd: int
+    # One descriptor for each entry of NAMESPACE_ENTRY_ORDER, in that order.
+    namespace_fds: Tuple[int, ...]
+    # Oldest first, which is the order in which to install them.
+    seccomp_filters: Tuple[bytes, ...]
+    capability_bounding_set: int
+
+
+def _parse_leader_pid(value: str) -> int:
+    """Parse a machine Leader PID from machinectl output."""
+    if not isinstance(value, str) or not LEADER_PID_PATTERN.fullmatch(value):
+        raise ValueError("Invalid container Leader PID")
+    pid = _require_pid(int(value))
+    # The host init is never the Leader of a container.
+    if pid == 1:
+        raise ValueError("Invalid container Leader PID")
+    return pid
+
+
+def _query_machine_leader(machine_name: str) -> int:
+    """Return the Leader PID that systemd-machined reports for machine_name."""
+    if not _validate_container_name(machine_name):
+        raise ValueError("Invalid container name")
+    result = _run_secure_subprocess(
+        ["machinectl", "show", machine_name, "-p", "Leader", "--value"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout
+    if output.endswith("\n"):
+        output = output[:-1]
+    return _parse_leader_pid(output)
+
+
+def _parse_capability_bounding_set(status_text: str) -> int:
+    """Return the CapBnd mask from /proc/<pid>/status text, or fail closed."""
+    values = [line for line in status_text.split("\n") if line.startswith("CapBnd:")]
+    if len(values) != 1:
+        raise ValueError("Expected exactly one CapBnd line")
+    match = CAPBND_LINE_PATTERN.fullmatch(values[0])
+    if match is None:
+        raise ValueError("Malformed CapBnd line")
+    return int(match.group(1), 16)
+
+
+def _read_capability_bounding_set(proc_fd: int) -> int:
+    """Read CapBnd from the status file of an open host /proc/<pid> directory."""
+    status_fd = os.open("status", READ_FILE_OPEN_FLAGS, dir_fd=proc_fd)
+    try:
+        chunks = []
+        size = 0
+        while True:
+            chunk = os.read(status_fd, 4096)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > PROC_STATUS_MAX_BYTES:
+                raise ValueError("Process status is too large")
+            chunks.append(chunk)
+    finally:
+        os.close(status_fd)
+    return _parse_capability_bounding_set(
+        b"".join(chunks).decode("ascii", errors="replace")
+    )
+
+
+def _pidfd_process_alive(pidfd: int) -> bool:
+    """Return whether the process of pidfd has not exited."""
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    # A pidfd becomes readable when its process exits. Any event means exit.
+    return not poller.poll(0)
+
+
+def _stop_seized_tracee(pid: int) -> int:
+    """Interrupt a seized tracee, wait for its stop, and return the detach signal."""
+    _ptrace_interrupt(pid)
+    _, status = os.waitpid(pid, WAIT_ALL)
+    if not os.WIFSTOPPED(status):
+        # A seized tracee reports only stops and its exit.
+        raise ProcessLookupError("Container Leader exited during extraction")
+    if status >> 16 == 0:
+        # A signal-delivery-stop took the signal off the queue. Detach must
+        # deliver it again, or the Leader loses it (for example, a poweroff).
+        return os.WSTOPSIG(status)
+    # A PTRACE_EVENT_STOP (the interrupt, or a group-stop) holds no signal.
+    return 0
+
+
+def _collect_seccomp_filters(pid: int) -> Tuple[bytes, ...]:
+    """Read every seccomp filter of a stopped tracee, oldest first."""
+    filters = []
+    for index in range(SECCOMP_MAX_INSNS_PER_PATH + 1):
+        try:
+            filters.append(_ptrace_get_seccomp_filter(pid, index))
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                break
+            raise
+    else:
+        raise OSError(errno.E2BIG, "Too many seccomp filters on container Leader")
+    if not filters:
+        # Sandy always starts the payload with a filter. None means that this
+        # process is not a confined Sandy Leader.
+        raise PermissionError("Container Leader has no seccomp filter")
+    # Index 0 is the oldest filter, so index order is installation order
+    # (measured on kernels 5.15, 6.8, and 6.12).
+    return tuple(filters)
+
+
+def _read_seccomp_filters(pid: int) -> Tuple[bytes, ...]:
+    """Return the seccomp filters of pid, oldest first, and always detach.
+
+    If the Leader never reaches a stop, it has exited. If an unexpected error
+    leaves it seized, the caller must fail, and the tracer's exit removes the
+    ptrace link.
+    """
+    _ptrace_seize(pid)
+    detach_signal = _stop_seized_tracee(pid)
+    try:
+        filters = _collect_seccomp_filters(pid)
+    except BaseException:
+        try:
+            _ptrace_detach(pid, detach_signal)
+        except OSError:
+            pass
+        raise
+    _ptrace_detach(pid, detach_signal)
+    return filters
+
+
+def _close_fds(fds: Tuple[int, ...]) -> None:
+    """Close each descriptor, and ignore descriptors that are already closed."""
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _close_leader_confinement(confinement: LeaderConfinement) -> None:
+    """Close the descriptors of a LeaderConfinement."""
+    _close_fds((confinement.pidfd,) + confinement.namespace_fds)
+
+
+def _extract_leader_confinement(
+    machine_name: str, leader_pid: int
+) -> LeaderConfinement:
+    """Pin the Leader and read its filters and CapBnd on the host side.
+
+    Hold the lifecycle lock for the whole extraction. Every read uses the host
+    /proc, before any setns, so the container cannot change what Sandy reads.
+    The caller owns the returned descriptors.
+    """
+    pid = _require_pid(leader_pid)
+    opened = []
+    with _lifecycle_lock():
+        try:
+            pidfd = os.pidfd_open(pid)
+            opened.append(pidfd)
+            # The pidfd pins one process. Confirm that this process is the
+            # Leader of the machine now, not a later user of the same PID.
+            if _query_machine_leader(machine_name) != pid:
+                raise PermissionError("Container Leader changed during extraction")
+            proc_fd = os.open(f"/proc/{pid}", DIRECTORY_OPEN_FLAGS)
+            try:
+                namespace_fds = []
+                for name, _ in NAMESPACE_ENTRY_ORDER:
+                    # ns/<name> are kernel magic links, anchored at the pinned
+                    # /proc/<pid> descriptor. setns checks the type later.
+                    ns_fd = os.open(
+                        f"ns/{name}", os.O_RDONLY | os.O_CLOEXEC, dir_fd=proc_fd
+                    )
+                    opened.append(ns_fd)
+                    namespace_fds.append(ns_fd)
+                seccomp_filters = _read_seccomp_filters(pid)
+                capability_bounding_set = _read_capability_bounding_set(proc_fd)
+            finally:
+                os.close(proc_fd)
+            # The process was alive from pidfd_open to here, so the PID
+            # referred to it for every read above.
+            if not _pidfd_process_alive(pidfd):
+                raise ProcessLookupError("Container Leader exited during extraction")
+        except BaseException:
+            _close_fds(tuple(opened))
+            raise
+    return LeaderConfinement(
+        pidfd=pidfd,
+        namespace_fds=tuple(namespace_fds),
+        seccomp_filters=seccomp_filters,
+        capability_bounding_set=capability_bounding_set,
     )
 
 
@@ -4353,9 +4615,9 @@ class Sandy:
         removed_any = False
         for entry in os.listdir(cache_dir):
             entry_path = os.path.join(cache_dir, entry)
-            if entry == PORT_MAPPINGS_LOCK_FILENAME:
-                # This inode is the permanent transaction lock. Removing it
-                # could split queued and new processes across different locks.
+            if entry in (PORT_MAPPINGS_LOCK_FILENAME, LIFECYCLE_LOCK_FILENAME):
+                # Each lock inode is permanent. Removing one could split
+                # queued and new processes across different locks.
                 continue
             if preserve_state and entry == PORT_MAPPINGS_FILENAME:
                 continue

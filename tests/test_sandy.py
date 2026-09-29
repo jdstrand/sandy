@@ -3153,7 +3153,7 @@ class EntryPrimitiveTests(unittest.TestCase):
             with self.subTest(machine=machine):
                 with mocked_entry_syscall(machine=machine) as syscall:
                     with self.assertRaises(OSError) as raised:
-                        sandy._ptrace_attach(42)
+                        sandy._ptrace_seize(42)
                 self.assertEqual(raised.exception.errno, errno.ENOSYS)
                 syscall.assert_not_called()
 
@@ -3162,7 +3162,7 @@ class EntryPrimitiveTests(unittest.TestCase):
             sandy.ctypes, "sizeof", return_value=4
         ):
             with self.assertRaises(OSError) as raised:
-                sandy._ptrace_attach(42)
+                sandy._ptrace_seize(42)
         self.assertEqual(raised.exception.errno, errno.ENOSYS)
         syscall.assert_not_called()
 
@@ -3190,7 +3190,7 @@ class EntryPrimitiveTests(unittest.TestCase):
     def test_syscall_failure_raises_errno(self):
         with mocked_entry_syscall(return_value=-1, err=errno.EPERM):
             with self.assertRaises(OSError) as raised:
-                sandy._ptrace_attach(42)
+                sandy._ptrace_seize(42)
         self.assertEqual(raised.exception.errno, errno.EPERM)
         self.assertIn("ptrace failed", str(raised.exception))
 
@@ -3200,26 +3200,39 @@ class EntryPrimitiveTests(unittest.TestCase):
                 sandy._capbset_drop(0)
         self.assertEqual(raised.exception.errno, errno.EIO)
 
-    def test_ptrace_attach_and_detach_exact_calls(self):
+    def test_ptrace_seize_interrupt_and_detach_exact_calls(self):
         for machine, number in (("x86_64", 101), ("aarch64", 117)):
             with self.subTest(machine=machine):
                 with mocked_entry_syscall(machine=machine) as syscall:
-                    sandy._ptrace_attach(42)
+                    sandy._ptrace_seize(42)
+                    sandy._ptrace_interrupt(42)
                     sandy._ptrace_detach(42)
+                    sandy._ptrace_detach(42, 36)
                 self.assertEqual(
                     syscall.call_args_list,
                     [
-                        call(number, 16, 42, 0, 0, 0, 0),
+                        call(number, 0x4206, 42, 0, 0, 0, 0),
+                        call(number, 0x4207, 42, 0, 0, 0, 0),
                         call(number, 17, 42, 0, 0, 0, 0),
+                        call(number, 17, 42, 0, 36, 0, 0),
                     ],
                 )
+
+    def test_ptrace_detach_rejects_invalid_signal(self):
+        for signal_number in (-1, 65, True, "9", None):
+            with self.subTest(signal_number=signal_number):
+                with mocked_entry_syscall() as syscall:
+                    with self.assertRaises(ValueError):
+                        sandy._ptrace_detach(42, signal_number)
+                syscall.assert_not_called()
 
     def test_invalid_process_ids_are_rejected(self):
         for pid in (0, -1, True, "42", 42.0, None, sandy.PID_MAX_LIMIT):
             with self.subTest(pid=pid):
                 with mocked_entry_syscall() as syscall:
                     for function in (
-                        sandy._ptrace_attach,
+                        sandy._ptrace_seize,
+                        sandy._ptrace_interrupt,
                         sandy._ptrace_detach,
                         lambda value: sandy._ptrace_get_seccomp_filter(value, 0),
                     ):
@@ -3227,8 +3240,10 @@ class EntryPrimitiveTests(unittest.TestCase):
                             function(pid)
                 syscall.assert_not_called()
         with mocked_entry_syscall() as syscall:
-            sandy._ptrace_attach(sandy.PID_MAX_LIMIT - 1)
-        syscall.assert_called_once_with(101, 16, sandy.PID_MAX_LIMIT - 1, 0, 0, 0, 0)
+            sandy._ptrace_seize(sandy.PID_MAX_LIMIT - 1)
+        syscall.assert_called_once_with(
+            101, 0x4206, sandy.PID_MAX_LIMIT - 1, 0, 0, 0, 0
+        )
 
     def test_get_seccomp_filter_reads_length_then_program(self):
         program = bytes(range(16))
@@ -3396,6 +3411,505 @@ class EntryPrimitiveTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         sandy._seccomp_set_mode_filter(program)
                 syscall.assert_not_called()
+
+
+def ptrace_stop_status(signal_number, event=0):
+    """Return a waitpid status for a ptrace stop."""
+    return (event << 16) | (signal_number << 8) | 0x7F
+
+
+class LeaderExtractionTests(unittest.TestCase):
+    """Host-side extraction of the Leader's seccomp filters and CapBnd.
+
+    Tests mock the ptrace and prctl primitives, os.waitpid, os.pidfd_open,
+    machinectl, and the lock file owner check. Lock tests use real flock on a
+    temporary file. E2E tests in a VM must prove the real kernel behavior.
+    """
+
+    def open_temporary_lock(self, temp_dir):
+        lock_path = Path(temp_dir) / "lifecycle.lock"
+
+        def open_lock(path):
+            self.assertEqual(
+                path,
+                os.path.join(sandy.SYSTEMD_MACHINES, "sandy.__cache", "lifecycle.lock"),
+            )
+            return open(lock_path, "a+", encoding="utf-8")
+
+        return lock_path, open_lock
+
+    def test_lifecycle_lock_is_exclusive_and_released(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path, open_lock = self.open_temporary_lock(temp_dir)
+            with patch.object(sandy, "_open_stable_lock_file", side_effect=open_lock):
+                with sandy._lifecycle_lock():
+                    with open(lock_path, "a+", encoding="utf-8") as other:
+                        with self.assertRaises(BlockingIOError):
+                            sandy.fcntl.flock(
+                                other.fileno(),
+                                sandy.fcntl.LOCK_EX | sandy.fcntl.LOCK_NB,
+                            )
+                with open(lock_path, "a+", encoding="utf-8") as other:
+                    sandy.fcntl.flock(
+                        other.fileno(), sandy.fcntl.LOCK_EX | sandy.fcntl.LOCK_NB
+                    )
+
+    def test_lifecycle_lock_times_out_when_held(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path, open_lock = self.open_temporary_lock(temp_dir)
+            with open(lock_path, "a+", encoding="utf-8") as holder:
+                sandy.fcntl.flock(holder.fileno(), sandy.fcntl.LOCK_EX)
+                with patch.object(
+                    sandy, "_open_stable_lock_file", side_effect=open_lock
+                ), patch.object(
+                    sandy.time, "monotonic", side_effect=[100.0, 105.0, 110.0]
+                ), patch.object(
+                    sandy.time, "sleep"
+                ) as sleep:
+                    body = MagicMock()
+                    with self.assertRaises(TimeoutError):
+                        with sandy._lifecycle_lock():
+                            body()
+                body.assert_not_called()
+                sleep.assert_called_once_with(sandy.LIFECYCLE_LOCK_RETRY_INTERVAL)
+
+    def test_lifecycle_lock_retries_until_free(self):
+        lock_handle = MagicMock()
+        lock_handle.fileno.return_value = 9
+        with patch.object(
+            sandy, "_open_stable_lock_file", return_value=lock_handle
+        ), patch.object(
+            sandy.fcntl, "flock", side_effect=[BlockingIOError(), None, None]
+        ) as flock, patch.object(
+            sandy.time, "monotonic", return_value=0.0
+        ), patch.object(
+            sandy.time, "sleep"
+        ) as sleep:
+            with sandy._lifecycle_lock():
+                pass
+        self.assertEqual(
+            flock.call_args_list,
+            [
+                call(9, sandy.fcntl.LOCK_EX | sandy.fcntl.LOCK_NB),
+                call(9, sandy.fcntl.LOCK_EX | sandy.fcntl.LOCK_NB),
+                call(9, sandy.fcntl.LOCK_UN),
+            ],
+        )
+        sleep.assert_called_once_with(sandy.LIFECYCLE_LOCK_RETRY_INTERVAL)
+        lock_handle.close.assert_called_once_with()
+
+    def test_lifecycle_lock_releases_on_error_and_tolerates_unlock_failure(self):
+        lock_handle = MagicMock()
+        lock_handle.fileno.return_value = 9
+        with patch.object(
+            sandy, "_open_stable_lock_file", return_value=lock_handle
+        ), patch.object(
+            sandy.fcntl, "flock", side_effect=[None, OSError("unlock failed")]
+        ) as flock:
+            with self.assertRaises(RuntimeError):
+                with sandy._lifecycle_lock():
+                    raise RuntimeError("body failed")
+        self.assertEqual(flock.call_args_list[-1], call(9, sandy.fcntl.LOCK_UN))
+        lock_handle.close.assert_called_once_with()
+
+    def test_lifecycle_lock_closes_handle_when_flock_fails(self):
+        lock_handle = MagicMock()
+        lock_handle.fileno.return_value = 9
+        with patch.object(
+            sandy, "_open_stable_lock_file", return_value=lock_handle
+        ), patch.object(sandy.fcntl, "flock", side_effect=OSError(errno.EBADF, "x")):
+            with self.assertRaises(OSError):
+                with sandy._lifecycle_lock():
+                    pass
+        lock_handle.close.assert_called_once_with()
+
+    def test_parse_leader_pid(self):
+        self.assertEqual(sandy._parse_leader_pid("2"), 2)
+        self.assertEqual(sandy._parse_leader_pid("4194303"), 4194303)
+        for value in (
+            "",
+            "0",
+            "1",
+            "01",
+            "+5",
+            "-5",
+            " 5",
+            "5 ",
+            "5\n",
+            "12345678",
+            "4194304",
+            "\u0663",
+            None,
+            5,
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    sandy._parse_leader_pid(value)
+
+    def test_query_machine_leader_exact_command(self):
+        result = subprocess.CompletedProcess([], 0, stdout="4242\n")
+        with patch.object(sandy, "_run_secure_subprocess", return_value=result) as run:
+            self.assertEqual(sandy._query_machine_leader("ai-dev"), 4242)
+        run.assert_called_once_with(
+            ["machinectl", "show", "ai-dev", "-p", "Leader", "--value"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def test_query_machine_leader_rejects_bad_output_and_names(self):
+        for stdout in ("", "\n", "4242\n\n", "4242 \n", "abc\n", "1\n"):
+            with self.subTest(stdout=stdout):
+                result = subprocess.CompletedProcess([], 0, stdout=stdout)
+                with patch.object(sandy, "_run_secure_subprocess", return_value=result):
+                    with self.assertRaises(ValueError):
+                        sandy._query_machine_leader("ai-dev")
+        with patch.object(sandy, "_run_secure_subprocess") as run:
+            with self.assertRaises(ValueError):
+                sandy._query_machine_leader("-p")
+        run.assert_not_called()
+        with patch.object(
+            sandy,
+            "_run_secure_subprocess",
+            side_effect=subprocess.CalledProcessError(1, ["machinectl"]),
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                sandy._query_machine_leader("ai-dev")
+
+    def test_parse_capability_bounding_set(self):
+        status = "Name:\t(sd-stubinit)\nCapEff:\t000001ffffffffff\nCapBnd:\t00000000fdecbfff\n"
+        self.assertEqual(sandy._parse_capability_bounding_set(status), 0xFDECBFFF)
+        for text in (
+            "Name:\tx\n",
+            "CapBnd:\t00000000fdecbfff\nCapBnd:\t00000000fdecbfff\n",
+            "CapBnd:\t00000000FDECBFFF\n",
+            "CapBnd:\t0000000fdecbfff\n",
+            "CapBnd:\t000000000fdecbfff\n",
+            "CapBnd: 00000000fdecbfff\n",
+            "CapBnd:\t00000000fdecbfff \n",
+            "CapBnd:\t0x000000fdecbfff\n",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    sandy._parse_capability_bounding_set(text)
+
+    def test_read_capability_bounding_set_from_proc_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status = Path(temp_dir) / "status"
+            status.write_text("Name:\tx\nCapBnd:\t000001ffffffffff\n")
+            proc_fd = os.open(temp_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                self.assertEqual(
+                    sandy._read_capability_bounding_set(proc_fd), 0x1FFFFFFFFFF
+                )
+                status.write_bytes(b"CapBnd:\t000001ffffffffff\n" + b"x" * 65536)
+                with self.assertRaises(ValueError):
+                    sandy._read_capability_bounding_set(proc_fd)
+                status.unlink()
+                with self.assertRaises(FileNotFoundError):
+                    sandy._read_capability_bounding_set(proc_fd)
+            finally:
+                os.close(proc_fd)
+
+    def test_pidfd_process_alive_uses_readability(self):
+        # A pipe stands in for a pidfd: readable means that the process exited.
+        read_fd, write_fd = os.pipe()
+        try:
+            self.assertTrue(sandy._pidfd_process_alive(read_fd))
+            os.write(write_fd, b"x")
+            self.assertFalse(sandy._pidfd_process_alive(read_fd))
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_stop_seized_tracee_returns_detach_signal(self):
+        cases = (
+            (ptrace_stop_status(sandy.signal.SIGCHLD), sandy.signal.SIGCHLD),
+            (ptrace_stop_status(36), 36),
+            (ptrace_stop_status(sandy.signal.SIGTRAP, 128), 0),
+            (ptrace_stop_status(sandy.signal.SIGSTOP, 128), 0),
+        )
+        for status, expected in cases:
+            with self.subTest(status=status):
+                with patch.object(
+                    sandy, "_ptrace_interrupt"
+                ) as interrupt, patch.object(
+                    sandy.os, "waitpid", return_value=(42, status)
+                ) as waitpid:
+                    self.assertEqual(sandy._stop_seized_tracee(42), expected)
+                interrupt.assert_called_once_with(42)
+                waitpid.assert_called_once_with(42, 0x40000000)
+
+    def test_stop_seized_tracee_fails_when_leader_exits(self):
+        for status in (0, 9):
+            with self.subTest(status=status):
+                with patch.object(sandy, "_ptrace_interrupt"), patch.object(
+                    sandy.os, "waitpid", return_value=(42, status)
+                ):
+                    with self.assertRaises(ProcessLookupError):
+                        sandy._stop_seized_tracee(42)
+
+    def test_collect_seccomp_filters_returns_oldest_first(self):
+        with patch.object(
+            sandy,
+            "_ptrace_get_seccomp_filter",
+            side_effect=[b"oldest", b"middle", b"newest", OSError(errno.ENOENT, "x")],
+        ) as get_filter:
+            # Regression: index 0 is the oldest filter, so the list must not
+            # be reversed. A reversed list installs the filters in the wrong
+            # order (measured in E2E: the session's programs were reversed).
+            self.assertEqual(
+                sandy._collect_seccomp_filters(42), (b"oldest", b"middle", b"newest")
+            )
+        self.assertEqual(
+            get_filter.call_args_list,
+            [call(42, 0), call(42, 1), call(42, 2), call(42, 3)],
+        )
+
+    def test_collect_seccomp_filters_fails_on_other_errors(self):
+        for err in (errno.EACCES, errno.EINVAL, errno.ESRCH, errno.EMEDIUMTYPE):
+            with self.subTest(err=err):
+                with patch.object(
+                    sandy,
+                    "_ptrace_get_seccomp_filter",
+                    side_effect=[b"newest", OSError(err, "x")],
+                ):
+                    with self.assertRaises(OSError) as raised:
+                        sandy._collect_seccomp_filters(42)
+                self.assertEqual(raised.exception.errno, err)
+
+    def test_collect_seccomp_filters_requires_a_filter(self):
+        with patch.object(
+            sandy,
+            "_ptrace_get_seccomp_filter",
+            side_effect=OSError(errno.ENOENT, "x"),
+        ):
+            with self.assertRaises(PermissionError):
+                sandy._collect_seccomp_filters(42)
+
+    def test_collect_seccomp_filters_bounds_the_index(self):
+        with patch.object(sandy, "SECCOMP_MAX_INSNS_PER_PATH", 2), patch.object(
+            sandy, "_ptrace_get_seccomp_filter", return_value=b"filter"
+        ) as get_filter:
+            with self.assertRaises(OSError) as raised:
+                sandy._collect_seccomp_filters(42)
+        self.assertEqual(raised.exception.errno, errno.E2BIG)
+        self.assertEqual(get_filter.call_count, 3)
+
+    def ptrace_mocks(self, stop_signal=0, collect=None, detach=None):
+        manager = MagicMock()
+        manager.stop.return_value = stop_signal
+        if collect is not None:
+            manager.collect.side_effect = collect
+        if detach is not None:
+            manager.detach.side_effect = detach
+        stack = ExitStack()
+        stack.enter_context(patch.object(sandy, "_ptrace_seize", manager.seize))
+        stack.enter_context(patch.object(sandy, "_stop_seized_tracee", manager.stop))
+        stack.enter_context(
+            patch.object(sandy, "_collect_seccomp_filters", manager.collect)
+        )
+        stack.enter_context(patch.object(sandy, "_ptrace_detach", manager.detach))
+        return manager, stack
+
+    def test_read_seccomp_filters_detaches_with_saved_signal(self):
+        manager, stack = self.ptrace_mocks(stop_signal=17)
+        manager.collect.return_value = (b"old", b"new")
+        with stack:
+            self.assertEqual(sandy._read_seccomp_filters(42), (b"old", b"new"))
+        self.assertEqual(
+            manager.mock_calls,
+            [call.seize(42), call.stop(42), call.collect(42), call.detach(42, 17)],
+        )
+
+    def test_read_seccomp_filters_detaches_on_error(self):
+        manager, stack = self.ptrace_mocks(
+            collect=OSError(errno.EACCES, "denied"),
+            detach=OSError(errno.ESRCH, "gone"),
+        )
+        with stack:
+            with self.assertRaises(OSError) as raised:
+                sandy._read_seccomp_filters(42)
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+        manager.detach.assert_called_once_with(42, 0)
+
+    def test_read_seccomp_filters_reports_detach_failure(self):
+        manager, stack = self.ptrace_mocks(detach=OSError(errno.ESRCH, "gone"))
+        with stack:
+            with self.assertRaises(OSError) as raised:
+                sandy._read_seccomp_filters(42)
+        self.assertEqual(raised.exception.errno, errno.ESRCH)
+
+    def test_read_seccomp_filters_does_not_detach_without_stop(self):
+        manager, stack = self.ptrace_mocks()
+        manager.stop.side_effect = ProcessLookupError("gone")
+        with stack:
+            with self.assertRaises(ProcessLookupError):
+                sandy._read_seccomp_filters(42)
+        manager.collect.assert_not_called()
+        manager.detach.assert_not_called()
+
+    def test_close_leader_confinement_closes_every_descriptor(self):
+        confinement = sandy.LeaderConfinement(
+            pidfd=3, namespace_fds=(4, 5), seccomp_filters=(), capability_bounding_set=0
+        )
+        with patch.object(
+            sandy.os, "close", side_effect=[None, OSError(errno.EBADF, "x"), None]
+        ) as close:
+            sandy._close_leader_confinement(confinement)
+        self.assertEqual(close.call_args_list, [call(3), call(4), call(5)])
+
+    @contextmanager
+    def extraction_mocks(self, **overrides):
+        """Mock every host boundary of _extract_leader_confinement."""
+        manager = MagicMock()
+        next_fd = iter(range(20, 40))
+
+        @contextmanager
+        def lock():
+            manager.lock_enter()
+            try:
+                yield
+            finally:
+                manager.lock_exit()
+
+        def open_fd(path, flags, dir_fd=None):
+            manager.open(path, flags, dir_fd=dir_fd)
+            if "open" in overrides and path == overrides["open"]:
+                raise FileNotFoundError(path)
+            return next(next_fd)
+
+        manager.pidfd_open.return_value = 10
+        manager.query.return_value = overrides.get("leader", 42)
+        manager.filters.return_value = (b"old", b"new")
+        manager.capbnd.return_value = 0xFDECBFFF
+        manager.alive.return_value = overrides.get("alive", True)
+        for name in ("filters", "capbnd", "pidfd_open"):
+            if name in overrides:
+                getattr(manager, name).side_effect = overrides[name]
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(sandy, "_lifecycle_lock", lock))
+            stack.enter_context(
+                patch.object(sandy.os, "pidfd_open", manager.pidfd_open, create=True)
+            )
+            stack.enter_context(
+                patch.object(sandy, "_query_machine_leader", manager.query)
+            )
+            stack.enter_context(patch.object(sandy.os, "open", side_effect=open_fd))
+            stack.enter_context(patch.object(sandy.os, "close", manager.close))
+            stack.enter_context(
+                patch.object(sandy, "_read_seccomp_filters", manager.filters)
+            )
+            stack.enter_context(
+                patch.object(sandy, "_read_capability_bounding_set", manager.capbnd)
+            )
+            stack.enter_context(
+                patch.object(sandy, "_pidfd_process_alive", manager.alive)
+            )
+            yield manager
+
+    def test_extract_leader_confinement_success_order(self):
+        with self.extraction_mocks() as manager:
+            confinement = sandy._extract_leader_confinement("ai-dev", 42)
+        self.assertEqual(
+            confinement,
+            sandy.LeaderConfinement(
+                pidfd=10,
+                namespace_fds=(21, 22, 23, 24, 25, 26, 27),
+                seccomp_filters=(b"old", b"new"),
+                capability_bounding_set=0xFDECBFFF,
+            ),
+        )
+        ns_flags = os.O_RDONLY | os.O_CLOEXEC
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                call.lock_enter(),
+                call.pidfd_open(42),
+                call.query("ai-dev"),
+                call.open("/proc/42", sandy.DIRECTORY_OPEN_FLAGS, dir_fd=None),
+                call.open("ns/cgroup", ns_flags, dir_fd=20),
+                call.open("ns/ipc", ns_flags, dir_fd=20),
+                call.open("ns/uts", ns_flags, dir_fd=20),
+                call.open("ns/net", ns_flags, dir_fd=20),
+                call.open("ns/pid", ns_flags, dir_fd=20),
+                call.open("ns/mnt", ns_flags, dir_fd=20),
+                call.open("ns/user", ns_flags, dir_fd=20),
+                call.filters(42),
+                call.capbnd(20),
+                call.close(20),
+                call.alive(10),
+                call.lock_exit(),
+            ],
+        )
+
+    def test_extract_leader_confinement_rejects_changed_leader(self):
+        with self.extraction_mocks(leader=43) as manager:
+            with self.assertRaises(PermissionError):
+                sandy._extract_leader_confinement("ai-dev", 42)
+        manager.open.assert_not_called()
+        manager.close.assert_called_once_with(10)
+        manager.lock_exit.assert_called_once_with()
+
+    def test_extract_leader_confinement_closes_fds_when_leader_exits(self):
+        with self.extraction_mocks(alive=False) as manager:
+            with self.assertRaises(ProcessLookupError):
+                sandy._extract_leader_confinement("ai-dev", 42)
+        self.assertEqual(
+            manager.close.call_args_list,
+            [
+                call(20),
+                call(10),
+                call(21),
+                call(22),
+                call(23),
+                call(24),
+                call(25),
+                call(26),
+                call(27),
+            ],
+        )
+
+    def test_extract_leader_confinement_closes_fds_on_partial_open(self):
+        with self.extraction_mocks(open="ns/pid") as manager:
+            with self.assertRaises(FileNotFoundError):
+                sandy._extract_leader_confinement("ai-dev", 42)
+        manager.filters.assert_not_called()
+        self.assertEqual(
+            manager.close.call_args_list,
+            [call(20), call(10), call(21), call(22), call(23), call(24)],
+        )
+
+    def test_extract_leader_confinement_fails_closed_on_read_errors(self):
+        for name, error in (
+            ("filters", OSError(errno.EACCES, "x")),
+            ("capbnd", ValueError("bad")),
+            ("pidfd_open", ProcessLookupError("gone")),
+        ):
+            with self.subTest(name=name):
+                with self.extraction_mocks(**{name: error}) as manager:
+                    with self.assertRaises(type(error)):
+                        sandy._extract_leader_confinement("ai-dev", 42)
+                manager.alive.assert_not_called()
+                manager.lock_exit.assert_called_once_with()
+                if name != "pidfd_open":
+                    self.assertIn(call(10), manager.close.call_args_list)
+
+    def test_extract_leader_confinement_validates_pid_before_lock(self):
+        for pid in (0, True, "42"):
+            with self.subTest(pid=pid):
+                with self.extraction_mocks() as manager:
+                    with self.assertRaises(ValueError):
+                        sandy._extract_leader_confinement("ai-dev", pid)
+                manager.lock_enter.assert_not_called()
+
+    def test_extract_leader_confinement_opens_nothing_without_lock(self):
+        with patch.object(
+            sandy, "_lifecycle_lock", side_effect=TimeoutError("busy")
+        ), patch.object(sandy.os, "pidfd_open", create=True) as pidfd_open:
+            with self.assertRaises(TimeoutError):
+                sandy._extract_leader_confinement("ai-dev", 42)
+        pidfd_open.assert_not_called()
 
 
 class AclTests(unittest.TestCase):
@@ -5415,12 +5929,14 @@ class CacheTests(unittest.TestCase):
             cache = Path(temp_dir)
             state = cache / sandy.PORT_MAPPINGS_FILENAME
             lock = cache / sandy.PORT_MAPPINGS_LOCK_FILENAME
+            lifecycle_lock = cache / sandy.LIFECYCLE_LOCK_FILENAME
             archive = cache / "cache.tar"
             directory = cache / "partial"
             state_alias = cache / "state-alias"
             directory_alias = cache / "directory-alias"
             state.write_text("{}")
             lock.write_text("")
+            lifecycle_lock.write_text("")
             archive.write_text("archive")
             directory.mkdir()
             (directory / "file").write_text("partial")
@@ -5436,6 +5952,7 @@ class CacheTests(unittest.TestCase):
                         self.assertTrue(instance._clear_cache_contents())
             self.assertTrue(state.exists())
             self.assertTrue(lock.exists())
+            self.assertTrue(lifecycle_lock.exists())
             self.assertFalse(archive.exists())
             self.assertFalse(state_alias.exists())
             self.assertFalse(directory_alias.exists())
