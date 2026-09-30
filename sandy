@@ -2086,8 +2086,8 @@ def _parse_entry_request(args: list) -> EntryRequest:
     return request
 
 
-def _entry_helper_argv(script_fd: int, request: EntryRequest) -> list:
-    """Return the argv that starts the entry helper for request."""
+def _entry_request_args(request: EntryRequest) -> list:
+    """Return the helper arguments for request; reject what the helper rejects."""
     args = [
         request.machine,
         str(request.leader_pid),
@@ -2100,6 +2100,12 @@ def _entry_helper_argv(script_fd: int, request: EntryRequest) -> list:
     # Build only what the helper accepts.
     if _parse_entry_request(args) != request:
         raise ValueError("Entry request does not survive helper argument parsing")
+    return args
+
+
+def _entry_helper_argv(script_fd: int, request: EntryRequest) -> list:
+    """Return the argv that starts the entry helper for request."""
+    args = _entry_request_args(request)
     return [
         sys.executable,
         "-I",
@@ -2156,6 +2162,17 @@ def _verify_entry_script(script_stat: os.stat_result) -> None:
         raise PermissionError(
             "Sandy script must be a regular file that only its owner can write"
         )
+
+
+def _open_entry_script() -> int:
+    """Open the running sandy script for the entry helper and verify it."""
+    fd = os.open(os.path.realpath(__file__), READ_FILE_OPEN_FLAGS)
+    try:
+        _verify_entry_script(os.fstat(fd))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _read_cap_last_cap() -> int:
@@ -4358,7 +4375,6 @@ class Sandy:
         required_tools = [
             "ip",
             "machinectl",
-            "nsenter",
             "sysctl",
             "systemd-machine-id-setup",
             "systemd-nspawn",
@@ -5292,17 +5308,67 @@ class Sandy:
         else:
             print(f"I: No cache directory to purge")
 
-    def _exec(self, command: Optional[str], *, login_shell: bool = False) -> int:
-        """Execute command in container using nsenter.
+    def _entry_request(
+        self,
+        leader: str,
+        user: str,
+        user_home: str,
+        kind: str,
+        command: str,
+        *,
+        use_workspace: bool,
+    ) -> EntryRequest:
+        """Build the entry request for the running container.
 
-        When login_shell is True, spawn a single interactive login shell so that
-        startup files execute only once (mirrors `ssh -tt` behaviour).
+        With use_workspace, the working directory is the workspace when it
+        exists. Otherwise it is "/", where the nsenter path started (measured).
+        """
+        workdir = "/"
+        workspace = f"{user_home}/workspace"
+        if (
+            use_workspace
+            and self.workspace
+            and os.path.isdir(os.path.join(self._get_machine_dir(), workspace[1:]))
+        ):
+            workdir = workspace
+        request = EntryRequest(
+            machine=self.container,
+            leader_pid=_parse_leader_pid(leader),
+            user=user,
+            home=user_home,
+            workdir=workdir,
+            kind=kind,
+            command=command,
+        )
+        # Reject what the helper would reject before any host setup.
+        _entry_request_args(request)
+        return request
+
+    @contextmanager  # closes the pinned script descriptor after the helper exits
+    def _entry_helper_command(
+        self, request: EntryRequest
+    ) -> Iterator[Tuple[list, int]]:
+        """Yield the entry helper argv and the script descriptor to pass to it."""
+        # The helper takes the lifecycle lock, which lives in the cache directory.
+        self._ensure_cache_dir()
+        script_fd = _open_entry_script()
+        try:
+            yield _entry_helper_argv(script_fd, request), script_fd
+        finally:
+            os.close(script_fd)
+
+    def _exec(self, command: Optional[str], *, login_shell: bool = False) -> int:
+        """Run a command or a login shell in the container as self.user.
+
+        The entry helper applies the container payload's seccomp filters and
+        capability bounding set. When login_shell is True, spawn a single
+        interactive login shell so that startup files execute only once
+        (mirrors `ssh -tt` behaviour).
         """
         container_environment = _container_environment(self.user, self.user_home)
 
-        # Get container PID
-        pid = self._is_container_running()
-        if not pid:
+        leader = self._is_container_running()
+        if not leader:
             print(f"E: Container '{self.container}' not found or not running")
             sys.exit(1)
 
@@ -5310,76 +5376,64 @@ class Sandy:
             print("E: Command required for container execution")
             sys.exit(1)
 
-        # Determine workspace inside container
-        cmd_fragment = command or ""
-        workdir = None
-        intp = f"{self.user_home}/workspace"
-        mdir = self._get_machine_dir()
-        extp = os.path.join(mdir, intp[1:])
-        if self.workspace and os.path.isdir(extp):
-            workdir = intp
+        exec_cmd = "exec bash --login" if login_shell else str(command)
+        try:
+            request = self._entry_request(
+                leader,
+                self.user,
+                self.user_home,
+                ENTRY_KIND_TTY,
+                exec_cmd,
+                use_workspace=True,
+            )
+        except ValueError as exc:
+            print(f"E: Invalid container entry: {_terminal_safe_repr(str(exc))}")
+            sys.exit(1)
 
-        if login_shell:
-            exec_cmd = "exec bash --login"
-        else:
-            exec_cmd = cmd_fragment
+        with self._entry_helper_command(request) as (argv, script_fd):
+            # The helper runs the command through script, which allocates a
+            # terminal from the container's devpts instance.
+            return self._run_container_interactive(
+                argv,
+                environment=container_environment,
+                pass_fds=(script_fd,),
+            )
 
-        if workdir:
-            exec_cmd = f"cd {shlex.quote(workdir)} && {exec_cmd}"
+    def _run_as_root(
+        self, command: str, **kwargs: Any
+    ) -> Optional[subprocess.CompletedProcess]:
+        """Run command as container root through the entry helper.
 
-        # Use script to allocate a proper controlling terminal for job control
-        script_wrapped_cmd = f"script -qec {shlex.quote(exec_cmd)} /dev/null"
-
-        # Execute using nsenter ('machinectl shell' can only be used if
-        # systemd running in the container)
-        nsenter_cmd = [
-            "nsenter",
-            "-t",
-            pid,
-            "-a",
-            "--",
-            "su",
-            self.user,
-            "-s",
-            "/bin/bash",
-            "-c",
-            script_wrapped_cmd,
-        ]
-
-        # Use _run_container_interactive for proper PTY with terminal size
-        return self._run_container_interactive(
-            nsenter_cmd,
-            environment=container_environment,
+        Return None when the container is not running.
+        """
+        container_environment = _container_environment("root", "/root")
+        leader = self._is_container_running()
+        if not leader:
+            return None
+        request = self._entry_request(
+            leader, "root", "/root", ENTRY_KIND_SH, command, use_workspace=False
         )
+        with self._entry_helper_command(request) as (argv, script_fd):
+            return _run_secure_subprocess(
+                argv, env=container_environment, pass_fds=(script_fd,), **kwargs
+            )
 
     def _exec_as_root(self, command) -> subprocess.CompletedProcess:
-        """Execute command in container as root using nsenter"""
-        container_environment = _container_environment("root", "/root")
-
+        """Execute command in container as root through the entry helper."""
         # Validate command for basic security
         if not command or len(command) > 1024:
             print("E: Invalid command for container execution")
             sys.exit(1)
 
-        # Get container PID
-        pid = self._is_container_running()
-        if not pid:
+        try:
+            result = self._run_as_root(command)
+        except ValueError as exc:
+            print(f"E: Invalid container entry: {_terminal_safe_repr(str(exc))}")
+            sys.exit(1)
+        if result is None:
             print(f"E: Container '{self.container}' not found or not running")
             sys.exit(1)
-
-        # Execute using nsenter as root
-        nsenter_cmd = [
-            "nsenter",
-            "-t",
-            pid,
-            "-a",
-            "--",
-            "sh",
-            "-c",
-            command,
-        ]
-
-        return _run_secure_subprocess(nsenter_cmd, env=container_environment)
+        return result
 
     def _run_container_interactive(
         self,
@@ -5439,19 +5493,19 @@ class Sandy:
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
-            pid = self._is_container_running()
-            if pid:
-                # Test if we can execute a simple command
-                try:
-                    result = _run_secure_subprocess(
-                        ["nsenter", "-t", pid, "-a", "--", "true"],
-                        capture_output=True,
-                        timeout=5,
-                    )
-                    if result.returncode == 0:
-                        return True
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                    pass
+            # Ready means that the entry helper can confine and run a command.
+            # Until nspawn has installed the payload's filters, extraction
+            # fails, so an early probe fails closed and is retried.
+            try:
+                result = self._run_as_root("true", capture_output=True, timeout=5)
+                if result is not None and result.returncode == 0:
+                    return True
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                ValueError,
+            ):
+                pass
             if spinner_active and spinner_line_event:
                 if spinner_line_event.is_set():
                     spinner_active = False

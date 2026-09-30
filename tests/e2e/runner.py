@@ -10,6 +10,7 @@ import traceback
 
 from tests.e2e import (
     test_cache,
+    test_confinement,
     test_filesystem,
     test_full,
     test_install,
@@ -25,6 +26,7 @@ TEST_MODULES = (
     test_filesystem,
     test_cache,
     test_lifecycle,
+    test_confinement,
     test_network,
 )
 

@@ -30,6 +30,9 @@ SYSTEMD_MACHINES = Path("/var/lib/machines")
 CACHE_DIR = SYSTEMD_MACHINES / "sandy.__cache"
 PORT_STATE = CACHE_DIR / "port_mappings.json"
 PORT_LOCK = CACHE_DIR / "port_mappings.lock"
+LIFECYCLE_LOCK = CACHE_DIR / "lifecycle.lock"
+# Product code never removes these stable lock inodes.
+PERSISTENT_LOCKS = (PORT_LOCK, LIFECYCLE_LOCK)
 BRIDGE_NAME = "sandybr0"
 NAME_PATTERN = re.compile(r"^e2e-[a-z0-9-]{1,48}$")
 DEFAULT_TIMEOUT = 120
@@ -400,11 +403,7 @@ class E2EContext:
         """Return persistent Sandy machine, bridge, and firewall state."""
         artifacts = []
         for path in sorted(SYSTEMD_MACHINES.glob("sandy.*")):
-            if (
-                path == CACHE_DIR
-                and self._persistent_port_lock_is_safe()
-                and list(CACHE_DIR.iterdir()) == [PORT_LOCK]
-            ):
+            if path == CACHE_DIR and self._cache_holds_only_safe_locks():
                 continue
             artifacts.append(str(path))
         if self.bridge_exists():
@@ -1000,13 +999,15 @@ class E2EContext:
     def purge_cache(self) -> None:
         if CACHE_DIR.exists():
             self.sandy(["rm", "--cache", "--force"])
-        if PORT_LOCK.exists() or PORT_LOCK.is_symlink():
-            if not self._persistent_port_lock_is_safe():
-                raise E2EFailure(f"Unsafe persistent port lock: {PORT_LOCK}")
-            # Product code never removes this stable inode because a waiter
-            # could still hold it. The harness owns the otherwise-clean VM and
-            # removes it only after all Sandy operations have stopped.
-            PORT_LOCK.unlink()
+        for lock in PERSISTENT_LOCKS:
+            if lock.exists() or lock.is_symlink():
+                if not self._persistent_lock_is_safe(lock):
+                    raise E2EFailure(f"Unsafe persistent lock: {lock}")
+                # Product code never removes this stable inode because a
+                # waiter could still hold it. The harness owns the
+                # otherwise-clean VM and removes it only after all Sandy
+                # operations have stopped.
+                lock.unlink()
         if CACHE_DIR.exists() and not any(CACHE_DIR.iterdir()):
             CACHE_DIR.rmdir()
         if CACHE_DIR.exists():
@@ -1015,11 +1016,19 @@ class E2EContext:
                 f"Cache directory remains after purge: {CACHE_DIR} ({remaining})"
             )
 
-    def _persistent_port_lock_is_safe(self) -> bool:
-        """Return whether the persistent lock has its exact safe metadata."""
-        if not PORT_LOCK.exists() or PORT_LOCK.is_symlink():
+    def _cache_holds_only_safe_locks(self) -> bool:
+        """Return whether the cache directory holds only safe persistent locks."""
+        entries = list(CACHE_DIR.iterdir())
+        return bool(entries) and all(
+            entry in PERSISTENT_LOCKS and self._persistent_lock_is_safe(entry)
+            for entry in entries
+        )
+
+    def _persistent_lock_is_safe(self, lock: Path) -> bool:
+        """Return whether a persistent lock has its exact safe metadata."""
+        if not lock.exists() or lock.is_symlink():
             return False
-        lock_stat = PORT_LOCK.lstat()
+        lock_stat = lock.lstat()
         return (
             stat.S_ISREG(lock_stat.st_mode)
             and (lock_stat.st_uid, lock_stat.st_gid) == (0, 0)

@@ -2766,6 +2766,7 @@ class SandyInitializationTests(unittest.TestCase):
         self.assertIn("Missing required tools", stdout.getvalue())
         self.assertIn("systemd-nspawn", stdout.getvalue())
         self.assertIn("setfacl", stdout.getvalue())
+        self.assertNotIn("nsenter", stdout.getvalue())
 
     def test_required_tools_accepts_debootstrap_and_warns_without_firewall(self):
         instance = make_sandy()
@@ -7210,30 +7211,65 @@ class ExecutionTests(unittest.TestCase):
             ],
         )
 
-    def test_exec_builds_nsenter_command_and_quotes_workdir(self):
+    @contextmanager
+    def entry_script(self, instance):
+        """Give _open_entry_script a real descriptor; record its closing."""
+        script = tempfile.TemporaryFile()
+        closed = []
+        real_close = os.close
+
+        def close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        fd = os.dup(script.fileno())
+        script.close()
+        with patch.object(sandy, "_open_entry_script", return_value=fd), patch.object(
+            sandy.os, "close", side_effect=close
+        ), patch.object(instance, "_ensure_cache_dir") as ensure, patch.object(
+            sandy.sys, "executable", "/usr/bin/python3"
+        ):
+            yield SimpleNamespace(fd=fd, closed=closed, ensure=ensure)
+
+    def helper_argv(self, fd, *args):
+        return [
+            "/usr/bin/python3",
+            "-I",
+            f"/proc/self/fd/{fd}",
+            "__sandy-entry-helper",
+            *args,
+        ]
+
+    def test_exec_runs_entry_helper_with_pinned_script(self):
         instance = make_sandy()
         with patch.object(instance, "_is_container_running", return_value="123"):
-            with patch.object(
-                instance,
-                "_get_machine_dir",
-                return_value="/machine",
-            ):
-                with patch.object(sandy.os.path, "isdir", return_value=True):
-                    with patch.object(
-                        instance,
-                        "_run_container_interactive",
-                        return_value=23,
-                    ) as interactive:
-                        status = instance._exec("printf safe")
+            with patch.object(instance, "_get_machine_dir", return_value="/machine"):
+                with patch.object(sandy.os.path, "isdir", return_value=True) as isdir:
+                    with self.entry_script(instance) as script:
+                        with patch.object(
+                            instance, "_run_container_interactive", return_value=23
+                        ) as interactive:
+                            status = instance._exec("printf 'safe'")
 
-        command = interactive.call_args.args[0]
         self.assertEqual(status, 23)
-        self.assertEqual(command[:6], ["nsenter", "-t", "123", "-a", "--", "su"])
-        self.assertIn("cd /home/developer/workspace && printf safe", command[-1])
-        self.assertIn("script -qec", command[-1])
+        isdir.assert_called_once_with("/machine/home/developer/workspace")
+        interactive.assert_called_once_with(
+            self.helper_argv(
+                script.fd,
+                "ai-dev",
+                "123",
+                "developer",
+                "/home/developer",
+                "/home/developer/workspace",
+                "tty",
+                "printf 'safe'",
+            ),
+            environment=sandy._container_environment("developer", "/home/developer"),
+            pass_fds=(script.fd,),
+        )
+        script.ensure.assert_called_once_with()
+        self.assertEqual(script.closed, [script.fd])
         environment = interactive.call_args.kwargs["environment"]
-        self.assertEqual(environment["HOME"], "/home/developer")
-        self.assertEqual(environment["USER"], "developer")
         self.assertNotIn("SANDY_TEST_HOST_SECRET", environment)
 
     def test_exec_rejects_missing_container_or_command(self):
@@ -7248,37 +7284,155 @@ class ExecutionTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     instance._exec(None)
 
-    def test_exec_login_shell(self):
+    def test_exec_rejects_invalid_entry_before_starting_helper(self):
+        instance = make_sandy()
+        instance.workspace = None
+        for leader, command in (
+            ("abc", "true"),
+            ("1", "true"),
+            ("123", "x" * (sandy.ENTRY_COMMAND_MAX_BYTES + 1)),
+        ):
+            with self.subTest(leader=leader, length=len(command)):
+                with patch.object(
+                    instance, "_is_container_running", return_value=leader
+                ), patch.object(sandy, "_open_entry_script") as open_script:
+                    with captured_output() as (stdout, _):
+                        with self.assertRaises(SystemExit):
+                            instance._exec(command)
+                open_script.assert_not_called()
+                self.assertIn("E: Invalid container entry", stdout.getvalue())
+
+    def test_exec_login_shell_and_root_user_workdir(self):
         instance = make_sandy()
         instance.workspace = None
         with patch.object(instance, "_is_container_running", return_value="123"):
-            with patch.object(
-                instance,
-                "_run_container_interactive",
-                return_value=17,
-            ) as interactive:
-                status = instance._exec(None, login_shell=True)
+            with self.entry_script(instance) as script:
+                with patch.object(
+                    instance, "_run_container_interactive", return_value=17
+                ) as interactive:
+                    status = instance._exec(None, login_shell=True)
         self.assertEqual(status, 17)
-        self.assertIn("exec bash --login", interactive.call_args.args[0][-1])
+        self.assertEqual(
+            interactive.call_args.args[0],
+            self.helper_argv(
+                script.fd,
+                "ai-dev",
+                "123",
+                "developer",
+                "/home/developer",
+                "/",
+                "tty",
+                "exec bash --login",
+            ),
+        )
 
-    def test_exec_as_root_validates_and_runs(self):
+        # -u root uses <home>/workspace too, as the nsenter path did.
+        instance.workspace = "workspace"
+        instance.user = "root"
+        instance.user_home = "/root"
+        with patch.object(instance, "_is_container_running", return_value="123"):
+            with patch.object(instance, "_get_machine_dir", return_value="/machine"):
+                with patch.object(sandy.os.path, "isdir", return_value=False):
+                    with self.entry_script(instance) as script:
+                        with patch.object(
+                            instance, "_run_container_interactive", return_value=0
+                        ) as interactive:
+                            instance._exec("id")
+        self.assertEqual(
+            interactive.call_args.args[0][6:10], ["root", "/root", "/", "tty"]
+        )
+
+    def test_exec_as_root_runs_entry_helper(self):
         instance = make_sandy()
         result = SimpleNamespace(returncode=0)
         with patch.object(instance, "_is_container_running", return_value="123"):
-            with patch.object(
-                sandy,
-                "_run_secure_subprocess",
-                return_value=result,
-            ) as run:
-                self.assertIs(instance._exec_as_root("/init.sh"), result)
+            with patch.object(sandy.os.path, "isdir") as isdir:
+                with self.entry_script(instance) as script:
+                    with patch.object(
+                        sandy, "_run_secure_subprocess", return_value=result
+                    ) as run:
+                        self.assertIs(
+                            instance._exec_as_root("/bin/sh /init.sh"), result
+                        )
+        # init.sh never changes into the workspace.
+        isdir.assert_not_called()
         run.assert_called_once_with(
-            ["nsenter", "-t", "123", "-a", "--", "sh", "-c", "/init.sh"],
+            self.helper_argv(
+                script.fd,
+                "ai-dev",
+                "123",
+                "root",
+                "/root",
+                "/",
+                "sh",
+                "/bin/sh /init.sh",
+            ),
             env=sandy._container_environment("root", "/root"),
+            pass_fds=(script.fd,),
         )
+        self.assertEqual(script.closed, [script.fd])
 
         with captured_output():
             with self.assertRaises(SystemExit):
                 instance._exec_as_root("")
+
+    def test_exec_as_root_rejects_invalid_leader(self):
+        instance = make_sandy()
+        with patch.object(instance, "_is_container_running", return_value="0123"):
+            with patch.object(sandy, "_run_secure_subprocess") as run:
+                with captured_output() as (stdout, _):
+                    with self.assertRaises(SystemExit):
+                        instance._exec_as_root("true")
+        run.assert_not_called()
+        self.assertIn("E: Invalid container entry", stdout.getvalue())
+
+    def test_entry_helper_command_closes_script_on_error(self):
+        instance = make_sandy()
+        request = sandy.EntryRequest(
+            machine="ai-dev",
+            leader_pid=123,
+            user="root",
+            home="/root",
+            workdir="/",
+            kind="sh",
+            command="true",
+        )
+        with self.entry_script(instance) as script:
+            with self.assertRaises(RuntimeError):
+                with instance._entry_helper_command(request):
+                    raise RuntimeError("helper failed")
+        self.assertEqual(script.closed, [script.fd])
+
+    def test_open_entry_script_checks_the_running_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script = Path(temp_dir) / "sandy"
+            script.write_text("#!/usr/bin/env python3\n")
+            link = Path(temp_dir) / "sandy-link"
+            link.symlink_to(script)
+            for mode in (0o755, 0o700):
+                script.chmod(mode)
+                with self.subTest(mode=oct(mode)):
+                    # The symlink is resolved first, as an installed link would be.
+                    with patch.object(sandy, "__file__", str(link)):
+                        fd = sandy._open_entry_script()
+                    try:
+                        self.assertTrue(os.path.samestat(os.fstat(fd), script.stat()))
+                    finally:
+                        os.close(fd)
+            for mode in (0o775, 0o757):
+                script.chmod(mode)
+                with self.subTest(mode=oct(mode)):
+                    with patch.object(sandy, "__file__", str(script)), patch.object(
+                        sandy.os, "close", wraps=os.close
+                    ) as close:
+                        with self.assertRaises(PermissionError):
+                            sandy._open_entry_script()
+                    close.assert_called_once()
+
+    def test_no_nsenter_path_remains(self):
+        source = SANDY_PATH.read_text(encoding="utf-8")
+        self.assertNotIn('"nsenter"', source)
+        self.assertNotIn('"su"', source)
 
     def test_interactive_wrapper_wires_callbacks_and_finishes_spinner(self):
         instance = make_sandy()
@@ -7313,28 +7467,31 @@ class ExecutionTests(unittest.TestCase):
         instance = make_sandy()
         result = SimpleNamespace(returncode=0)
         with patch.object(
-            instance,
-            "_is_container_running",
-            side_effect=[None, "123"],
-        ):
-            with patch.object(
-                sandy,
-                "_run_secure_subprocess",
-                return_value=result,
-            ):
-                with patch("time.sleep") as sleep:
-                    self.assertTrue(instance._wait_for_container_ready())
+            instance, "_run_as_root", side_effect=[None, result]
+        ) as run_as_root:
+            with patch("time.sleep") as sleep:
+                self.assertTrue(instance._wait_for_container_ready())
         sleep.assert_called_once_with(1)
+        self.assertEqual(
+            run_as_root.call_args_list,
+            [call("true", capture_output=True, timeout=5)] * 2,
+        )
 
     def test_wait_for_container_ready_times_out_without_running_machine(self):
         instance = make_sandy()
-        with patch.object(instance, "_is_container_running", return_value=None):
-            with patch.object(sandy, "_run_secure_subprocess") as run:
-                with patch("time.monotonic", side_effect=[0, 0, 1]):
-                    with patch("time.sleep") as sleep:
-                        self.assertFalse(instance._wait_for_container_ready(timeout=1))
-        run.assert_not_called()
+        with patch.object(instance, "_run_as_root", return_value=None) as run:
+            with patch("time.monotonic", side_effect=[0, 0, 1]):
+                with patch("time.sleep") as sleep:
+                    self.assertFalse(instance._wait_for_container_ready(timeout=1))
+        run.assert_called_once_with("true", capture_output=True, timeout=5)
         sleep.assert_not_called()
+
+    def test_run_as_root_returns_none_without_running_machine(self):
+        instance = make_sandy()
+        with patch.object(instance, "_is_container_running", return_value=None):
+            with patch.object(sandy, "_open_entry_script") as open_script:
+                self.assertIsNone(instance._run_as_root("true"))
+        open_script.assert_not_called()
 
     def test_get_container_ip(self):
         instance = make_sandy()
@@ -7432,7 +7589,7 @@ class ExecutionTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 instance._exec_as_root("x" * 1025)
 
-        with patch.object(instance, "_is_container_running", return_value=None):
+        with patch.object(instance, "_run_as_root", return_value=None):
             with captured_output():
                 with self.assertRaises(SystemExit):
                     instance._exec_as_root("true")
@@ -7473,18 +7630,15 @@ class ExecutionTests(unittest.TestCase):
         result = SimpleNamespace(returncode=1)
         with patch.object(
             instance,
-            "_is_container_running",
-            side_effect=["123", "123", "123"],
+            "_run_as_root",
+            side_effect=[
+                subprocess.TimeoutExpired(["true"], 5),
+                ValueError("Invalid container Leader PID"),
+                result,
+                SimpleNamespace(returncode=0),
+            ],
         ):
-            with patch.object(
-                sandy,
-                "_run_secure_subprocess",
-                side_effect=[
-                    subprocess.TimeoutExpired(["true"], 5),
-                    result,
-                    SimpleNamespace(returncode=0),
-                ],
-            ):
+            if True:
                 with patch("time.sleep", side_effect=stop_spinner):
                     with captured_output() as (stdout, _):
                         self.assertTrue(
