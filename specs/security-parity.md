@@ -1031,9 +1031,11 @@ Claude Code's invocation does pass `--proc`, so it is affected.
 
 Docker hits three blockers in sequence. Its default seccomp profile denies
 `unshare`. With `seccomp=unconfined`, the `docker-default` AppArmor profile
-denies the `mount --make-rslave` that bubblewrap performs first, reported as
-`Failed to make / slave: Permission denied`. With AppArmor also unconfined, it
-reaches the same `/proc` masking failure Sandy has. Only `--privileged` works.
+denies the `mount --make-rslave` <!-- langcheckignore:rule=slave -->
+that bubblewrap performs first, reported as
+`Failed to make / slave: Permission denied`. <!-- langcheckignore:rule=slave -->
+With AppArmor also unconfined, it reaches the same `/proc` masking failure
+Sandy has. Only `--privileged` works.
 
 Sandy reaches blocker 2 with no options at all, so it is one layer closer to
 supporting a nested sandbox than Docker with two `--security-opt` overrides.
