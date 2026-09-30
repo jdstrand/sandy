@@ -114,6 +114,29 @@ def _pids_with_comm_in_cgroup(name: str, leaf: str) -> list[int]:
         return []
 
 
+def _wait_for_leaf_commands(
+    name: str, leaf: str, commands: tuple[bytes, ...]
+) -> list[int]:
+    """Wait until each command line runs in the leaf; return its processes.
+
+    leaf() returns when the helper has any child. That is already true
+    before the session has started its commands, so the leaf can still
+    have only two processes (seen on systemd 249 and 255).
+    """
+
+    def running() -> bool:
+        found = set()
+        for pid in _pids_with_comm_in_cgroup(name, leaf):
+            try:
+                found.add(Path(f"/proc/{pid}/cmdline").read_bytes())
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        return set(commands) <= found
+
+    _wait_for(f"the attach commands run in {leaf}", running)
+    return _pids_with_comm_in_cgroup(name, leaf)
+
+
 class _Attach:
     """A background `sandy exec` whose processes can be found and signaled."""
 
@@ -361,7 +384,11 @@ def test_main(context: E2EContext) -> None:
         with context.case(f"{label} to sandy ends its whole attach"):
             attach = _Attach(context, name, "sleep 301 & sleep 302")
             leaf = attach.leaf()
-            members = _pids_with_comm_in_cgroup(name, leaf)
+            # Both sleeps must run, so that the signal has a whole attach
+            # to end: the helper, the session, and a background process.
+            members = _wait_for_leaf_commands(
+                name, leaf, (b"sleep\x00301\x00", b"sleep\x00302\x00")
+            )
             if len(members) < 3:
                 raise E2EFailure(f"Attach leaf has {members!r}")
             attach.process.send_signal(signum)
