@@ -222,9 +222,9 @@ not reduce the effective privilege granted to members of that group.
 container through an internal helper mode of `sandy` itself, not through
 `nsenter`. The helper reads the seccomp filters and the capability bounding
 set of the container's init process from the host, joins the container's
-namespaces, and applies both before it runs the command. So an attached
-session has the same confinement as the container's main process, for the
-default user and for `-u root`. If the helper cannot read or apply the
+namespaces, and applies both before it runs the command. As a result, an
+attached session has the same confinement as the container's main process,
+for the default user and for `-u root`. If the helper cannot read or apply the
 confinement, it refuses to run the command; there is no unconfined fallback.
 
 Differences from earlier versions:
@@ -243,8 +243,9 @@ Differences from earlier versions:
 
 `up` starts `systemd-nspawn` in its own transient systemd scope,
 `sandy-<name>.scope` in `system.slice`, with no terminal and in its own
-session. So a closed terminal, or a stop or an OOM kill of the terminal's
-scope, does not stop the container. The scope has the same resource defaults
+session. Because of this, the container keeps running when the terminal
+closes, or when systemd stops the terminal's scope (for example, after an OOM
+kill in that scope). The scope has the same resource defaults
 as the machine scopes that `machinectl` creates: `TasksMax=16384`, and no
 memory or CPU limit. On systemd 253 or later it also has
 `OOMPolicy=continue`, so that an OOM kill of one process does not stop the
@@ -252,8 +253,8 @@ container. `up` fails if a unit with the scope's name already exists.
 
 The container's main process is `sandy-keepalive`: the image's `/bin/bash`
 running a copy of `sandy-keepalive.sh` as container root. It waits until the
-container is powered off. So the image needs `/bin/bash` and a `sleep` in
-`PATH`. Container users other than root cannot signal it.
+container is powered off. The image must therefore provide `/bin/bash` and a
+`sleep` in `PATH`. Container users other than root cannot signal it.
 
 Each session (the `up` console, `bash`, `exec`, and `/init.sh`) runs in its own
 cgroup `attach-<random>` in the container's scope, next to the container's
@@ -262,6 +263,67 @@ not against the terminal. When a session ends, `sandy` ends every process that
 the session left behind and removes the cgroup. When the terminal goes away
 (`SIGHUP`), or `sandy` gets `SIGTERM` or is killed, the session ends in the
 same way, but the container keeps running.
+
+The diagram shows a start, an attach, the two ways in which a session ends,
+and the cleanup. `up` without `-d` attaches its console as the first
+session; `up -d` skips the steps marked "without -d".
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant S as sandy (host)
+    participant C as sandy-NAME.scope (cgroup)
+    participant N as systemd-nspawn
+    participant K as container (stub init, sandy-keepalive)
+    participant H as entry helper
+
+    Note over U,H: Start
+    U->>S: sandy up [-d]
+    S->>S: remove stale port rules of NAME (creates no network)
+    S->>C: systemd-run --scope creates the scope
+    C->>N: runs systemd-nspawn --keep-unit (supervisor/)
+    N->>K: starts the stub init and sandy-keepalive (payload/)
+    opt without -d
+        S->>C: mkdir up-console, under the lifecycle lock
+    end
+    S->>H: readiness probe, then /init.sh if present (both confined)
+
+    Note over U,H: Attach (the up console, sandy bash, or sandy exec)
+    U->>S: start a session
+    S->>H: start the helper (pinned sandy, validated arguments)
+    H->>K: read the Leader's seccomp filters and CapBnd from the host
+    H->>C: create and join attach-RANDOM, under the lifecycle lock
+    H->>K: setns, drop to CapBnd, install the filters, execve the session
+
+    Note over U,H: Detach
+    alt the session exits
+        H-->>S: exit status
+        S->>C: cgroup.kill and rmdir attach-RANDOM
+        opt the session is the up console
+            S->>C: rmdir up-console
+        end
+        S->>C: count the populated attach-* leaves, under the lifecycle lock
+        opt no attach left, no up-console marker, and started without -d
+            S->>N: machinectl poweroff
+        end
+    else the terminal closes (SIGHUP), or sandy gets SIGTERM
+        S->>C: cgroup.kill and rmdir attach-RANDOM
+        opt the session is the up console
+            S->>C: rmdir up-console
+        end
+        Note over S,K: no count and no stop, the container keeps running
+    else sandy gets SIGKILL
+        H->>C: cgroup.kill attach-RANDOM (parent-death signal)
+        Note over S,K: the empty leaf stays until the next count
+    end
+
+    Note over U,H: Cleanup
+    U->>S: sandy down
+    S->>S: remove the port rules of NAME
+    S->>N: machinectl poweroff (terminate after 5 s)
+    N->>K: SIGTERM to sandy-keepalive, the container ends
+    C->>C: systemd removes the scope and all its cgroups
+```
 
 A container that stopped without `sandy` (for example, container root ended
 the main process) can leave port forwarding rules and state. The next `up` of
