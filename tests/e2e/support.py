@@ -40,6 +40,11 @@ BUILD_TIMEOUT = 1800
 FULL_BUILD_TIMEOUT = 7200
 OUTPUT_TAIL_LENGTH = 12000
 CONTAINER_USER_ID = 1000
+# On systemd < 250 sandy grants workspace access with ACLs. It needs SUDO_UID
+# (the invoking user, who owns the workspace) and asks once for each of the
+# workspace and shared directories, as it does for a real `sudo sandy up`.
+# No other prompt can appear during `up`.
+ACL_PROMPT_ANSWERS = "y\ny\n"
 HOST_SECRET_NAME = "SANDY_HOST_SECRET"
 HOST_SECRET_VALUE = "must-not-enter-container"
 DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -266,11 +271,15 @@ class E2EContext:
                 raise E2EFailure(f"Refusing unsafe container name: {name!r}")
             command.extend(["--container", name])
         command.extend(arguments)
+        sandy_environment = dict(environment or self.safe_environment())
+        # sudo sets this for the invoking user. Sandy reads it only for
+        # workspace ACLs on systemd < 250.
+        sandy_environment["SUDO_UID"] = str(CONTAINER_USER_ID)
         return self.run(
             command,
             expected=expected,
             timeout=timeout,
-            environment=environment or self.safe_environment(),
+            environment=sandy_environment,
             input_text=input_text,
         )
 
@@ -838,6 +847,7 @@ class E2EContext:
             user=user,
             timeout=BUILD_TIMEOUT,
             environment=self.minimal_environment(),
+            input_text=ACL_PROMPT_ANSWERS,
         )
         self.wait_for_machine(name, running=True)
         return result
@@ -857,6 +867,7 @@ class E2EContext:
             user=self.main_user,
             timeout=BUILD_TIMEOUT,
             environment=self.minimal_environment(),
+            input_text=ACL_PROMPT_ANSWERS,
         )
         self.wait_for_machine(self.main_name, running=True)
         return result
@@ -878,6 +889,7 @@ class E2EContext:
             name=self.full_name,
             user=self.full_user,
             timeout=FULL_BUILD_TIMEOUT,
+            input_text=ACL_PROMPT_ANSWERS,
         )
         self.wait_for_machine(self.full_name, running=True)
         return result

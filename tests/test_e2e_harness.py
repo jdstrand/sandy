@@ -14,6 +14,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.e2e.support import (
+    ACL_PROMPT_ANSWERS,
+    CONTAINER_USER_ID,
     DEFAULT_TIMEOUT,
     CommandResult,
     E2EContext,
@@ -371,3 +373,42 @@ class PublicHttpsRetryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SandyInvocationTests(unittest.TestCase):
+    """The harness runs sandy as a real `sudo` user would. It mocks run()."""
+
+    def make_context(self) -> E2EContext:
+        context = E2EContext.__new__(E2EContext)
+        context.workspace = Path("/tmp/sandy-e2e-test/workspace")
+        context.shared = Path("/tmp/sandy-e2e-test/shared")
+        return context
+
+    def test_sandy_passes_the_invoking_user(self):
+        context = self.make_context()
+        with patch.object(E2EContext, "run") as run:
+            context.sandy(["status"])
+            context.sandy(["status"], environment={"PATH": "/usr/bin", "SANDY_X": "1"})
+        default_environment = run.call_args_list[0].kwargs["environment"]
+        self.assertEqual(default_environment["SUDO_UID"], str(CONTAINER_USER_ID))
+        self.assertEqual(
+            default_environment["PATH"], context.safe_environment()["PATH"]
+        )
+        self.assertEqual(
+            run.call_args_list[1].kwargs["environment"],
+            {"PATH": "/usr/bin", "SANDY_X": "1", "SUDO_UID": str(CONTAINER_USER_ID)},
+        )
+
+    def test_builds_answer_only_the_two_acl_prompts(self):
+        self.assertEqual(ACL_PROMPT_ANSWERS, "y\ny\n")
+        context = self.make_context()
+        context.main_name = "e2e-main-abc123"
+        context.main_user = "developer"
+        context.owned_containers = {}
+        with patch.object(E2EContext, "sandy") as sandy_call, patch.object(
+            E2EContext, "wait_for_machine"
+        ), patch.object(E2EContext, "minimal_environment", return_value={}):
+            context.build_main()
+            context.build_minimal("e2e-cache-abc123", "developer")
+        for entry in sandy_call.call_args_list:
+            self.assertEqual(entry.kwargs["input_text"], ACL_PROMPT_ANSWERS)
