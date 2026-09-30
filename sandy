@@ -3181,7 +3181,14 @@ class SandyNet:
     def __init__(
         self,
         planned_network_info: Optional[NetworkInfo] = None,
+        *,
+        create: bool = True,
     ):
+        """Detect the Sandy network, and create it when create is True.
+
+        With create=False, only inspect the host: configured is True only
+        when the bridge exists, and nothing is created or changed.
+        """
         self.bridge_name = "sandybr0"
         self.network: Optional[str] = None
         self.network_cidr: Optional[str] = None
@@ -3209,6 +3216,9 @@ class SandyNet:
                 self.configured = True
             else:
                 print(f"W: Could not detect network config for existing bridge")
+            return
+
+        if not create:
             return
 
         # Create and configure new bridge
@@ -5555,12 +5565,16 @@ class Sandy:
             deduped.append((proto, host_port, container_port))
         return deduped
 
-    def _ensure_network_ready(self) -> bool:
-        """Ensure the network helper is available and configured."""
+    def _existing_network(self) -> "SandyNet":
+        """Return the Sandy network as it exists now; never create any of it.
+
+        Reuse self.network when it is configured. Otherwise only inspect the
+        host, so that a cleanup cannot create the bridge, change sysctls, or
+        install the firewall base (for example, during `up --network host`).
+        """
         if self.network and self.network.configured:
-            return True
-        self.network = SandyNet()
-        return bool(self.network and self.network.configured)
+            return self.network
+        return SandyNet(create=False)
 
     def _update_port_mapping_state(self, container_name: str, container_ip: str):
         """Update persistent state for the container, aborting on port conflicts."""
@@ -5613,9 +5627,19 @@ class Sandy:
             self._persist_port_mapping_state(state)
 
     def _cleanup_port_mappings_for_container(self, container_name: str):
-        """Remove firewall rules and state for a specific container."""
+        """Remove firewall rules and state for a specific container.
+
+        Use only the network that exists now. When the bridge is gone (for
+        example, after a host reboot), remove the state; nftables rules are
+        deleted by comment, which needs no bridge. iptables rules need the
+        gateway of the bridge to rebuild their text, so they stay until the
+        next bridge setup, which flushes every Sandy chain, or `rm --network`.
+        """
         saved_container = self.container
         saved_mappings = list(self.port_mappings)
+        # Restore the caller's network. A network left here that is not
+        # configured would make a later lenient `up` skip its own setup.
+        saved_network = self.network
         try:
             self.container = container_name
             state_ports = self._remove_port_mappings_from_state(container_name)
@@ -5636,18 +5660,20 @@ class Sandy:
                 return
 
             self.port_mappings = sanitized
-            if not self._ensure_network_ready():
-                print("W: Could not initialize network while removing port mappings")
-                return
-
-            backend = self.network.firewall_backend if self.network else None
+            self.network = self._existing_network()
+            backend = self.network.firewall_backend
             if backend == "iptables":
-                self._cleanup_port_forwarding_ipt(container_ip)
+                if self.network.configured:
+                    self._cleanup_port_forwarding_ipt(container_ip)
             elif backend == "nftables":
-                self._cleanup_port_forwarding_nft(container_ip)
+                # The bridge setup does not flush the DNAT chains, so delete
+                # these rules whenever the table exists.
+                if self.network._nft_table_exists("ip", "sandy"):
+                    self._cleanup_port_forwarding_nft(container_ip)
         finally:
             self.container = saved_container
             self.port_mappings = saved_mappings
+            self.network = saved_network
 
     def _create_manifest_content(self):
         """Create manifest content for cache identification"""
@@ -6931,7 +6957,9 @@ class Sandy:
 
         # A container that stopped without sandy (its payload ended, or its
         # scope was stopped) leaves its port forwarding rules and state.
-        # Remove only this name's Sandy-owned rules and state.
+        # Remove only this name's Sandy-owned rules and state. The cleanup
+        # uses only the network that exists now; it never creates the bridge
+        # or the firewall base, which host networking must not get.
         self._cleanup_port_mappings_for_container(self.container)
 
         mdir = self._get_machine_dir()

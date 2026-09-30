@@ -10,6 +10,7 @@ from __future__ import annotations
 import signal
 
 from tests.e2e.support import (
+    BRIDGE_NAME,
     PORT_STATE,
     E2EContext,
     E2EFailure,
@@ -105,6 +106,45 @@ def run_matrix(
         _expect_ports(context, backend, (other_port,), (first, second))
         context.stop_container(other, user)
         _expect_ports(context, backend, (), (other_port, first, second))
+
+    with context.case(f"{backend}: up with host networking builds no network"):
+        _up(context, name, user, first)
+        _stop_without_sandy(context, name)
+        _expect_ports(context, backend, (first,), ())
+        # A host reboot removes the bridge but keeps the port state. No
+        # machine may use the bridge when this run deletes it.
+        members = context.run(["ip", "-o", "link", "show", "master", BRIDGE_NAME])
+        if members.stdout.strip():
+            raise E2EFailure(f"Machines still use the bridge: {members.stdout!r}")
+        context.run(["ip", "link", "delete", BRIDGE_NAME])
+        forward = context.run(["sysctl", "-n", "net.ipv4.ip_forward"]).stdout.strip()
+        if forward not in {"0", "1"}:
+            raise E2EFailure(f"Unexpected net.ipv4.ip_forward value: {forward!r}")
+        context.run(["sysctl", "-w", "net.ipv4.ip_forward=0"])
+        try:
+            context.sandy(
+                ["up", "--detach", "--persistent", "--network", "host"],
+                name=name,
+                user=user,
+            )
+            context.wait_for_machine(name, running=True)
+            forward_after = context.run(
+                ["sysctl", "-n", "net.ipv4.ip_forward"]
+            ).stdout.strip()
+        finally:
+            context.run(["sysctl", "-w", f"net.ipv4.ip_forward={forward}"])
+        if context.bridge_exists():
+            raise E2EFailure("up with host networking created the bridge")
+        if forward_after != "0":
+            raise E2EFailure("up with host networking changed net.ipv4.ip_forward")
+        state = context.port_state() if PORT_STATE.exists() else {}
+        if f"tcp:{first}" in state:
+            raise E2EFailure("up with host networking kept the stale port state")
+        # nftables deletes rules by comment, which needs no bridge. The
+        # iptables rules stay until the next bridge setup flushes the chains.
+        if backend == "nftables" and _has_port(context, backend, first):
+            raise E2EFailure("nftables: a stale rule remains without the bridge")
+        context.stop_container(name, user)
 
 
 def test_main(context: E2EContext) -> None:

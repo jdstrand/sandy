@@ -5096,6 +5096,35 @@ class NetworkCoreTests(unittest.TestCase):
         self.assertEqual(network.firewall_backend, "nftables")
         self.assertTrue(network.configured)
 
+    def test_constructor_without_create_only_inspects(self):
+        # Mocks: the tool lookup and the read-only bridge queries. With
+        # create=False the constructor must never set up the bridge.
+        for exists, detected, configured in (
+            (False, False, False),
+            (True, True, True),
+            (True, False, False),
+        ):
+            with self.subTest(exists=exists, detected=detected):
+                with patch.object(
+                    sandy.shutil, "which", side_effect=lambda name: f"/usr/sbin/{name}"
+                ):
+                    with patch.object(
+                        sandy.SandyNet, "_bridge_exists", return_value=exists
+                    ):
+                        with patch.object(
+                            sandy.SandyNet,
+                            "_detect_existing_config",
+                            return_value=detected,
+                        ):
+                            with patch.object(
+                                sandy.SandyNet, "_setup_bridge", autospec=True
+                            ) as setup:
+                                with captured_output():
+                                    network = sandy.SandyNet(create=False)
+                setup.assert_not_called()
+                self.assertIs(network.configured, configured)
+                self.assertEqual(network.firewall_backend, "iptables")
+
     def test_preview_bridge_network_reuses_existing_bridge_without_mutation(self):
         def detect_existing(preview):
             preview.network = "10.222.5.0"
@@ -6572,6 +6601,7 @@ class PortStateTests(unittest.TestCase):
         cleanup.assert_called_once_with("10.20.30.10")
         self.assertEqual(instance.container, "ai-dev")
         self.assertEqual(instance.port_mappings, [("udp", 5353, 53)])
+        self.assertIs(instance.network, original_network)
 
     def test_remove_port_mappings_filters_only_target_container(self):
         instance = make_sandy()
@@ -6700,29 +6730,32 @@ class PortStateTests(unittest.TestCase):
                 instance._update_port_mapping_state("test-box", "")
         persist.assert_not_called()
 
-    def test_ensure_network_ready_reuses_or_constructs_network(self):
+    def test_existing_network_reuses_or_inspects_without_creating(self):
+        # Mocks: the SandyNet type, so that no host command runs.
         instance = make_sandy()
-        instance.network = make_network()
-        with patch.object(sandy, "SandyNet") as network_type:
-            self.assertTrue(instance._ensure_network_ready())
-        network_type.assert_not_called()
-
-        instance.network = None
         configured = make_network()
-        with patch.object(sandy, "SandyNet", return_value=configured):
-            self.assertTrue(instance._ensure_network_ready())
+        instance.network = configured
+        with patch.object(sandy, "SandyNet") as network_type:
+            self.assertIs(instance._existing_network(), configured)
+        network_type.assert_not_called()
 
         unconfigured = make_network()
         unconfigured.configured = False
-        instance.network = None
-        with patch.object(sandy, "SandyNet", return_value=unconfigured):
-            self.assertFalse(instance._ensure_network_ready())
+        for current in (None, unconfigured):
+            with self.subTest(current=current):
+                instance.network = current
+                inspected = make_network()
+                with patch.object(
+                    sandy, "SandyNet", return_value=inspected
+                ) as network_type:
+                    self.assertIs(instance._existing_network(), inspected)
+                network_type.assert_called_once_with(create=False)
 
     def test_cleanup_port_state_handles_incomplete_state(self):
         instance = make_sandy()
         cases = (
-            ([], None, True, ""),
-            ([{"invalid": True}], None, True, ""),
+            ([], ""),
+            ([{"invalid": True}], ""),
             (
                 [
                     {
@@ -6731,25 +6764,10 @@ class PortStateTests(unittest.TestCase):
                         "container_port": 80,
                     }
                 ],
-                None,
-                True,
                 "Could not determine IP",
             ),
-            (
-                [
-                    {
-                        "proto": "tcp",
-                        "host_port": 8080,
-                        "container_port": 80,
-                        "ip": "10.20.30.10",
-                    }
-                ],
-                None,
-                False,
-                "Could not initialize network",
-            ),
         )
-        for stored, discovered_ip, network_ready, message in cases:
+        for stored, message in cases:
             with self.subTest(message=message, stored=stored):
                 with patch.object(
                     instance,
@@ -6759,22 +6777,17 @@ class PortStateTests(unittest.TestCase):
                     with patch.object(
                         instance,
                         "_get_container_ip",
-                        return_value=discovered_ip,
+                        return_value=None,
                     ):
-                        with patch.object(
-                            instance,
-                            "_ensure_network_ready",
-                            return_value=network_ready,
-                        ):
+                        with patch.object(instance, "_existing_network") as existing:
                             with captured_output() as (stdout, _):
                                 instance._cleanup_port_mappings_for_container("target")
+                existing.assert_not_called()
                 if message:
                     self.assertIn(message, stdout.getvalue())
 
-    def test_cleanup_port_state_dispatches_nftables(self):
-        instance = make_sandy()
-        instance.network = make_network()
-        instance.network.firewall_backend = "nftables"
+    def test_cleanup_port_state_dispatches_nftables_when_table_exists(self):
+        # Mocks: the port state, the nft table query, and the rule cleanup.
         stored = [
             {
                 "proto": "tcp",
@@ -6783,17 +6796,172 @@ class PortStateTests(unittest.TestCase):
                 "ip": "10.20.30.10",
             }
         ]
-        with patch.object(
-            instance,
-            "_remove_port_mappings_from_state",
-            return_value=stored,
-        ):
-            with patch.object(
-                instance,
-                "_cleanup_port_forwarding_nft",
-            ) as cleanup:
-                instance._cleanup_port_mappings_for_container("target")
-        cleanup.assert_called_once_with("10.20.30.10")
+        for table_exists in (True, False):
+            with self.subTest(table_exists=table_exists):
+                instance = make_sandy()
+                network = make_network()
+                network.firewall_backend = "nftables"
+                instance.network = network
+                with patch.object(
+                    instance,
+                    "_remove_port_mappings_from_state",
+                    return_value=stored,
+                ):
+                    with patch.object(
+                        network, "_nft_table_exists", return_value=table_exists
+                    ) as table:
+                        with patch.object(
+                            instance,
+                            "_cleanup_port_forwarding_nft",
+                        ) as cleanup:
+                            instance._cleanup_port_mappings_for_container("target")
+                table.assert_called_once_with("ip", "sandy")
+                if table_exists:
+                    cleanup.assert_called_once_with("10.20.30.10")
+                else:
+                    cleanup.assert_not_called()
+                self.assertIs(instance.network, network)
+
+    def test_cleanup_port_state_never_creates_network(self):
+        # Regression test for `up --network host` building the bridge. Mocks:
+        # the port state, the firewall tool lookup, and Sandy's subprocess
+        # wrapper; the bridge is missing, as after a host reboot. Only
+        # read-only queries may run, and nothing may be created.
+        stored = [
+            {
+                "proto": "tcp",
+                "host_port": 8080,
+                "container_port": 80,
+                "container": "target",
+                "ip": "10.20.30.10",
+            }
+        ]
+        cases = (
+            (
+                "iptables",
+                False,
+                [["ip", "link", "show", "sandybr0"]],
+            ),
+            (
+                "nftables",
+                True,
+                [
+                    ["ip", "link", "show", "sandybr0"],
+                    ["nft", "list", "table", "ip", "sandy"],
+                ],
+            ),
+            (
+                "nftables",
+                False,
+                [
+                    ["ip", "link", "show", "sandybr0"],
+                    ["nft", "list", "table", "ip", "sandy"],
+                ],
+            ),
+            # No firewall tool: the state goes, and no rule command runs.
+            (None, False, [["ip", "link", "show", "sandybr0"]]),
+        )
+        for backend, table_exists, expected_commands in cases:
+            with self.subTest(backend=backend, table_exists=table_exists):
+                instance = make_sandy()
+                commands = []
+
+                def run(command, **_kwargs):
+                    commands.append(command)
+                    found = command[0] == "nft" and table_exists
+                    return SimpleNamespace(
+                        returncode=0 if found else 1, stdout="", stderr=""
+                    )
+
+                tools = {
+                    "iptables": {"iptables", "ip6tables", "nft"},
+                    "nftables": {"nft"},
+                    None: set(),
+                }[backend]
+                with ExitStack() as stack:
+                    remove = stack.enter_context(
+                        patch.object(
+                            instance,
+                            "_remove_port_mappings_from_state",
+                            return_value=stored,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            sandy.shutil,
+                            "which",
+                            side_effect=lambda name: (
+                                f"/usr/sbin/{name}" if name in tools else None
+                            ),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(sandy, "_run_secure_subprocess", side_effect=run)
+                    )
+                    setup = stack.enter_context(
+                        patch.object(sandy.SandyNet, "_setup_bridge", autospec=True)
+                    )
+                    ipt = stack.enter_context(
+                        patch.object(instance, "_cleanup_port_forwarding_ipt")
+                    )
+                    nft = stack.enter_context(
+                        patch.object(instance, "_cleanup_port_forwarding_nft")
+                    )
+                    stack.enter_context(captured_output())
+                    instance._cleanup_port_mappings_for_container("target")
+
+                remove.assert_called_once_with("target")
+                setup.assert_not_called()
+                ipt.assert_not_called()
+                if backend == "nftables" and table_exists:
+                    nft.assert_called_once_with("10.20.30.10")
+                else:
+                    nft.assert_not_called()
+                self.assertEqual(commands, expected_commands)
+                # A lenient `up` builds its own network after this cleanup.
+                self.assertIsNone(instance.network)
+
+    def test_cleanup_port_state_uses_existing_bridge(self):
+        # Mocks: the port state, the read-only bridge queries, and the rule
+        # cleanup. An existing bridge is reused; nothing is set up.
+        instance = make_sandy()
+        stored = [
+            {
+                "proto": "tcp",
+                "host_port": 8080,
+                "container_port": 80,
+                "ip": "10.20.30.10",
+            }
+        ]
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    instance, "_remove_port_mappings_from_state", return_value=stored
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    sandy.shutil, "which", side_effect=lambda name: f"/usr/sbin/{name}"
+                )
+            )
+            stack.enter_context(
+                patch.object(sandy.SandyNet, "_bridge_exists", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(
+                    sandy.SandyNet, "_detect_existing_config", return_value=True
+                )
+            )
+            setup = stack.enter_context(
+                patch.object(sandy.SandyNet, "_setup_bridge", autospec=True)
+            )
+            ipt = stack.enter_context(
+                patch.object(instance, "_cleanup_port_forwarding_ipt")
+            )
+            instance._cleanup_port_mappings_for_container("target")
+        setup.assert_not_called()
+        ipt.assert_called_once_with("10.20.30.10")
+        self.assertIsNone(instance.network)
 
 
 class CacheTests(unittest.TestCase):

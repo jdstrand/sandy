@@ -268,7 +268,11 @@ the main process) can leave port forwarding rules and state. The next `up` of
 the same name removes them. With the nftables backend, each port forwarding
 rule carries the comment `sandy:<name>:<proto>:<host port>`, and `sandy`
 removes exactly the rules with that comment. Rules that earlier versions added
-have no comment; `rm --network` removes them.
+have no comment; `rm --network` removes them. This cleanup never creates the
+bridge or the firewall, also not for `up --network host`. When the bridge is
+gone (for example, after a host reboot), `sandy` removes the state and the
+nftables rules. The iptables rules need the address of the bridge, so any that
+remain are removed by the next bridge setup or by `rm --network`.
 
 Containers started by earlier versions of `sandy` are not in a
 `sandy-<name>.scope`. `bash` and `exec` refuse to attach to them; stop them
