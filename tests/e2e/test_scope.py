@@ -14,7 +14,6 @@ import time
 from pathlib import Path
 
 from tests.e2e.support import (
-    PORT_STATE,
     SANDY,
     E2EContext,
     E2EFailure,
@@ -528,6 +527,9 @@ def test_main(context: E2EContext) -> None:
             f"Sandy container {second} (attached)"
         ):
             raise E2EFailure("The scope does not record an attached up")
+        # While the console runs, no attach exit may stop the container.
+        if not (_unit_dir(second) / "console-pending").is_dir():
+            raise E2EFailure("The console-pending marker is missing")
         console_inside = context.sandy(
             ["exec", "--", "cat /proc/self/cgroup"], name=second
         )
@@ -576,6 +578,27 @@ def test_main(context: E2EContext) -> None:
         ):
             raise E2EFailure(f"Unexpected warnings: {joined[-2000:]}")
 
+    with context.case("a console hangup keeps the container until the last attach"):
+        console = _Console(context, second)
+        _wait_for_console(context, second)
+        attach = _Attach(context, second, "sleep 4")
+        attach.leaf()
+        console.process.send_signal(signal.SIGHUP)
+        returncode, console_output = console.finish()
+        if returncode != 128 + signal.SIGHUP:
+            raise E2EFailure(
+                f"Console up exited {returncode}: {console_output[-2000:]}"
+            )
+        if not context.machine_running(second):
+            raise E2EFailure("A console hangup stopped the container")
+        if (_unit_dir(second) / "console-pending").exists():
+            raise E2EFailure("The console-pending marker remains after the hangup")
+        attach_returncode, attach_output = attach.finish()
+        if attach_returncode != 0:
+            raise E2EFailure(f"Attach exited {attach_returncode}: {attach_output}")
+        assert_contains_text(attach_output, "no session is attached")
+        _wait_stopped(context, second)
+
     with context.case("up -d is never stopped by an attach exit"):
         context.sandy(
             ["up", "--detach", "--persistent", "--network", "host"], name=second
@@ -588,47 +611,6 @@ def test_main(context: E2EContext) -> None:
         context.remove_container(second, context.cache_user)
         if _show(context, second, "LoadState") != "not-found":
             raise E2EFailure("The scope remains after rm")
-
-    with context.case("up removes forwarding rules left by a stop without sandy"):
-        host_port = context.choose_host_port()
-        context.stop_container(name, context.main_user)
-        context.sandy(
-            [
-                "up",
-                "--detach",
-                "--persistent",
-                "--network",
-                "lenient",
-                "--port",
-                f"tcp:{host_port}:8000",
-            ],
-            name=name,
-            user=context.main_user,
-        )
-        context.wait_for_machine(name, running=True)
-        # Container root ends PID 2; nothing in sandy sees the stop.
-        # The stop kills this attach too, so its exit status is 137.
-        context.sandy(
-            ["exec", "--", "kill -TERM 2; sleep 30"],
-            name=name,
-            user="root",
-            expected=128 + signal.SIGKILL,
-        )
-        _wait_stopped(context, name)
-        rules = context.run(["iptables", "-t", "nat", "-S", "sandy-nat-out"])
-        assert_contains(rules, f"--dport {host_port}")
-        if f"tcp:{host_port}" not in context.port_state():
-            raise E2EFailure("The port state was removed without sandy")
-        context.sandy(
-            ["up", "--detach", "--persistent", "--network", "lenient"],
-            name=name,
-            user=context.main_user,
-        )
-        context.wait_for_machine(name, running=True)
-        rules = context.run(["iptables", "-t", "nat", "-S", "sandy-nat-out"])
-        assert_not_contains(rules, f"--dport {host_port}")
-        if PORT_STATE.exists() and f"tcp:{host_port}" in context.port_state():
-            raise E2EFailure("Stale port state remains after up")
 
 
 def assert_contains_text(text: str, expected: str) -> None:

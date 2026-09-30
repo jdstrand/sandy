@@ -382,7 +382,53 @@ class SandyInvocationTests(unittest.TestCase):
         context = E2EContext.__new__(E2EContext)
         context.workspace = Path("/tmp/sandy-e2e-test/workspace")
         context.shared = Path("/tmp/sandy-e2e-test/shared")
+        context.hide_iptables = False
         return context
+
+    def test_hidden_iptables_wraps_sandy_in_a_private_mount_namespace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary = root / "xtables-nft-multi"
+            binary.write_bytes(b"")
+            link = root / "iptables"
+            link.symlink_to(binary)
+            context = self.make_context()
+            context.root = root
+            context.hide_iptables = True
+            with patch("tests.e2e.support.shutil.which", return_value=str(link)), patch(
+                "tests.e2e.support.IPTABLES_BINARY_DIRS", (root,)
+            ), patch.object(E2EContext, "run") as run:
+                context.sandy(["down"])
+            command = run.call_args.args[0]
+            self.assertEqual(
+                command[:11],
+                [
+                    "unshare",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    'mount --bind -- "$1" "$2" && shift 2 && exec "$@"',
+                    "sh",
+                    str(root / "no-iptables"),
+                    str(binary),
+                ],
+            )
+            self.assertEqual(command[-1], "down")
+            blocker = root / "no-iptables"
+            self.assertEqual(stat.S_IMODE(blocker.stat().st_mode), 0o644)
+            self.assertEqual(blocker.read_bytes(), b"")
+
+    def test_hidden_iptables_rejects_unexpected_binary(self):
+        context = self.make_context()
+        context.root = Path("/tmp/sandy-e2e-test")
+        for located in (None, "/tmp/iptables"):
+            with self.subTest(located=located):
+                with patch("tests.e2e.support.shutil.which", return_value=located):
+                    with self.assertRaises(E2EFailure):
+                        context.without_iptables(["sandy"])
 
     def test_sandy_passes_the_invoking_user(self):
         context = self.make_context()

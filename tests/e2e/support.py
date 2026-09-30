@@ -61,6 +61,12 @@ IP6TABLES_CHAINS = (
     ("filter", "sandy-fwd6"),
     ("filter", "sandy-rej6"),
 )
+# Sandy uses nftables only when iptables is missing. To test that backend, run
+# sandy in a private mount namespace where an empty, non-executable file is
+# bound over the iptables binary. The host stays unchanged. The script is
+# static; the paths and the sandy command are positional arguments.
+HIDE_IPTABLES_SCRIPT = 'mount --bind -- "$1" "$2" && shift 2 && exec "$@"'
+IPTABLES_BINARY_DIRS = (Path("/usr/sbin"), Path("/sbin"))
 NFTABLES_TABLES = (
     ("ip", "sandy"),
     ("ip6", "sandy"),
@@ -135,6 +141,9 @@ class E2EContext:
         self.main_name = f"e2e-main-{suffix}"
         self.full_name = f"e2e-full-{suffix}"
         self.scope_name = f"e2e-scope-{suffix}"
+        self.other_name = f"e2e-other-{suffix}"
+        self.nft_name = f"e2e-nft-{suffix}"
+        self.nft_other_name = f"e2e-nft-other-{suffix}"
         self.cache_user = "developer"
         self.cache_miss_user = "e2emiss"
         self.main_user = "developer"
@@ -169,6 +178,8 @@ class E2EContext:
             FilesystemFixtureIdentity,
         ] = {}
         self._filesystem_mounts: list[Path] = []
+        # When True, every sandy call runs without a visible iptables.
+        self.hide_iptables = False
 
     def _validate_names(self) -> None:
         for name in (
@@ -178,6 +189,9 @@ class E2EContext:
             self.main_name,
             self.full_name,
             self.scope_name,
+            self.other_name,
+            self.nft_name,
+            self.nft_other_name,
         ):
             if not NAME_PATTERN.fullmatch(name):
                 raise E2EFailure(f"Generated unsafe container name: {name!r}")
@@ -273,6 +287,8 @@ class E2EContext:
                 raise E2EFailure(f"Refusing unsafe container name: {name!r}")
             command.extend(["--container", name])
         command.extend(arguments)
+        if self.hide_iptables:
+            command = self.without_iptables(command)
         sandy_environment = dict(environment or self.safe_environment())
         # sudo sets this for the invoking user. Sandy reads it only for
         # workspace ACLs on systemd < 250.
@@ -284,6 +300,33 @@ class E2EContext:
             environment=sandy_environment,
             input_text=input_text,
         )
+
+    def without_iptables(self, command: Sequence[str]) -> list[str]:
+        """Return command wrapped so that it sees no iptables binary."""
+        located = shutil.which("iptables", path=self.safe_environment()["PATH"])
+        if located is None:
+            raise E2EFailure("iptables is not installed")
+        target = Path(located).resolve()
+        if target.parent not in IPTABLES_BINARY_DIRS or not target.is_file():
+            raise E2EFailure(f"Unexpected iptables binary: {target}")
+        blocker = self.root / "no-iptables"
+        if not blocker.exists():
+            blocker.write_bytes(b"")
+            blocker.chmod(0o644)
+        return [
+            "unshare",
+            "--mount",
+            "--propagation",
+            "private",
+            "--",
+            "/bin/sh",
+            "-c",
+            HIDE_IPTABLES_SCRIPT,
+            "sh",
+            str(blocker),
+            str(target),
+            *command,
+        ]
 
     @contextmanager
     def case(self, name: str) -> Iterator[None]:
@@ -872,6 +915,20 @@ class E2EContext:
             input_text=ACL_PROMPT_ANSWERS,
         )
         self.wait_for_machine(self.main_name, running=True)
+        return result
+
+    def build_lenient(self, name: str, user: str) -> CommandResult:
+        """Build a persistent machine with the bridge network; leave it running."""
+        self.register_container(name, user)
+        result = self.sandy(
+            ["up", "--build", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=user,
+            timeout=BUILD_TIMEOUT,
+            environment=self.minimal_environment(),
+            input_text=ACL_PROMPT_ANSWERS,
+        )
+        self.wait_for_machine(name, running=True)
         return result
 
     def build_full(self) -> CommandResult:
