@@ -3332,6 +3332,11 @@ class EntryPrimitiveTests(unittest.TestCase):
                         sandy._capbset_drop(capability)
                 syscall.assert_not_called()
 
+    def test_set_child_subreaper_exact_call(self):
+        with mocked_entry_syscall() as syscall:
+            sandy._set_child_subreaper()
+        syscall.assert_called_once_with(157, 36, 1, 0, 0, 0, 0)
+
     def test_setns_exact_calls_for_each_namespace(self):
         with mocked_entry_syscall() as syscall:
             for fd, (_, nstype) in enumerate(sandy.NAMESPACE_ENTRY_ORDER, start=10):
@@ -3910,6 +3915,882 @@ class LeaderExtractionTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 sandy._extract_leader_confinement("ai-dev", 42)
         pidfd_open.assert_not_called()
+
+
+class _ExitCalled(Exception):
+    """Raised by a mocked os._exit so that a test can observe the exit code."""
+
+
+def entry_args(**overrides):
+    """Return valid entry helper arguments that follow the mode argument."""
+    values = {
+        "machine": "ai-dev",
+        "leader": "4242",
+        "user": "developer",
+        "home": "/home/developer",
+        "workdir": "/home/developer/workspace",
+        "kind": "tty",
+        "command": "exec bash --login",
+    }
+    values.update(overrides)
+    return list(values.values())
+
+
+def entry_request(**overrides):
+    return sandy._parse_entry_request(entry_args(**overrides))
+
+
+def entry_confinement(mask=0b101010):
+    return sandy.LeaderConfinement(
+        pidfd=10,
+        namespace_fds=(21, 22, 23, 24, 25, 26, 27),
+        seccomp_filters=(b"oldest00", b"newest00"),
+        capability_bounding_set=mask,
+    )
+
+
+class EntryHelperTests(unittest.TestCase):
+    """The internal entry helper mode.
+
+    Tests mock fork, setns, prctl, seccomp, the id changes, execve, _exit,
+    signal state, and the Leader extraction. No test enters a namespace. E2E
+    tests in a VM must prove the real confinement.
+    """
+
+    def test_parse_entry_request_accepts_user_and_root(self):
+        self.assertEqual(
+            entry_request(),
+            sandy.EntryRequest(
+                machine="ai-dev",
+                leader_pid=4242,
+                user="developer",
+                home="/home/developer",
+                workdir="/home/developer/workspace",
+                kind="tty",
+                command="exec bash --login",
+            ),
+        )
+        root = entry_request(
+            user="root",
+            home="/root",
+            workdir="/",
+            kind="sh",
+            command="/bin/sh /init.sh",
+        )
+        self.assertEqual((root.user, root.home, root.kind), ("root", "/root", "sh"))
+
+    def test_parse_entry_request_rejects_invalid_fields(self):
+        cases = {
+            "machine": ("-p", "Ai", ""),
+            "leader": ("1", "01", "abc", "4194304"),
+            "user": ("Root", "-x", ""),
+            "home": ("/home/other", "/root", ""),
+            "workdir": ("", "relative", "/a/../b", "/a/", "//a", "/a/./b", "/a\nb"),
+            "kind": ("bash", "", "TTY"),
+            "command": ("", "x" * (sandy.ENTRY_COMMAND_MAX_BYTES + 1)),
+        }
+        for field, values in cases.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(ValueError):
+                        sandy._parse_entry_request(entry_args(**{field: value}))
+        for extra in ([], entry_args() + ["x"], entry_args()[:-1]):
+            with self.subTest(count=len(extra)):
+                with self.assertRaises(ValueError):
+                    sandy._parse_entry_request(extra)
+
+    def test_command_limit_counts_bytes(self):
+        command = "\u00e9" * (sandy.ENTRY_COMMAND_MAX_BYTES // 2)
+        self.assertEqual(entry_request(command=command).command, command)
+        with self.assertRaises(ValueError):
+            entry_request(command=command + "x")
+
+    def test_entry_helper_argv_exact(self):
+        with tempfile.TemporaryFile() as script:
+            fd = script.fileno()
+            with patch.object(sandy.sys, "executable", "/usr/bin/python3"):
+                argv = sandy._entry_helper_argv(fd, entry_request())
+        self.assertEqual(
+            argv,
+            ["/usr/bin/python3", "-I", f"/proc/self/fd/{fd}", "__sandy-entry-helper"]
+            + entry_args(),
+        )
+        self.assertEqual(sandy._parse_entry_request(argv[4:]), entry_request())
+
+    def test_entry_helper_argv_rejects_unparsable_request(self):
+        bad = entry_request()._replace(workdir="relative")
+        with tempfile.TemporaryFile() as script:
+            with self.assertRaises(ValueError):
+                sandy._entry_helper_argv(script.fileno(), bad)
+
+    def test_entry_helper_argv_rejects_request_that_changes_in_parsing(self):
+        # Text is not the int that parsing returns.
+        changed = entry_request()._replace(leader_pid="4242")
+        with tempfile.TemporaryFile() as script:
+            with self.assertRaises(ValueError):
+                sandy._entry_helper_argv(script.fileno(), changed)
+
+    def test_resolve_container_identity_matches_nspawn(self):
+        passwd = (
+            "root:x:0:0:root:/root:/bin/bash\n"
+            "# comment\n"
+            "\n"
+            "developer:x:1000:1000:AI User,,,:/home/developer:/bin/bash\n"
+        )
+        group = (
+            "root:x:0:\n"
+            "developer:x:1000:developer\n"
+            "aitwo:x:2002:root,developer\n"
+            "aione:x:2001:developer,developer\n"
+            "aithree:x:2003:other,developers\n"
+            "empty:x:2004:\n"
+            "aitwo-alias:x:2002:developer\n"
+        )
+        # The measured nspawn result: file order, no duplicates, the primary
+        # gid only when listed, and no supplementary groups for root.
+        self.assertEqual(
+            sandy._resolve_container_identity("developer", passwd, group),
+            (1000, 1000, (1000, 2002, 2001)),
+        )
+        self.assertEqual(
+            sandy._resolve_container_identity("root", passwd, group), (0, 0, ())
+        )
+        self.assertEqual(
+            sandy._resolve_container_identity(
+                "developer", passwd, "developer:x:1000:\n"
+            ),
+            (1000, 1000, ()),
+        )
+
+    def test_resolve_container_identity_fails_closed(self):
+        passwd = "root:x:0:0::/root:/bin/sh\ndeveloper:x:1000:1000::/home/developer:/bin/sh\n"
+        cases = (
+            ("developer", "root:x:0:0::/root:/bin/sh\n", "", "missing user"),
+            ("developer", passwd + "developer:x:1001:1001::/h:/s\n", "", "twice"),
+            ("developer", passwd + "broken:x:1\n", "", "short passwd line"),
+            ("developer", passwd.replace(":1000:1000:", ":01000:1000:"), "", "uid"),
+            ("developer", passwd.replace(":1000:1000:", ":1000:65535:"), "", "gid"),
+            ("developer", passwd.replace(":1000:1000:", ":0:1000:"), "", "uid 0"),
+            ("root", passwd.replace("root:x:0:0", "root:x:5:0"), "", "root uid"),
+            ("developer", passwd, "g:x:2001\n", "short group line"),
+            ("developer", passwd, "g:x:x:developer\n", "group gid"),
+            ("root", passwd, "g:x:x:root\n", "group gid for root"),
+            (
+                "developer",
+                passwd,
+                "".join(f"g{i}:x:{2000 + i}:developer\n" for i in range(65)),
+                "too many groups",
+            ),
+        )
+        for user, passwd_text, group_text, label in cases:
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    sandy._resolve_container_identity(user, passwd_text, group_text)
+
+    def test_read_container_account_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "group"
+            path.write_bytes(b"g:x:1:\xff\n")
+            self.assertEqual(
+                sandy._read_container_account_file(str(path)), "g:x:1:\udcff\n"
+            )
+            link = Path(temp_dir) / "link"
+            link.symlink_to(path)
+            self.assertEqual(
+                sandy._read_container_account_file(str(link)), "g:x:1:\udcff\n"
+            )
+            path.write_bytes(b"x" * (sandy.CONTAINER_ACCOUNT_FILE_MAX_BYTES + 1))
+            with self.assertRaises(ValueError):
+                sandy._read_container_account_file(str(path))
+            fifo = Path(temp_dir) / "fifo"
+            os.mkfifo(fifo)
+            # O_NONBLOCK: the open does not wait for a writer.
+            with self.assertRaises(ValueError):
+                sandy._read_container_account_file(str(fifo))
+            with self.assertRaises(ValueError):
+                sandy._read_container_account_file(temp_dir)
+            with self.assertRaises(FileNotFoundError):
+                sandy._read_container_account_file(str(Path(temp_dir) / "none"))
+
+    def test_entry_exec_argv(self):
+        self.assertEqual(
+            sandy._entry_exec_argv(entry_request(command="echo 'a b'; id")),
+            ["/bin/bash", "-c", "script -qec 'echo '\"'\"'a b'\"'\"'; id' /dev/null"],
+        )
+        self.assertEqual(
+            sandy._entry_exec_argv(entry_request(kind="sh", command="echo $x")),
+            ["/bin/sh", "-c", "echo $x"],
+        )
+
+    def test_open_fds_lists_only_open_descriptors(self):
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        try:
+            fds = sandy._open_fds()
+        finally:
+            os.close(read_fd)
+        self.assertIn(read_fd, fds)
+        self.assertNotIn(write_fd, fds)
+        self.assertTrue({0, 1, 2} <= fds)
+
+    def verify_fds(self, path, fds, mode=stat.S_IFREG | 0o755, uid=0):
+        script_stat = SimpleNamespace(st_mode=mode, st_uid=uid)
+        with patch.object(sandy, "_open_fds", return_value=fds), patch.object(
+            sandy.os, "fstat", return_value=script_stat
+        ):
+            return sandy._verify_entry_helper_fds(path)
+
+    def test_verify_entry_helper_fds_accepts_pinned_script(self):
+        self.assertEqual(self.verify_fds("/proc/self/fd/3", {0, 1, 2, 3}), 3)
+        self.assertEqual(self.verify_fds("/proc/self/fd/12", {0, 1, 2, 12}), 12)
+
+    def test_verify_entry_helper_fds_rejects_direct_calls(self):
+        for path, fds in (
+            ("/usr/local/lib/sandy/sandy", {0, 1, 2}),
+            ("sandy", {0, 1, 2}),
+            ("/proc/self/fd/2", {0, 1, 2}),
+            ("/proc/self/fd/03", {0, 1, 2, 3}),
+            ("/proc/1/fd/3", {0, 1, 2, 3}),
+            ("/proc/self/fd/3", {0, 1, 2}),
+            ("/proc/self/fd/3", {1, 2, 3}),
+            ("/proc/self/fd/3", {0, 1, 2, 3, 4}),
+        ):
+            with self.subTest(path=path, fds=fds):
+                with self.assertRaises(PermissionError):
+                    self.verify_fds(path, fds)
+
+    def test_verify_entry_helper_fds_accepts_owner_only_writable_script(self):
+        # The parent already runs this file as root; any owner is accepted.
+        for uid in (0, 1000):
+            with self.subTest(uid=uid):
+                self.assertEqual(
+                    self.verify_fds(
+                        "/proc/self/fd/3", {0, 1, 2, 3}, stat.S_IFREG | 0o755, uid
+                    ),
+                    3,
+                )
+
+    def test_verify_entry_helper_fds_rejects_unsafe_script(self):
+        for mode, uid in (
+            (stat.S_IFREG | 0o775, 0),
+            (stat.S_IFREG | 0o757, 0),
+            (stat.S_IFREG | 0o775, 1000),
+            (stat.S_IFIFO | 0o755, 0),
+        ):
+            with self.subTest(mode=oct(mode), uid=uid):
+                with self.assertRaises(PermissionError):
+                    self.verify_fds("/proc/self/fd/3", {0, 1, 2, 3}, mode, uid)
+
+    def test_read_cap_last_cap(self):
+        for data, expected in ((b"40\n", 40), (b"0\n", 0), (b"63\n", 63)):
+            with self.subTest(data=data):
+                with patch.object(
+                    sandy.os, "open", return_value=99
+                ) as opened, patch.object(
+                    sandy.os, "read", return_value=data
+                ), patch.object(
+                    sandy.os, "close"
+                ) as close:
+                    self.assertEqual(sandy._read_cap_last_cap(), expected)
+                opened.assert_called_once_with(
+                    "/proc/sys/kernel/cap_last_cap", sandy.READ_FILE_OPEN_FLAGS
+                )
+                close.assert_called_once_with(99)
+        for data in (b"40", b"64\n", b"x\n", b"123\n", b"4 0\n", b""):
+            with self.subTest(data=data):
+                with patch.object(sandy.os, "open", return_value=99), patch.object(
+                    sandy.os, "read", return_value=data
+                ), patch.object(sandy.os, "close"):
+                    with self.assertRaises(ValueError):
+                        sandy._read_cap_last_cap()
+
+    def test_read_child_pids_lists_running_and_unreaped_children(self):
+        # No mocks: the helper finds the session in this list, and a session
+        # that exits at once must still be listed until it is reaped.
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE,
+        )
+        try:
+            self.assertIn(child.pid, sandy._read_child_pids())
+            assert child.stdin is not None
+            child.stdin.close()
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+            self.assertIn(child.pid, sandy._read_child_pids())
+        finally:
+            child.wait(timeout=30)
+        self.assertNotIn(child.pid, sandy._read_child_pids())
+
+    def test_read_child_pids_parses_strictly(self):
+        cases = ((b"", ()), (b"88 ", (88,)), (b"88 89 ", (88, 89)))
+        for data, expected in cases:
+            with self.subTest(data=data):
+                with patch.object(sandy.os, "open", return_value=99), patch.object(
+                    sandy.os, "read", return_value=data
+                ), patch.object(sandy.os, "close"), patch.object(
+                    sandy.os, "getpid", return_value=55
+                ):
+                    self.assertEqual(sandy._read_child_pids(), expected)
+                    sandy.os.open.assert_called_once_with(
+                        "/proc/55/task/55/children", sandy.READ_FILE_OPEN_FLAGS
+                    )
+        for data in (b"88", b"x ", b"088 ", b"88  ", b"-1 ", b"4194304 ", b"8" * 4096):
+            with self.subTest(data=data[:12]):
+                with patch.object(sandy.os, "open", return_value=99), patch.object(
+                    sandy.os, "read", return_value=data
+                ), patch.object(sandy.os, "close"), patch.object(
+                    sandy.os, "getpid", return_value=55
+                ):
+                    with self.assertRaises(ValueError):
+                        sandy._read_child_pids()
+
+    def test_entry_error_removes_control_characters(self):
+        with captured_output() as (_, stderr):
+            sandy._entry_error(OSError("bad\x1b[2Jname"))
+        self.assertEqual(
+            stderr.getvalue(), "E: Container entry failed: 'bad\\x1b[2Jname'\n"
+        )
+        broken = MagicMock()
+        broken.write.side_effect = OSError("closed")
+        with patch.object(sandy.sys, "stderr", broken):
+            sandy._entry_error(OSError("x"))
+
+    def test_wait_forwarding_signals_installs_then_unblocks_then_waits(self):
+        manager = MagicMock()
+        manager.waitpid.return_value = (77, 0x300)
+        with patch.object(sandy.signal, "signal", manager.signal), patch.object(
+            sandy.signal, "pthread_sigmask", manager.sigmask
+        ), patch.object(sandy.os, "waitpid", manager.waitpid), patch.object(
+            sandy.os, "kill", manager.kill
+        ):
+            self.assertEqual(sandy._wait_forwarding_signals(77), 0x300)
+            handler = manager.signal.call_args_list[0].args[1]
+            handler(sandy.signal.SIGTERM, None)
+            manager.kill.side_effect = ProcessLookupError()
+            handler(sandy.signal.SIGHUP, None)
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                call.signal(sandy.signal.SIGHUP, handler),
+                call.signal(sandy.signal.SIGTERM, handler),
+                call.sigmask(sandy.signal.SIG_UNBLOCK, sandy.ENTRY_FORWARDED_SIGNALS),
+                call.waitpid(77, 0),
+                call.kill(77, sandy.signal.SIGTERM),
+                call.kill(77, sandy.signal.SIGHUP),
+            ],
+        )
+
+    def test_propagate_wait_status(self):
+        self.assertEqual(sandy._propagate_wait_status(3 << 8), 3)
+        self.assertEqual(sandy._propagate_wait_status(0), 0)
+        # A stopped status is not an exit.
+        self.assertEqual(sandy._propagate_wait_status(0x137F), 125)
+        manager = MagicMock()
+        with patch.object(sandy.signal, "signal", manager.signal), patch.object(
+            sandy.signal, "pthread_sigmask", manager.sigmask
+        ), patch.object(sandy.os, "kill", manager.kill), patch.object(
+            sandy.os, "getpid", return_value=55
+        ):
+            self.assertEqual(sandy._propagate_wait_status(sandy.signal.SIGTERM), 143)
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                call.signal(sandy.signal.SIGTERM, sandy.signal.SIG_DFL),
+                call.sigmask(sandy.signal.SIG_UNBLOCK, {sandy.signal.SIGTERM}),
+                call.kill(55, sandy.signal.SIGTERM),
+            ],
+        )
+
+    def test_propagate_wait_status_ends_real_process_with_signal(self):
+        # No mocks: a child interpreter must die by the same signal.
+        code = (
+            "import importlib.machinery, importlib.util, sys\n"
+            "loader = importlib.machinery.SourceFileLoader('s', sys.argv[1])\n"
+            "spec = importlib.util.spec_from_loader('s', loader)\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "loader.exec_module(module)\n"
+            "module._propagate_wait_status(int(sys.argv[2]))\n"
+        )
+        for signum in (sandy.signal.SIGKILL, sandy.signal.SIGTERM, sandy.signal.SIGHUP):
+            with self.subTest(signum=signum):
+                result = subprocess.run(
+                    [sys.executable, "-c", code, str(SANDY_PATH), str(signum)],
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, -signum, result.stderr)
+
+    def test_propagate_wait_status_passes_on_sigkill(self):
+        # Regression: signal.signal(SIGKILL, ...) raises OSError(EINVAL), so
+        # a SIGKILL exit (for example, a container stop) became exit 125.
+        manager = MagicMock()
+        with patch.object(sandy.signal, "signal", manager.signal), patch.object(
+            sandy.signal, "pthread_sigmask", manager.sigmask
+        ), patch.object(sandy.os, "kill", manager.kill), patch.object(
+            sandy.os, "getpid", return_value=55
+        ):
+            self.assertEqual(sandy._propagate_wait_status(sandy.signal.SIGKILL), 137)
+        self.assertEqual(manager.mock_calls, [call.kill(55, sandy.signal.SIGKILL)])
+
+    @contextmanager
+    def confine_mocks(self, mask):
+        manager = MagicMock()
+        manager.capbset_read.side_effect = lambda cap: bool(mask & (1 << cap))
+        manager.exit.side_effect = _ExitCalled
+        account_files = {
+            "/etc/passwd": "developer:x:1000:1000::/home/developer:/bin/bash\n",
+            "/etc/group": "aitwo:x:2002:developer\naione:x:2001:developer\n",
+        }
+        manager.read_account.side_effect = account_files.__getitem__
+        targets = (
+            (sandy, "_read_container_account_file", "read_account"),
+            (sandy, "_capbset_drop", "capbset_drop"),
+            (sandy, "_capbset_read", "capbset_read"),
+            (sandy, "_seccomp_set_mode_filter", "seccomp"),
+            (sandy.os, "setgroups", "setgroups"),
+            (sandy.os, "setresgid", "setresgid"),
+            (sandy.os, "setresuid", "setresuid"),
+            (sandy.os, "chdir", "chdir"),
+            (sandy.signal, "signal", "signal"),
+            (sandy.signal, "pthread_sigmask", "sigmask"),
+            (sandy.os, "execve", "execve"),
+            (sandy.os, "_exit", "exit"),
+            (sandy, "_entry_error", "error"),
+        )
+        with ExitStack() as stack:
+            for owner, name, attribute in targets:
+                stack.enter_context(
+                    patch.object(owner, name, getattr(manager, attribute))
+                )
+            yield manager
+
+    def test_confine_and_exec_order(self):
+        mask = 0b101010
+        request = entry_request()
+        environment = {"HOME": "/home/developer"}
+        with self.confine_mocks(mask) as manager:
+            with self.assertRaises(_ExitCalled):
+                sandy._confine_and_exec(
+                    request, environment, entry_confinement(mask), 5
+                )
+        expected = [call.capbset_drop(0), call.capbset_drop(2), call.capbset_drop(4)]
+        expected += [call.capbset_read(cap) for cap in range(6)]
+        expected += [
+            call.seccomp(b"oldest00"),
+            call.seccomp(b"newest00"),
+            # The account files are read only after the filters are in place.
+            call.read_account("/etc/passwd"),
+            call.read_account("/etc/group"),
+            call.setgroups([2002, 2001]),
+            call.setresgid(1000, 1000, 1000),
+            call.setresuid(1000, 1000, 1000),
+            call.chdir("/home/developer/workspace"),
+        ]
+        expected += [
+            call.signal(signum, sandy.signal.SIG_DFL)
+            for signum in sandy.ENTRY_RESET_SIGNALS
+        ]
+        expected += [
+            call.sigmask(sandy.signal.SIG_SETMASK, set()),
+            call.execve(
+                "/bin/bash",
+                sandy._entry_exec_argv(request),
+                environment,
+            ),
+            # Only a mocked execve returns.
+            call.exit(125),
+        ]
+        self.assertEqual(manager.mock_calls, expected)
+        self.assertEqual(
+            set(sandy.ENTRY_RESET_SIGNALS),
+            {
+                sandy.signal.SIGHUP,
+                sandy.signal.SIGINT,
+                sandy.signal.SIGQUIT,
+                sandy.signal.SIGTERM,
+                sandy.signal.SIGPIPE,
+                sandy.signal.SIGXFSZ,
+            },
+        )
+
+    def test_confine_and_exec_fails_closed_at_each_step(self):
+        steps = (
+            ("capbset_drop", "seccomp"),
+            ("seccomp", "read_account"),
+            ("read_account", "setgroups"),
+            ("setgroups", "setresgid"),
+            ("setresgid", "setresuid"),
+            ("setresuid", "chdir"),
+            ("chdir", "execve"),
+        )
+        for failing, never in steps:
+            with self.subTest(failing=failing):
+                with self.confine_mocks(0b101010) as manager:
+                    getattr(manager, failing).side_effect = OSError(errno.EPERM, "x")
+                    with self.assertRaises(_ExitCalled):
+                        sandy._confine_and_exec(
+                            entry_request(), {}, entry_confinement(), 5
+                        )
+                getattr(manager, never).assert_not_called()
+                manager.execve.assert_not_called()
+                manager.error.assert_called_once()
+                manager.exit.assert_called_once_with(125)
+
+    def test_confine_and_exec_rejects_unknown_user(self):
+        with self.confine_mocks(0b101010) as manager:
+            manager.read_account.side_effect = lambda path: "root:x:0:0::/r:/s\n"
+            with self.assertRaises(_ExitCalled):
+                sandy._confine_and_exec(entry_request(), {}, entry_confinement(), 5)
+        manager.setgroups.assert_not_called()
+        manager.execve.assert_not_called()
+        self.assertIsInstance(manager.error.call_args.args[0], ValueError)
+        manager.exit.assert_called_once_with(125)
+
+    def test_confine_and_exec_rejects_bounding_set_mismatch(self):
+        with self.confine_mocks(0b101010) as manager:
+            manager.capbset_read.side_effect = None
+            manager.capbset_read.return_value = True
+            with self.assertRaises(_ExitCalled):
+                sandy._confine_and_exec(entry_request(), {}, entry_confinement(), 5)
+        manager.seccomp.assert_not_called()
+        manager.execve.assert_not_called()
+        self.assertIsInstance(manager.error.call_args.args[0], PermissionError)
+
+    @contextmanager
+    def middle_mocks(self, fork_result=77):
+        manager = MagicMock()
+        manager.fork.return_value = fork_result
+        manager.exit.side_effect = _ExitCalled
+        manager.confine.side_effect = _ExitCalled
+        with patch.object(sandy, "_setns", manager.setns), patch.object(
+            sandy.os, "setgroups", manager.setgroups
+        ), patch.object(sandy.os, "setresgid", manager.setresgid), patch.object(
+            sandy.os, "setresuid", manager.setresuid
+        ), patch.object(
+            sandy.sys, "meta_path", ["finder"]
+        ), patch.object(
+            sandy.sys, "path", ["/usr/lib/python3"]
+        ), patch.object(
+            sandy, "_close_leader_confinement", manager.close
+        ), patch.object(
+            sandy.os, "fork", manager.fork
+        ), patch.object(
+            sandy, "_wait_forwarding_signals", manager.wait
+        ), patch.object(
+            sandy, "_propagate_wait_status", manager.propagate
+        ), patch.object(
+            sandy, "_confine_and_exec", manager.confine
+        ), patch.object(
+            sandy.os, "_exit", manager.exit
+        ), patch.object(
+            sandy, "_entry_error", manager.error
+        ):
+            yield manager
+
+    def test_middle_joins_namespaces_in_order_forks_and_exits(self):
+        confinement = entry_confinement()
+        import_state = []
+        with self.middle_mocks() as manager:
+            manager.setns.side_effect = lambda fd, nstype: import_state.append(
+                (list(sandy.sys.meta_path), list(sandy.sys.path))
+            )
+            with self.assertRaises(_ExitCalled):
+                sandy._enter_namespaces_and_fork(entry_request(), {}, confinement, 5)
+        # Imports are blocked before the first setns.
+        self.assertEqual(import_state, [([], [])] * 7)
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                call.setns(21, sandy.CLONE_NEWCGROUP),
+                call.setns(22, sandy.CLONE_NEWIPC),
+                call.setns(23, sandy.CLONE_NEWUTS),
+                call.setns(24, sandy.CLONE_NEWNET),
+                call.setns(25, sandy.CLONE_NEWPID),
+                call.setns(26, sandy.CLONE_NEWNS),
+                call.setns(27, sandy.CLONE_NEWUSER),
+                call.setgroups([]),
+                call.setresgid(0, 0, 0),
+                call.setresuid(0, 0, 0),
+                call.close(confinement),
+                call.fork(),
+                # The middle process does not wait: the session is reparented
+                # to the helper.
+                call.exit(0),
+            ],
+        )
+
+    def test_middle_fails_closed_when_setns_fails(self):
+        with self.middle_mocks() as manager:
+            manager.setns.side_effect = [None, None, OSError(errno.EPERM, "x")]
+            with self.assertRaises(_ExitCalled):
+                sandy._enter_namespaces_and_fork(
+                    entry_request(), {}, entry_confinement(), 5
+                )
+        manager.fork.assert_not_called()
+        manager.error.assert_called_once()
+        manager.exit.assert_called_once_with(125)
+
+    def test_middle_fails_closed_when_uid_change_fails(self):
+        for failing in ("setgroups", "setresgid", "setresuid"):
+            with self.subTest(failing=failing):
+                with self.middle_mocks() as manager:
+                    getattr(manager, failing).side_effect = OSError(errno.EPERM, "x")
+                    with self.assertRaises(_ExitCalled):
+                        sandy._enter_namespaces_and_fork(
+                            entry_request(), {}, entry_confinement(), 5
+                        )
+                manager.fork.assert_not_called()
+                manager.exit.assert_called_once_with(125)
+
+    def test_middle_child_confines(self):
+        request = entry_request()
+        confinement = entry_confinement()
+        with self.middle_mocks(fork_result=0) as manager:
+            with self.assertRaises(_ExitCalled):
+                sandy._enter_namespaces_and_fork(request, {"A": "b"}, confinement, 5)
+        manager.confine.assert_called_once_with(request, {"A": "b"}, confinement, 5)
+
+    @contextmanager
+    def run_mocks(self, fork_result: object = 77, middle_status=0, children=(88,)):
+        manager = MagicMock()
+        if isinstance(fork_result, BaseException):
+            manager.fork.side_effect = fork_result
+        else:
+            manager.fork.return_value = fork_result
+        manager.waitpid.return_value = (77, middle_status)
+        if isinstance(children, BaseException):
+            manager.children.side_effect = children
+        else:
+            manager.children.return_value = children
+        manager.wait.return_value = 0
+        manager.propagate.return_value = 0
+        manager.middle.side_effect = _ExitCalled
+        with patch.object(
+            sandy.signal, "pthread_sigmask", manager.sigmask
+        ), patch.object(sandy.signal, "signal", manager.signal), patch.object(
+            sandy, "_set_child_subreaper", manager.subreaper
+        ), patch.object(
+            sandy.os, "fork", manager.fork
+        ), patch.object(
+            sandy.os, "waitpid", manager.waitpid
+        ), patch.object(
+            sandy, "_read_child_pids", manager.children
+        ), patch.object(
+            sandy.os, "kill", manager.kill
+        ), patch.object(
+            sandy, "_close_leader_confinement", manager.close
+        ), patch.object(
+            sandy, "_wait_forwarding_signals", manager.wait
+        ), patch.object(
+            sandy, "_propagate_wait_status", manager.propagate
+        ), patch.object(
+            sandy, "_enter_namespaces_and_fork", manager.middle
+        ), patch.object(
+            sandy, "_entry_error", manager.error
+        ):
+            yield manager
+
+    def test_run_confined_entry_waits_for_reparented_session(self):
+        confinement = entry_confinement()
+        with self.run_mocks() as manager:
+            self.assertEqual(
+                sandy._run_confined_entry(entry_request(), {}, confinement, 5), 0
+            )
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                call.sigmask(sandy.signal.SIG_BLOCK, sandy.ENTRY_FORWARDED_SIGNALS),
+                call.signal(sandy.signal.SIGINT, sandy.signal.SIG_IGN),
+                call.signal(sandy.signal.SIGQUIT, sandy.signal.SIG_IGN),
+                call.subreaper(),
+                call.fork(),
+                call.close(confinement),
+                call.waitpid(77, 0),
+                call.children(),
+                call.wait(88),
+                call.propagate(0),
+            ],
+        )
+
+    def test_run_confined_entry_passes_on_middle_failure(self):
+        for status in (125 << 8, sandy.signal.SIGKILL):
+            with self.subTest(status=status):
+                with self.run_mocks(middle_status=status) as manager:
+                    manager.propagate.return_value = 125
+                    self.assertEqual(
+                        sandy._run_confined_entry(
+                            entry_request(), {}, entry_confinement(), 5
+                        ),
+                        125,
+                    )
+                manager.propagate.assert_called_once_with(status)
+                manager.children.assert_not_called()
+                manager.wait.assert_not_called()
+
+    def test_run_confined_entry_requires_exactly_one_session(self):
+        for children in ((), (88, 89)):
+            with self.subTest(children=children):
+                with self.run_mocks(children=children) as manager:
+                    manager.kill.side_effect = [None, ProcessLookupError()][
+                        : len(children)
+                    ]
+                    self.assertEqual(
+                        sandy._run_confined_entry(
+                            entry_request(), {}, entry_confinement(), 5
+                        ),
+                        125,
+                    )
+                self.assertEqual(
+                    manager.kill.call_args_list,
+                    [call(pid, sandy.signal.SIGKILL) for pid in children],
+                )
+                manager.wait.assert_not_called()
+                manager.error.assert_called_once()
+
+    def test_run_confined_entry_fails_when_children_cannot_be_read(self):
+        for error in (FileNotFoundError("children"), ValueError("bad")):
+            with self.subTest(error=type(error).__name__):
+                with self.run_mocks(children=error) as manager:
+                    self.assertEqual(
+                        sandy._run_confined_entry(
+                            entry_request(), {}, entry_confinement(), 5
+                        ),
+                        125,
+                    )
+                manager.wait.assert_not_called()
+                manager.error.assert_called_once_with(error)
+
+    def test_run_confined_entry_subreaper_failure_does_not_fork(self):
+        confinement = entry_confinement()
+        with self.run_mocks() as manager:
+            manager.subreaper.side_effect = OSError(errno.EINVAL, "x")
+            self.assertEqual(
+                sandy._run_confined_entry(entry_request(), {}, confinement, 5), 125
+            )
+        manager.fork.assert_not_called()
+        manager.close.assert_called_once_with(confinement)
+        manager.error.assert_called_once()
+
+    def test_run_confined_entry_fork_failure_closes_descriptors(self):
+        confinement = entry_confinement()
+        with self.run_mocks(fork_result=OSError(errno.EAGAIN, "x")) as manager:
+            self.assertEqual(
+                sandy._run_confined_entry(entry_request(), {}, confinement, 5), 125
+            )
+        manager.close.assert_called_once_with(confinement)
+        manager.waitpid.assert_not_called()
+        manager.error.assert_called_once()
+
+    def test_run_confined_entry_child_runs_middle(self):
+        request = entry_request()
+        confinement = entry_confinement()
+        with self.run_mocks(fork_result=0) as manager:
+            with self.assertRaises(_ExitCalled):
+                sandy._run_confined_entry(request, {"A": "b"}, confinement, 5)
+        manager.middle.assert_called_once_with(request, {"A": "b"}, confinement, 5)
+        manager.close.assert_not_called()
+
+    @contextmanager
+    def helper_mocks(self, **overrides):
+        manager = MagicMock()
+        manager.geteuid.return_value = overrides.get("euid", 0)
+        manager.active_count.return_value = overrides.get("threads", 1)
+        manager.verify.return_value = 3
+        manager.cap_last.return_value = 40
+        manager.extract.return_value = overrides.get(
+            "confinement", entry_confinement(0xFDECBFFF)
+        )
+        manager.run.return_value = 0
+        for name in ("verify", "extract", "cap_last"):
+            if name in overrides:
+                getattr(manager, name).side_effect = overrides[name]
+        with patch.object(sandy.os, "geteuid", manager.geteuid), patch.object(
+            sandy.threading, "active_count", manager.active_count
+        ), patch.object(
+            sandy, "_verify_entry_helper_fds", manager.verify
+        ), patch.object(
+            sandy.os, "close", manager.os_close
+        ), patch.object(
+            sandy, "_read_cap_last_cap", manager.cap_last
+        ), patch.object(
+            sandy, "_extract_leader_confinement", manager.extract
+        ), patch.object(
+            sandy, "_close_leader_confinement", manager.close
+        ), patch.object(
+            sandy, "_run_confined_entry", manager.run
+        ), patch.object(
+            sandy, "_entry_error", manager.error
+        ), patch.dict(
+            sandy.os.environ, {"TERM": "xterm"}
+        ):
+            yield manager
+
+    def helper_argv(self, **overrides):
+        return ["/proc/self/fd/3", "__sandy-entry-helper"] + entry_args(**overrides)
+
+    def test_entry_helper_main_success(self):
+        with self.helper_mocks() as manager:
+            self.assertEqual(sandy._entry_helper_main(self.helper_argv()), 0)
+        manager.verify.assert_called_once_with("/proc/self/fd/3")
+        manager.os_close.assert_called_once_with(3)
+        manager.extract.assert_called_once_with("ai-dev", 4242)
+        manager.run.assert_called_once_with(
+            entry_request(),
+            sandy._container_environment("developer", "/home/developer")
+            | {"TERM": "xterm"},
+            entry_confinement(0xFDECBFFF),
+            40,
+        )
+        manager.error.assert_not_called()
+
+    def test_entry_helper_main_fails_closed_before_extraction(self):
+        cases = (
+            ({"euid": 1000}, self.helper_argv()),
+            ({"threads": 2}, self.helper_argv()),
+            ({}, ["/proc/self/fd/3", "up"] + entry_args()),
+            ({}, ["/proc/self/fd/3"]),
+            ({"verify": PermissionError("fds")}, self.helper_argv()),
+            ({}, self.helper_argv(workdir="relative")),
+            ({"cap_last": ValueError("bad")}, self.helper_argv()),
+        )
+        for overrides, argv in cases:
+            with self.subTest(overrides=overrides, argv=argv[1:2]):
+                with self.helper_mocks(**overrides) as manager:
+                    self.assertEqual(sandy._entry_helper_main(argv), 125)
+                manager.extract.assert_not_called()
+                manager.run.assert_not_called()
+                manager.error.assert_called_once()
+
+    def test_entry_helper_main_fails_closed_on_extraction_error(self):
+        for error in (
+            PermissionError("changed"),
+            TimeoutError("busy"),
+            ValueError("CapBnd"),
+            subprocess.CalledProcessError(1, ["machinectl"]),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with self.helper_mocks(extract=error) as manager:
+                    self.assertEqual(sandy._entry_helper_main(self.helper_argv()), 125)
+                manager.run.assert_not_called()
+                manager.error.assert_called_once_with(error)
+
+    def test_entry_helper_main_rejects_unknown_capabilities(self):
+        confinement = entry_confinement(1 << 41)
+        with self.helper_mocks(confinement=confinement) as manager:
+            self.assertEqual(sandy._entry_helper_main(self.helper_argv()), 125)
+        manager.close.assert_called_once_with(confinement)
+        manager.run.assert_not_called()
+
+    def test_main_dispatches_entry_helper_before_argument_parsing(self):
+        argv = ["/proc/self/fd/3", "__sandy-entry-helper", "x"]
+        with patch.object(sandy.sys, "argv", argv), patch.object(
+            sandy, "_entry_helper_main", return_value=7
+        ) as helper, patch.object(sandy, "parse_args_custom") as parse:
+            with self.assertRaises(SystemExit) as raised:
+                sandy.main()
+        self.assertEqual(raised.exception.code, 7)
+        helper.assert_called_once_with(argv)
+        parse.assert_not_called()
 
 
 class AclTests(unittest.TestCase):

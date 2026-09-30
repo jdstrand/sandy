@@ -37,6 +37,7 @@ from typing import (
     Iterator,
     Mapping,
     NamedTuple,
+    NoReturn,
     Optional,
     Tuple,
 )
@@ -1473,6 +1474,7 @@ SIGNAL_MAX: Final = 64
 PTRACE_SECCOMP_GET_FILTER: Final = 0x420C
 PR_CAPBSET_READ: Final = 23
 PR_CAPBSET_DROP: Final = 24
+PR_SET_CHILD_SUBREAPER: Final = 36
 SECCOMP_SET_MODE_FILTER: Final = 1
 # The kernel limits one classic BPF program to BPF_MAXINSNS instructions.
 BPF_MAXINSNS: Final = 4096
@@ -1642,6 +1644,11 @@ def _capbset_drop(capability: int) -> None:
     """Remove capability from the calling thread's bounding set."""
     capability = _require_int_in_range(capability, "capability", 0, CAPABILITY_MAX)
     _entry_syscall("prctl", PR_CAPBSET_DROP, capability, 0, 0, 0)
+
+
+def _set_child_subreaper() -> None:
+    """Make this process the reaper of orphaned descendants in its PID namespace."""
+    _entry_syscall("prctl", PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
 
 
 def _setns(fd: int, nstype: int) -> None:
@@ -1909,6 +1916,486 @@ def _extract_leader_confinement(
         seccomp_filters=seccomp_filters,
         capability_bounding_set=capability_bounding_set,
     )
+
+
+# Internal mode for confined container entry. The parent starts it as
+# [python, -I, /proc/self/fd/<pinned sandy>, ENTRY_HELPER_MODE, ...] with only
+# stdin, stdout, stderr, and the pinned script descriptor open.
+ENTRY_HELPER_MODE: Final = "__sandy-entry-helper"
+ENTRY_HELPER_ARGC: Final = 9
+ENTRY_HELPER_FAILURE: Final = 125
+ENTRY_KIND_TTY: Final = "tty"
+ENTRY_KIND_SH: Final = "sh"
+ENTRY_COMMAND_MAX_BYTES: Final = 131072
+ENTRY_MAX_GROUPS: Final = 64
+CONTAINER_ACCOUNT_FILE_MAX_BYTES: Final = 1048576
+# IDs inside the container's 65536-ID user namespace; 65535 is the overflow ID.
+CONTAINER_ID_MAX: Final = 65534
+CONTAINER_ID_PATTERN: Final = re.compile(r"0|[1-9][0-9]{0,4}")
+PINNED_SCRIPT_PATTERN: Final = re.compile(r"/proc/self/fd/([3-9]|[1-9][0-9]{1,3})")
+CAP_LAST_CAP_PATTERN: Final = re.compile(r"([0-9]{1,2})\n")
+# The helper and the middle process pass these on to their child. They ignore
+# SIGINT and SIGQUIT while they wait, as system(3) does, because a terminal
+# sends those to the whole foreground process group.
+ENTRY_FORWARDED_SIGNALS: Final = (signal.SIGHUP, signal.SIGTERM)
+ENTRY_WAIT_IGNORED_SIGNALS: Final = (signal.SIGINT, signal.SIGQUIT)
+# Python ignores SIGPIPE and SIGXFSZ, and an ignored signal stays ignored after
+# execve. Restore the defaults, as subprocess does with restore_signals.
+ENTRY_RESET_SIGNALS: Final = (
+    signal.SIGHUP,
+    signal.SIGINT,
+    signal.SIGQUIT,
+    signal.SIGTERM,
+    signal.SIGPIPE,
+    signal.SIGXFSZ,
+)
+
+
+class EntryRequest(NamedTuple):
+    """Validated parameters of one confined container entry."""
+
+    machine: str
+    leader_pid: int
+    user: str
+    home: str
+    workdir: str
+    kind: str
+    command: str
+
+
+def _parse_container_id(value: str, label: str) -> int:
+    """Parse a uid or gid inside the container user namespace."""
+    if not isinstance(value, str) or not CONTAINER_ID_PATTERN.fullmatch(value):
+        raise ValueError(f"Invalid container {label}")
+    return _require_int_in_range(int(value), f"container {label}", 0, CONTAINER_ID_MAX)
+
+
+def _account_file_entries(text: str, field_count: int, label: str) -> list:
+    """Split passwd or group text into entries; reject malformed lines.
+
+    Empty lines and lines that start with "#" are skipped, as nss_files does.
+    """
+    entries = []
+    for line in text.split("\n"):
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(":")
+        if len(fields) != field_count:
+            raise ValueError(f"Malformed container {label} entry")
+        entries.append(fields)
+    return entries
+
+
+def _resolve_container_identity(
+    user: str, passwd_text: str, group_text: str
+) -> Tuple[int, int, Tuple[int, ...]]:
+    """Return uid, gid, and supplementary groups for user, as nspawn sets them.
+
+    Measured with systemd 249, 255, and 257: nspawn gives root no
+    supplementary groups. For other users it sets exactly the groups that
+    list the user as a member (getent initgroups), without the primary gid
+    unless that group lists the user.
+    """
+    matches = [
+        fields
+        for fields in _account_file_entries(passwd_text, 7, "passwd")
+        if fields[0] == user
+    ]
+    if len(matches) != 1:
+        raise ValueError("Container user must have exactly one passwd entry")
+    uid = _parse_container_id(matches[0][2], "uid")
+    gid = _parse_container_id(matches[0][3], "gid")
+    if (user == "root") != (uid == 0):
+        raise ValueError("Container uid 0 must be the root user")
+    groups: list = []
+    for fields in _account_file_entries(group_text, 4, "group"):
+        group_id = _parse_container_id(fields[2], "group")
+        if user == "root" or user not in fields[3].split(","):
+            continue
+        if group_id not in groups:
+            groups.append(group_id)
+    if len(groups) > ENTRY_MAX_GROUPS:
+        raise ValueError("Too many container groups")
+    return uid, gid, tuple(groups)
+
+
+def _read_container_account_file(path: str) -> str:
+    """Read a regular account file inside the container's mount namespace.
+
+    O_NONBLOCK keeps a FIFO from blocking the open; the file is then rejected.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOCTTY)
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError(f"Container {path} is not a regular file")
+        chunks = []
+        size = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > CONTAINER_ACCOUNT_FILE_MAX_BYTES:
+                raise ValueError(f"Container {path} is too large")
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8", "surrogateescape")
+
+
+def _validate_container_path(path: str) -> bool:
+    """Return whether path is a normalized absolute path inside the container."""
+    if not isinstance(path, str) or not path.startswith("/") or len(path) > 4096:
+        return False
+    if _contains_control_character(path) or os.path.normpath(path) != path:
+        return False
+    # normpath keeps a leading "//", which POSIX leaves implementation-defined.
+    return not path.startswith("//")
+
+
+def _parse_entry_request(args: list) -> EntryRequest:
+    """Parse the helper arguments that follow ENTRY_HELPER_MODE."""
+    if len(args) != ENTRY_HELPER_ARGC - 2:
+        raise ValueError("Invalid entry helper argument count")
+    machine, leader, user, home, workdir, kind, command = args
+    if not _validate_container_name(machine):
+        raise ValueError("Invalid container name")
+    if not _validate_username(user):
+        raise ValueError("Invalid container username")
+    request = EntryRequest(
+        machine=machine,
+        leader_pid=_parse_leader_pid(leader),
+        user=user,
+        home=home,
+        workdir=workdir,
+        kind=kind,
+        command=command,
+    )
+    expected_home = "/root" if user == "root" else f"/home/{user}"
+    if home != expected_home:
+        raise ValueError("Invalid container home directory")
+    if not _validate_container_path(workdir):
+        raise ValueError("Invalid container working directory")
+    if kind not in (ENTRY_KIND_TTY, ENTRY_KIND_SH):
+        raise ValueError("Invalid container entry kind")
+    if not isinstance(command, str) or not command:
+        raise ValueError("Invalid container command")
+    if len(command.encode("utf-8", "surrogateescape")) > ENTRY_COMMAND_MAX_BYTES:
+        raise ValueError("Container command is too long")
+    return request
+
+
+def _entry_helper_argv(script_fd: int, request: EntryRequest) -> list:
+    """Return the argv that starts the entry helper for request."""
+    args = [
+        request.machine,
+        str(request.leader_pid),
+        request.user,
+        request.home,
+        request.workdir,
+        request.kind,
+        request.command,
+    ]
+    # Build only what the helper accepts.
+    if _parse_entry_request(args) != request:
+        raise ValueError("Entry request does not survive helper argument parsing")
+    return [
+        sys.executable,
+        "-I",
+        _proc_self_fd_path(script_fd),
+        ENTRY_HELPER_MODE,
+    ] + args
+
+
+def _entry_exec_argv(request: EntryRequest) -> list:
+    """Return the in-container argv for request."""
+    if request.kind == ENTRY_KIND_TTY:
+        # script allocates a terminal from the container's devpts instance.
+        return [
+            "/bin/bash",
+            "-c",
+            f"script -qec {shlex.quote(request.command)} /dev/null",
+        ]
+    return ["/bin/sh", "-c", request.command]
+
+
+def _open_fds() -> set:
+    """Return the descriptors open in this process."""
+    fds = set()
+    # listdir uses a descriptor of its own, which is closed when it returns.
+    for name in os.listdir("/proc/self/fd"):
+        fd = int(name)
+        try:
+            os.fstat(fd)
+        except OSError:
+            continue
+        fds.add(fd)
+    return fds
+
+
+def _verify_entry_helper_fds(script_path: str) -> int:
+    """Require the pinned script descriptor and the standard streams only."""
+    match = PINNED_SCRIPT_PATTERN.fullmatch(script_path)
+    if match is None:
+        raise PermissionError("Entry helper must run from a pinned script descriptor")
+    script_fd = int(match.group(1))
+    if _open_fds() != {0, 1, 2, script_fd}:
+        raise PermissionError("Entry helper has unexpected file descriptors")
+    _verify_entry_script(os.fstat(script_fd))
+    return script_fd
+
+
+def _verify_entry_script(script_stat: os.stat_result) -> None:
+    """Require a regular script file that only its owner can write.
+
+    The parent already runs this file as root, so its owner is trusted as
+    much as the parent is. No other user may change it.
+    """
+    if not stat.S_ISREG(script_stat.st_mode) or script_stat.st_mode & 0o022:
+        raise PermissionError(
+            "Sandy script must be a regular file that only its owner can write"
+        )
+
+
+def _read_cap_last_cap() -> int:
+    """Read the highest capability number from the host procfs."""
+    fd = os.open("/proc/sys/kernel/cap_last_cap", READ_FILE_OPEN_FLAGS)
+    try:
+        data = os.read(fd, 16)
+    finally:
+        os.close(fd)
+    match = CAP_LAST_CAP_PATTERN.fullmatch(data.decode("ascii", errors="replace"))
+    if match is None:
+        raise ValueError("Malformed cap_last_cap")
+    return _require_int_in_range(int(match.group(1)), "cap_last_cap", 0, CAPABILITY_MAX)
+
+
+CHILD_PIDS_PATTERN: Final = re.compile(r"(?:[1-9][0-9]{0,6} )*")
+
+
+def _read_child_pids() -> Tuple[int, ...]:
+    """Return the children of this process from the host procfs.
+
+    The list includes children that have exited but are not reaped yet.
+    """
+    pid = os.getpid()
+    fd = os.open(f"/proc/{pid}/task/{pid}/children", READ_FILE_OPEN_FLAGS)
+    try:
+        data = os.read(fd, 4096)
+    finally:
+        os.close(fd)
+    text = data.decode("ascii", errors="replace")
+    if len(data) >= 4096 or not CHILD_PIDS_PATTERN.fullmatch(text):
+        raise ValueError("Malformed process children list")
+    return tuple(_require_pid(int(value)) for value in text.split())
+
+
+def _entry_error(exc: BaseException) -> None:
+    """Report a container entry failure on stderr without control characters."""
+    try:
+        sys.stderr.write(
+            f"E: Container entry failed: {_terminal_safe_repr(str(exc))}\n"
+        )
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def _wait_forwarding_signals(child: int) -> int:
+    """Wait for child, pass forwarded signals on, and return its wait status.
+
+    The caller blocks ENTRY_FORWARDED_SIGNALS before it forks, so a signal that
+    arrives before the handler exists stays pending until the unblock below.
+    """
+
+    def forward(signum: int, frame: Any) -> None:
+        _ = frame
+        try:
+            os.kill(child, signum)
+        except ProcessLookupError:
+            pass
+
+    for signum in ENTRY_FORWARDED_SIGNALS:
+        signal.signal(signum, forward)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, ENTRY_FORWARDED_SIGNALS)
+    _, status = os.waitpid(child, 0)
+    return status
+
+
+def _propagate_wait_status(status: int) -> int:
+    """Return the exit code of status, or end this process with its signal."""
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        signum = os.WTERMSIG(status)
+        # SIGKILL cannot be caught or blocked, and signal.signal() rejects it.
+        if signum != signal.SIGKILL:
+            signal.signal(signum, signal.SIG_DFL)
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signum})
+        os.kill(os.getpid(), signum)
+        # The default action of this signal does not end the process.
+        return min(128 + signum, 255)
+    return ENTRY_HELPER_FAILURE
+
+
+def _confine_and_exec(
+    request: EntryRequest,
+    environment: Mapping[str, str],
+    confinement: LeaderConfinement,
+    cap_last: int,
+) -> NoReturn:
+    """In the container PID namespace: confine this process, then exec.
+
+    Order: bounding set, then seccomp while still namespaced root (the filters
+    need CAP_SYS_ADMIN, and no_new_privs stays 0 as on the up path), then the
+    ids. The filters are installed oldest first. The account files are read
+    at attach time, as su and nspawn do, and only after the filters are in
+    place, because container root controls them.
+    """
+    try:
+        mask = confinement.capability_bounding_set
+        for capability in range(cap_last + 1):
+            if not mask & (1 << capability):
+                _capbset_drop(capability)
+        for capability in range(cap_last + 1):
+            if _capbset_read(capability) != bool(mask & (1 << capability)):
+                raise PermissionError("Capability bounding set does not match")
+        for program in confinement.seccomp_filters:
+            _seccomp_set_mode_filter(program)
+        uid, gid, groups = _resolve_container_identity(
+            request.user,
+            _read_container_account_file("/etc/passwd"),
+            _read_container_account_file("/etc/group"),
+        )
+        os.setgroups(list(groups))
+        os.setresgid(gid, gid, gid)
+        os.setresuid(uid, uid, uid)
+        os.chdir(request.workdir)
+        argv = _entry_exec_argv(request)
+        for signum in ENTRY_RESET_SIGNALS:
+            signal.signal(signum, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_SETMASK, set())
+        os.execve(argv[0], argv, dict(environment))
+    except BaseException as exc:
+        _entry_error(exc)
+    os._exit(ENTRY_HELPER_FAILURE)
+
+
+def _enter_namespaces_and_fork(
+    request: EntryRequest,
+    environment: Mapping[str, str],
+    confinement: LeaderConfinement,
+    cap_last: int,
+) -> NoReturn:
+    """Middle process: join the pinned namespaces, fork, and exit.
+
+    The child is the first process in the container's PID namespace. This
+    process exits at once, so the child is reparented to the helper, which is
+    a child subreaper. Until then this process is in the host PID namespace,
+    so it must not keep host uid 0, and it must not run code from the
+    container's filesystem.
+    """
+    code = ENTRY_HELPER_FAILURE
+    try:
+        # After setns(CLONE_NEWNS), an import would load a module from the
+        # container's filesystem, which container root controls. Nothing below
+        # imports; make any later import fail instead.
+        sys.meta_path.clear()
+        sys.path.clear()
+        for fd, (_, nstype) in zip(confinement.namespace_fds, NAMESPACE_ENTRY_ORDER):
+            _setns(fd, nstype)
+        # setns(CLONE_NEWUSER) keeps host uid 0, which may signal every host
+        # root process from this PID namespace. Become container root, which
+        # keeps the capabilities that the child needs in the container's user
+        # namespace.
+        os.setgroups([])
+        os.setresgid(0, 0, 0)
+        os.setresuid(0, 0, 0)
+        _close_leader_confinement(confinement)
+        # setns(CLONE_NEWPID) applies only to children.
+        child = os.fork()
+        if child == 0:
+            _confine_and_exec(request, environment, confinement, cap_last)
+        code = 0
+    except BaseException as exc:
+        _entry_error(exc)
+    finally:
+        os._exit(code)
+
+
+def _run_confined_entry(
+    request: EntryRequest,
+    environment: Mapping[str, str],
+    confinement: LeaderConfinement,
+    cap_last: int,
+) -> int:
+    """Start the session through the middle process, then wait for it.
+
+    The helper is a child subreaper, so the session becomes its child when the
+    middle process exits. Orphans inside the container go to the container's
+    PID 1, not to the helper.
+    """
+    signal.pthread_sigmask(signal.SIG_BLOCK, ENTRY_FORWARDED_SIGNALS)
+    for signum in ENTRY_WAIT_IGNORED_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
+    try:
+        _set_child_subreaper()
+        middle = os.fork()
+    except OSError as exc:
+        _close_leader_confinement(confinement)
+        _entry_error(exc)
+        return ENTRY_HELPER_FAILURE
+    if middle == 0:
+        _enter_namespaces_and_fork(request, environment, confinement, cap_last)
+    _close_leader_confinement(confinement)
+    _, middle_status = os.waitpid(middle, 0)
+    if not os.WIFEXITED(middle_status) or os.WEXITSTATUS(middle_status) != 0:
+        # The middle process failed before or at its fork and reported why.
+        return _propagate_wait_status(middle_status)
+    try:
+        children = _read_child_pids()
+    except (OSError, ValueError) as exc:
+        _entry_error(exc)
+        return ENTRY_HELPER_FAILURE
+    if len(children) != 1:
+        # These are this process's own unreaped children, so their PIDs
+        # cannot have been reused.
+        for pid in children:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        _entry_error(RuntimeError("Expected exactly one container session process"))
+        return ENTRY_HELPER_FAILURE
+    return _propagate_wait_status(_wait_forwarding_signals(children[0]))
+
+
+def _entry_helper_main(argv: list) -> int:
+    """Run the internal entry helper mode and return its exit code."""
+    try:
+        if os.geteuid() != 0:
+            raise PermissionError("Entry helper requires root")
+        # fork from a threaded interpreter is unsafe, and setns(CLONE_NEWUSER)
+        # fails in a multithreaded process.
+        if threading.active_count() != 1:
+            raise RuntimeError("Entry helper must be single-threaded")
+        if len(argv) < 2 or argv[1] != ENTRY_HELPER_MODE:
+            raise ValueError("Invalid entry helper mode")
+        script_fd = _verify_entry_helper_fds(argv[0])
+        os.close(script_fd)
+        request = _parse_entry_request(argv[2:])
+        environment = _container_environment(request.user, request.home)
+        cap_last = _read_cap_last_cap()
+        confinement = _extract_leader_confinement(request.machine, request.leader_pid)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        _entry_error(exc)
+        return ENTRY_HELPER_FAILURE
+    if confinement.capability_bounding_set >> (cap_last + 1):
+        _close_leader_confinement(confinement)
+        _entry_error(PermissionError("CapBnd has unknown capabilities"))
+        return ENTRY_HELPER_FAILURE
+    return _run_confined_entry(request, environment, confinement, cap_last)
 
 
 def _check_systemd_version():
@@ -6420,6 +6907,11 @@ Environment Variables:
 
 
 def main():
+    # The internal entry helper takes no user-facing arguments. Dispatch it
+    # before argparse so that no CLI option can reach it.
+    if len(sys.argv) > 1 and sys.argv[1] == ENTRY_HELPER_MODE:
+        sys.exit(_entry_helper_main(sys.argv))
+
     # Parse arguments with custom handling
     args = parse_args_custom()
 
