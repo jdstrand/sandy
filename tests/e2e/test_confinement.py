@@ -1,4 +1,4 @@
-"""Entry-path confinement parity (security-parity.md item 1).
+"""Entry-path confinement parity (specs/security-parity.md item 1).
 
 Every attach (`exec`, `bash`, and `-u root`) must run with the container
 payload's seccomp filters and capability bounding set. These properties need
@@ -34,7 +34,7 @@ STABILITY_RUNS = 150
 # aarch64 has 7 of the 10 denied syscalls, and 5.15 hides bpf.
 MIN_OBSERVABLE_DENIED = 6
 # Denied by Docker's default profile and by nspawn's filter; the nsenter path
-# reached the kernel with each of them (security-parity.md item 1).
+# reached the kernel with each of them (specs/security-parity.md item 1).
 DENIED_SYSCALLS = (
     "add_key",
     "request_key",
