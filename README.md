@@ -25,7 +25,9 @@ wrapper written by Trevor Hilton (@hiltontj).
 
 ## Requirements
 
-- Linux host with `systemd-nspawn`, `machinectl`, `ip`, ...
+- Linux host with `systemd-nspawn`, `machinectl`, `systemd-run`, `systemctl`,
+  `ip`, ... and the unified cgroup v2 hierarchy with `cgroup.kill` (Linux 5.14
+  or later)
 - Either `debootstrap` **or** the combination of `skopeo` and `umoci` for image
   creation
 - Firewall tooling: `iptables` or `nftables` as a fallback for NAT rules with
@@ -51,8 +53,9 @@ target.
    Install only the tools you intend to use (eg, `sandy auto-detects OCI vs.
    `debootstrap` support)
 2. When run from the checked out directory, `sandy` will look for the
-   `debootstrap.sh`, `oci.sh` and `setup-container.sh` helper scripts. If
-   copying `sandy` to another directory, put these scripts next to `sandy`
+   `debootstrap.sh`, `oci.sh`, `sandy-keepalive.sh` and `setup-container.sh`
+   helper scripts. If copying `sandy` to another directory, put these scripts
+   next to `sandy`
    (also see the `SANDY_...` environment variables from `--help`)
 3. Ensure `/var/lib/machines` exists as described above.
 4. Run `sandy` as root (`sudo /path/to/sandy ...`). By default it mounts the
@@ -123,9 +126,13 @@ $ sudo /path/to/sandy [GLOBAL OPTIONS] [COMMAND] [COMMAND OPTIONS]
 
 
 ### Commands
-- `up` - Build and start the container. Key flags:
+- `up` - Build and start the container, then attach a console session.
+  When the console exits, the container stops, unless another `bash` or
+  `exec` session is still attached; then the last session to exit stops it.
+  Key flags:
   - `--build` to create a container
-  - `--detach` leaves the container running in the background
+  - `--detach` starts the container without a console and leaves it running
+    in the background. Only `down` or `rm` stops it.
   - `--persistent` keeps the instance running across CLI exits
   - `--network {host,lenient}` chooses host networking or an isolated bridge
     (default `lenient`).
@@ -232,9 +239,37 @@ Differences from earlier versions:
 - An attached session starts in the workspace when it exists, otherwise in
   `/`.
 
-Current limits: an attached session still runs in the cgroup of the terminal
-that started `sandy`, and a process that an attached session leaves behind
-can keep running in the container until the container stops.
+### Container scope and session lifecycle
+
+`up` starts `systemd-nspawn` in its own transient systemd scope,
+`sandy-<name>.scope` in `system.slice`, with no terminal and in its own
+session. So a closed terminal, or a stop or an OOM kill of the terminal's
+scope, does not stop the container. The scope has the same resource defaults
+as the machine scopes that `machinectl` creates: `TasksMax=16384`, and no
+memory or CPU limit. On systemd 253 or later it also has
+`OOMPolicy=continue`, so that an OOM kill of one process does not stop the
+container. `up` fails if a unit with the scope's name already exists.
+
+The container's main process is `sandy-keepalive`: the image's `/bin/bash`
+running a copy of `sandy-keepalive.sh` as container root. It waits until the
+container is powered off. So the image needs `/bin/bash` and a `sleep` in
+`PATH`. Container users other than root cannot signal it.
+
+Each session (the `up` console, `bash`, `exec`, and `/init.sh`) runs in its own
+cgroup `attach-<random>` in the container's scope, next to the container's
+own processes. Its memory and processes count against the container's scope,
+not against the terminal. When a session ends, `sandy` ends every process that
+the session left behind and removes the cgroup. When the terminal goes away
+(`SIGHUP`), or `sandy` gets `SIGTERM` or is killed, the session ends in the
+same way, but the container keeps running.
+
+A container that stopped without `sandy` (for example, container root ended
+the main process) can leave port forwarding rules and state. The next `up` of
+the same name removes them.
+
+Containers started by earlier versions of `sandy` are not in a
+`sandy-<name>.scope`. `bash` and `exec` refuse to attach to them; stop them
+with `down` and start them again with `up`.
 
 As mentioned above, `sandy` was written with security in mind with the goal of
 creating a strong sandbox for AI agents, but it should be understood there may
