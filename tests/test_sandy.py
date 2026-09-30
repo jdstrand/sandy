@@ -2883,6 +2883,27 @@ class SandyInitializationTests(unittest.TestCase):
         self.assertIn("setfacl", stdout.getvalue())
         self.assertNotIn("nsenter", stdout.getvalue())
 
+    def test_required_tools_reports_each_missing_systemd_tool(self):
+        # Mocks: the tool lookup. up starts the container's scope with
+        # systemd-run and queries it with systemctl.
+        for missing in ("systemctl", "systemd-run"):
+            with self.subTest(missing=missing):
+                instance = make_sandy()
+                with patch.object(
+                    sandy.shutil,
+                    "which",
+                    side_effect=lambda name: (
+                        None if name == missing else f"/usr/bin/{name}"
+                    ),
+                ):
+                    with captured_output() as (stdout, _):
+                        with self.assertRaises(SystemExit) as exited:
+                            instance._check_required_tools()
+                self.assertEqual(exited.exception.code, 1)
+                self.assertEqual(
+                    stdout.getvalue(), f"E: Missing required tools: {missing}\n"
+                )
+
     def test_required_tools_accepts_debootstrap_and_warns_without_firewall(self):
         instance = make_sandy()
         instance.has_skopeo = False
@@ -9229,6 +9250,9 @@ class RunUpTests(unittest.TestCase):
                 self.assertIn(message, stdout.getvalue())
                 machine_dir.assert_not_called()
                 popen.assert_not_called()
+                # The stale rule cleanup changes the firewall and the port
+                # state, so it must come after the unit check.
+                self.stale_cleanup.assert_not_called()
 
     def test_keepalive_failure_rejects_before_network_setup(self):
         instance = make_sandy()
@@ -9383,6 +9407,42 @@ class RunUpTests(unittest.TestCase):
                                             instance.run_up(self.arguments())
         stop.assert_called_once_with(popen.return_value)
         self.exec.assert_not_called()
+
+    def test_console_status_is_the_exit_status_of_up(self):
+        # The base ignored the status of the attached container. Mocks: as in
+        # the detached host test; the console returns each status in turn.
+        for status, expected in ((0, None), (19, 19), (-9, 128 + 9)):
+            with self.subTest(status=status):
+                instance = make_sandy()
+                instance.workspace = None
+                self.exec.reset_mock()
+                self.exec.return_value = status
+                with tempfile.TemporaryDirectory() as machine, ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(
+                            instance, "_is_container_running", return_value=None
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(instance, "_remove_port_mappings_from_state")
+                    )
+                    stack.enter_context(
+                        patch.object(instance, "_get_machine_dir", return_value=machine)
+                    )
+                    stack.enter_context(
+                        patch.object(sandy, "_run_secure_subprocess_popen")
+                    )
+                    stack.enter_context(
+                        patch.object(instance, "_run_init_script", return_value=False)
+                    )
+                    stack.enter_context(captured_output())
+                    if expected is None:
+                        instance.run_up(self.arguments(detach=False))
+                    else:
+                        with self.assertRaises(SystemExit) as exited:
+                            instance.run_up(self.arguments(detach=False))
+                        self.assertEqual(exited.exception.code, expected)
+                self.exec.assert_called_once_with(None, login_shell=True, console=True)
 
     def test_rejects_ports_with_host_network(self):
         instance = make_sandy()

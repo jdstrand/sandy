@@ -375,10 +375,6 @@ class PublicHttpsRetryTests(unittest.TestCase):
         self.assertEqual(context.results, [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SandyInvocationTests(unittest.TestCase):
     """The harness runs sandy as a real `sudo` user would. It mocks run()."""
 
@@ -492,3 +488,7 @@ class SandyInvocationTests(unittest.TestCase):
             context.build_minimal("e2e-cache-abc123", "developer")
         for entry in sandy_call.call_args_list:
             self.assertEqual(entry.kwargs["input_text"], ACL_PROMPT_ANSWERS)
+
+
+if __name__ == "__main__":
+    unittest.main()
