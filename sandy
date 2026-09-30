@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 import tty
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import (
     Any,
     Callable,
@@ -82,6 +82,17 @@ CONTAINER_STOP_TIMEOUT: Final = 30
 CONTAINER_POWEROFF_TIMEOUT: Final = 5
 CONTAINER_STOP_POLL_INTERVAL: Final = 0.1
 CONTAINER_IP_UNSET: Final = object()
+# nftables deletes a rule only by handle. Each rule that Sandy adds for a port
+# mapping carries the comment from _nft_port_rule_comment, and cleanup deletes
+# the handles of exactly the rules with that comment in these chains.
+NFT_PORT_RULE_CHAINS: Final = (
+    "output",
+    "prerouting",
+    "postrouting",
+    "forward",
+    "output_filter",
+)
+NFT_LIST_MAX_BYTES: Final = 4 * 1024 * 1024
 CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 DEFAULT_CONTAINER_TERM: Final = "xterm-256color"
 ENVIRONMENT_KEY_PATTERN: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
@@ -1958,6 +1969,13 @@ ATTACH_LEAF_PATTERN: Final = re.compile(r"attach-[0-9a-f]{32}")
 ATTACH_LEAF_KILL_TIMEOUT: Final = 5
 ATTACH_LEAF_POLL_INTERVAL: Final = 0.02
 CGROUP_EVENTS_MAX_BYTES: Final = 4096
+# While this empty cgroup exists in the scope of a container that up started
+# without -d, the console has not exited yet, and no attach exit stops the
+# container. up creates it under the lifecycle lock before any attach can
+# exist; the console's own exit removes it.
+CONSOLE_PENDING_CGROUP: Final = "console-pending"
+CONSOLE_PENDING_TIMEOUT: Final = 5
+CONSOLE_PENDING_POLL_INTERVAL: Final = 0.01
 PROC_CGROUP_MAX_BYTES: Final = 4096
 PROC_CGROUP_PATTERN: Final = re.compile(r"0::(/[^\n]*)\n")
 CAPBND_LINE_PATTERN: Final = re.compile(r"CapBnd:\t([0-9a-f]{16})")
@@ -2168,6 +2186,10 @@ def _end_attach_leaf(unit_fd: int, attach_leaf: str) -> None:
             if time.monotonic() >= deadline:
                 raise TimeoutError("Attach cgroup did not become empty")
             time.sleep(ATTACH_LEAF_POLL_INTERVAL)
+    except FileNotFoundError:
+        # Another attach's count removed the leaf meanwhile. cgroupfs removes
+        # only an empty cgroup, so nothing of this attach is left.
+        return
     finally:
         os.close(leaf_fd)
     try:
@@ -2219,6 +2241,46 @@ def _count_populated_attaches(unit_fd: int) -> int:
         except OSError:
             pass
     return count
+
+
+def _create_console_pending(machine_name: str) -> None:
+    """Create the console-pending marker as soon as the scope's cgroup exists.
+
+    The caller holds the lifecycle lock. Raise TimeoutError when the scope
+    does not appear in time.
+    """
+    deadline = time.monotonic() + CONSOLE_PENDING_TIMEOUT
+    while True:
+        try:
+            unit_fd = _open_supervisor_cgroup(machine_name)
+            break
+        except FileNotFoundError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("The container scope did not appear") from None
+            time.sleep(CONSOLE_PENDING_POLL_INTERVAL)
+    try:
+        os.mkdir(CONSOLE_PENDING_CGROUP, 0o755, dir_fd=unit_fd)
+    except FileExistsError:
+        pass
+    finally:
+        os.close(unit_fd)
+
+
+def _remove_console_pending(unit_fd: int) -> None:
+    """Remove the console-pending marker of an open scope cgroup."""
+    try:
+        os.rmdir(CONSOLE_PENDING_CGROUP, dir_fd=unit_fd)
+    except FileNotFoundError:
+        pass
+
+
+def _console_pending(unit_fd: int) -> bool:
+    """Return whether the console-pending marker exists."""
+    try:
+        marker = os.stat(CONSOLE_PENDING_CGROUP, dir_fd=unit_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISDIR(marker.st_mode)
 
 
 def _new_attach_leaf() -> str:
@@ -3050,6 +3112,55 @@ printf '%s\\n' 'nameserver 1.1.1.1' 'nameserver 1.0.0.1' > /etc/resolv.conf
         _write(init_script_path, init_script_content, mode=0o0755)
 
 
+def _nft_port_rule_comment(container_name: str, proto: str, host_port: int) -> str:
+    """Return the comment that marks the nftables rules of one port mapping."""
+    if not _validate_container_name(container_name):
+        raise ValueError("Invalid container name")
+    if proto not in ("tcp", "udp"):
+        raise ValueError("Invalid port mapping protocol")
+    if (
+        not isinstance(host_port, int)
+        or isinstance(host_port, bool)
+        or not 1 <= host_port <= 65535
+    ):
+        raise ValueError("Invalid port mapping host port")
+    return f"sandy:{container_name}:{proto}:{host_port}"
+
+
+def _parse_nft_rule_handles(output: str, chain: str, comment: str) -> list:
+    """Return the handles of the rules in `nft -j -a list chain ip sandy <chain>`
+    output whose comment is exactly comment. Reject malformed output."""
+    if len(output) > NFT_LIST_MAX_BYTES:
+        raise ValueError("nft output is too large")
+    try:
+        document = json.loads(output)
+    except ValueError as exc:
+        raise ValueError("nft output is not JSON") from exc
+    items = document.get("nftables") if isinstance(document, dict) else None
+    if not isinstance(items, list):
+        raise ValueError("nft output has no nftables list")
+    handles = []
+    for item in items:
+        if not isinstance(item, dict) or "rule" not in item:
+            continue
+        rule = item["rule"]
+        if not isinstance(rule, dict):
+            raise ValueError("Malformed nft rule")
+        if rule.get("comment") != comment:
+            continue
+        if (rule.get("family"), rule.get("table"), rule.get("chain")) != (
+            "ip",
+            "sandy",
+            chain,
+        ):
+            raise ValueError("nft rule from an unexpected chain")
+        handle = rule.get("handle")
+        if not isinstance(handle, int) or isinstance(handle, bool) or handle <= 0:
+            raise ValueError("Malformed nft rule handle")
+        handles.append(handle)
+    return handles
+
+
 class SandyNet:
     """Manages network bridge and NAT configuration for containers"""
 
@@ -3571,7 +3682,9 @@ class SandyNet:
                     error_prefix="Create prerouting chain",
                 )
 
-            # Create chains for OUTPUT NAT (for host-generated traffic DNAT)
+            # Create chains for OUTPUT NAT (for host-generated traffic DNAT).
+            # nft 1.0.2 rejects "priority dstnat" for the output hook; -100 is
+            # the same value and works with nft 1.0.2, 1.0.9, and 1.1.3.
             if not self._nft_chain_exists("ip", "sandy", "output"):
                 self._run_nft(
                     "add",
@@ -3585,7 +3698,7 @@ class SandyNet:
                     "hook",
                     "output",
                     "priority",
-                    "dstnat",
+                    "-100",
                     ";",
                     "}",
                     error_prefix="Create output NAT chain",
@@ -5890,7 +6003,13 @@ class Sandy:
                 f"{_terminal_safe_repr(str(exc))}"
             )
 
-    def _exec(self, command: Optional[str], *, login_shell: bool = False) -> int:
+    def _exec(
+        self,
+        command: Optional[str],
+        *,
+        login_shell: bool = False,
+        console: bool = False,
+    ) -> int:
         """Run a command or a login shell in the container as self.user.
 
         The entry helper applies the container payload's seccomp filters and
@@ -5937,33 +6056,41 @@ class Sandy:
         except _AttachHangup as hangup:
             # Loss of the terminal ends only this attach; the attach leaf is
             # already removed. It never stops the container.
+            if console:
+                self._end_console_pending()
             sys.exit(128 + hangup.signum)
-        self._stop_if_last_attach()
+        self._stop_if_last_attach(console=console)
         return status
 
-    def _stop_if_last_attach(self) -> None:
+    def _stop_if_last_attach(self, console: bool = False) -> None:
         """Stop a container that up started without -d when no attach is left.
 
         Decide and stop under the lifecycle lock, so that a new attach cannot
         start in between and two exits cannot both stop the container. Block
-        SIGHUP and SIGTERM meanwhile, so that the stop is not cut short.
+        SIGHUP and SIGTERM meanwhile, so that the stop is not cut short. The
+        count also removes empty attach leaves, for -d containers too. While
+        the console-pending marker exists, the console has not exited, so no
+        stop; the console's own exit (console=True) removes the marker first.
         """
         blocked = threading.current_thread() is threading.main_thread()
         if blocked:
             signal.pthread_sigmask(signal.SIG_BLOCK, ATTACH_HANGUP_SIGNALS)
         try:
             with _lifecycle_lock():
-                if _supervisor_detached(self.container) is not False:
-                    return
                 try:
                     unit_fd = _open_supervisor_cgroup(self.container)
                 except FileNotFoundError:
                     return
                 try:
+                    if console:
+                        _remove_console_pending(unit_fd)
                     remaining = _count_populated_attaches(unit_fd)
+                    pending = _console_pending(unit_fd)
                 finally:
                     os.close(unit_fd)
-                if remaining:
+                if remaining or pending:
+                    return
+                if _supervisor_detached(self.container) is not False:
                     return
                 print(f"I: Stopping '{self.container}': no session is attached")
                 self._machine_poweroff()
@@ -5975,6 +6102,23 @@ class Sandy:
         finally:
             if blocked:
                 signal.pthread_sigmask(signal.SIG_UNBLOCK, ATTACH_HANGUP_SIGNALS)
+
+    def _end_console_pending(self) -> None:
+        """After a console hangup: remove the marker, but never stop."""
+        try:
+            with _lifecycle_lock():
+                unit_fd = _open_supervisor_cgroup(self.container)
+                try:
+                    _remove_console_pending(unit_fd)
+                finally:
+                    os.close(unit_fd)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            print(
+                f"W: Could not update the sessions of '{self.container}': "
+                f"{_terminal_safe_repr(str(exc))}"
+            )
 
     def _run_as_root(
         self, command: str, **kwargs: Any
@@ -6420,11 +6564,18 @@ class Sandy:
 
         try:
             for proto, host_port, container_port in self.port_mappings:
+                # Every rule of this mapping carries its comment, so that
+                # cleanup can find exactly these rules by handle.
+                comment = [
+                    "comment",
+                    f'"{_nft_port_rule_comment(self.container, proto, host_port)}"',
+                ]
                 # DNAT in output chain (for host-generated traffic to 127.0.0.1)
                 destination = f"{container_ip}:{container_port}"
                 self.network._run_nft(
                     "add",
                     *self._nft_dnat_rule_args("output", proto, host_port, destination),
+                    *comment,
                     error_prefix=f"Add OUTPUT DNAT for {proto}:{host_port}->{container_port}",
                 )
 
@@ -6434,6 +6585,7 @@ class Sandy:
                     *self._nft_dnat_rule_args(
                         "prerouting", proto, host_port, destination
                     ),
+                    *comment,
                     error_prefix=f"Add PREROUTING DNAT for {proto}:{host_port}->{container_port}",
                 )
 
@@ -6444,6 +6596,7 @@ class Sandy:
                     *self._nft_snat_rule_args(
                         gateway, proto, container_ip, container_port
                     ),
+                    *comment,
                     error_prefix=f"Add SNAT for {proto}:{host_port} forwarding",
                 )
 
@@ -6451,6 +6604,7 @@ class Sandy:
                 self.network._run_nft(
                     "insert",
                     *self._nft_forward_accept_args(proto, container_ip, container_port),
+                    *comment,
                     error_prefix=f"Add FORWARD rule for {proto}:{container_port}",
                 )
 
@@ -6460,6 +6614,7 @@ class Sandy:
                     *self._nft_output_allow_args(
                         bridge_name, gateway, proto, container_ip, container_port
                     ),
+                    *comment,
                     error_prefix=f"Add output_filter rule for direct access to {proto}:{container_port}",
                 )
 
@@ -6621,79 +6776,67 @@ class Sandy:
             return False
 
     def _cleanup_port_forwarding_nft(self, container_ip: str) -> bool:
-        """Remove port forwarding rules for nftables - called when container stops"""
+        """Remove port forwarding rules for nftables - called when container stops
+
+        nft deletes a rule only by handle (measured with nft 1.0.2, 1.0.9, and
+        1.1.3). Delete the rules that carry this mapping's comment. Rules
+        added by Sandy versions without the comment stay until
+        `rm --network` removes the table.
+        """
         if not self.port_mappings:
             return True
 
         assert self.network is not None, "Network must be configured for cleanup"
-        assert self.network.network_cidr is not None, "Network CIDR must be configured"
-
-        if not self.network._ensure_gateway():
-            print(
-                f"E: Could not determine gateway for bridge '{_strip_control_characters(self.network.bridge_name)}'"
-            )
-            return False
-
-        if not self.network.gateway:
-            print(
-                f"E: Gateway value missing for bridge '{_strip_control_characters(self.network.bridge_name)}'"
-            )
-            return False
-        gateway = self.network.gateway
-        if gateway is None:
-            return False
-        bridge_name = self.network.bridge_name
+        complete = True
         try:
             for proto, host_port, container_port in self.port_mappings:
-                # For nftables, we need to delete rules by matching their exact specification
-                # This is more complex than iptables -D, so we use handle-based deletion
-                # Remove DNAT in output chain (for host-generated traffic to 127.0.0.1)
-                destination = f"{container_ip}:{container_port}"
-                self.network._run_nft(
-                    "delete",
-                    *self._nft_dnat_rule_args("output", proto, host_port, destination),
-                    error_prefix=f"Remove OUTPUT DNAT for {proto}:{host_port}->{container_port}",
-                )
-                # Remove DNAT in prerouting chain (for forwarded traffic)
-                self.network._run_nft(
-                    "delete",
-                    *self._nft_dnat_rule_args(
-                        "prerouting", proto, host_port, destination
-                    ),
-                    error_prefix=f"Remove PREROUTING DNAT for {proto}:{host_port}->{container_port}",
-                )
-                # Remove SNAT in postrouting chain
-                self.network._run_nft(
-                    "delete",
-                    *self._nft_snat_rule_args(
-                        gateway, proto, container_ip, container_port
-                    ),
-                    error_prefix=f"Remove SNAT for {proto}:{host_port} forwarding",
-                )
-                # Remove FORWARD acceptance rule
-                self.network._run_nft(
-                    "delete",
-                    *self._nft_forward_accept_args(proto, container_ip, container_port),
-                    error_prefix=f"Remove FORWARD rule for {proto}:{container_port}",
-                )
-                # Remove direct access to container IP from host
-                self.network._run_nft(
-                    "delete",
-                    *self._nft_output_allow_args(
-                        bridge_name, gateway, proto, container_ip, container_port
-                    ),
-                    error_prefix=f"Remove output_filter rule for direct access to {proto}:{container_port}",
-                )
+                comment = _nft_port_rule_comment(self.container, proto, host_port)
+                for chain in NFT_PORT_RULE_CHAINS:
+                    # A chain that cannot be listed must not keep the rules of
+                    # the other chains in place.
+                    try:
+                        handles = self._nft_port_rule_handles(chain, comment)
+                    except (RuntimeError, ValueError) as exc:
+                        print(f"W: {_terminal_safe_repr(str(exc))}")
+                        complete = False
+                        continue
+                    for handle in handles:
+                        self.network._run_nft(
+                            "delete",
+                            "rule",
+                            "ip",
+                            "sandy",
+                            chain,
+                            "handle",
+                            str(handle),
+                            error_prefix=(
+                                f"Remove {chain} rule for {proto}:{host_port}"
+                            ),
+                        )
                 print(
                     f"I: Removed port forwarding: 127.0.0.1:{host_port} -> {container_ip}:{container_port} ({proto})"
                 )
-            return True
+            return complete
         except Exception as e:
             print(
                 "E: Error cleaning up nftables port forwarding: "
                 f"{_terminal_safe_repr(str(e))}"
             )
             return False
+
+    def _nft_port_rule_handles(self, chain: str, comment: str) -> list:
+        """Return the handles of the rules in chain that carry comment."""
+        result = _run_secure_subprocess(
+            ["nft", "-j", "-a", "list", "chain", "ip", "sandy", chain],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not list nft chain {chain}: {_terminal_safe_repr(result.stderr)}"
+            )
+        return _parse_nft_rule_handles(result.stdout, chain, comment)
 
     def _run_init_script(self, network_mode: str = "lenient") -> None:
         """Execute /init.sh as root if it exists and network is configured.
@@ -7083,18 +7226,39 @@ class Sandy:
             # The supervisor has no terminal and its own session, and runs in
             # its own scope. So a closed terminal, or a stop or OOM kill of
             # the terminal's scope, does not reach it.
-            try:
-                supervisor = _run_secure_subprocess_popen(
-                    scope_cmd,
-                    start_new_session=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=container_environment,
-                    pass_fds=tuple(runtime_fds),
-                )
-            finally:
-                close_runtime_fds()
+            # Without -d, hold the lifecycle lock until the console-pending
+            # marker exists. Every attach joins its leaf under this lock, so
+            # no attach can end, and stop the container, before the console
+            # starts.
+            if not args.detach:
+                self._ensure_cache_dir()
+            with nullcontext() if args.detach else _lifecycle_lock():
+                try:
+                    supervisor = _run_secure_subprocess_popen(
+                        scope_cmd,
+                        start_new_session=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=container_environment,
+                        pass_fds=tuple(runtime_fds),
+                    )
+                finally:
+                    close_runtime_fds()
+                if not args.detach:
+                    try:
+                        _create_console_pending(self.container)
+                    except (OSError, ValueError) as exc:
+                        _finish_spinner_line(spinner_line_event)
+                        print(
+                            f"E: Container '{self.container}' did not start: "
+                            f"{_terminal_safe_repr(str(exc))}"
+                        )
+                        self._stop_failed_start(supervisor)
+                        sys.exit(1)
+                    except BaseException:
+                        self._stop_failed_start(supervisor)
+                        raise
             try:
                 ready = self._wait_for_container_ready(
                     spinner_line_event=spinner_line_event, supervisor=supervisor
@@ -7124,7 +7288,7 @@ class Sandy:
             return
         # The console is one more attach. When it exits, the container stops
         # unless another attach is still running.
-        status = self._exec(None, login_shell=True)
+        status = self._exec(None, login_shell=True, console=True)
         _raise_for_container_status(status)
 
     def _report_failed_start(self, supervisor: subprocess.Popen) -> None:

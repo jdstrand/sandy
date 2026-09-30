@@ -5780,6 +5780,23 @@ class FirewallPolicyTests(unittest.TestCase):
             },
         )
 
+    def test_nftables_nat_output_chain_uses_numeric_priority(self):
+        # Regression: nft 1.0.2 rejects "priority dstnat" for the output hook
+        # (measured on the systemd 249 VM), so the chain was never created.
+        network = make_network()
+        with patch.object(network, "_nft_table_exists", return_value=False):
+            with patch.object(network, "_nft_chain_exists", return_value=False):
+                with patch.object(network, "_run_nft", return_value=True) as run:
+                    network._setup_nftables_base()
+        output = [
+            entry.args
+            for entry in run.call_args_list
+            if entry.args[:5] == ("add", "chain", "ip", "sandy", "output")
+        ]
+        self.assertEqual(len(output), 1)
+        self.assertIn("-100", output[0])
+        self.assertNotIn("dstnat", output[0])
+
     def test_nftables_base_reuses_existing_objects(self):
         network = make_network()
         with patch.object(network, "_nft_table_exists", return_value=True):
@@ -8032,21 +8049,155 @@ class PortForwardingTests(unittest.TestCase):
         with captured_output():
             self.assertTrue(instance._setup_port_forwarding_nft("10.20.30.10"))
         self.assertEqual(instance.network._run_nft.call_count, 5)
+        calls = instance.network._run_nft.call_args_list
         self.assertEqual(
-            [entry.args[0] for entry in instance.network._run_nft.call_args_list],
+            [entry.args[0] for entry in calls],
             ["add", "add", "add", "insert", "insert"],
         )
-
-        instance.network._run_nft.reset_mock()
-        with captured_output():
-            self.assertTrue(instance._cleanup_port_forwarding_nft("10.20.30.10"))
-        self.assertEqual(instance.network._run_nft.call_count, 5)
-        self.assertTrue(
-            all(
-                entry.args[0] == "delete"
-                for entry in instance.network._run_nft.call_args_list
-            )
+        # Every rule of the mapping carries the mapping's comment.
+        self.assertEqual(
+            [entry.args[4] for entry in calls],
+            ["output", "prerouting", "postrouting", "forward", "output_filter"],
         )
+        for entry in calls:
+            self.assertEqual(entry.args[-2:], ("comment", '"sandy:ai-dev:tcp:8080"'))
+
+    def nft_listing(self, chain, rules):
+        """Return `nft -j -a list chain` output with (handle, comment) rules."""
+        items = [
+            {"metainfo": {"version": "1.0.9", "json_schema_version": 1}},
+            {"chain": {"family": "ip", "table": "sandy", "name": chain, "handle": 1}},
+        ]
+        for handle, comment in rules:
+            rule = {
+                "family": "ip",
+                "table": "sandy",
+                "chain": chain,
+                "handle": handle,
+                "expr": [{"accept": None}],
+            }
+            if comment is not None:
+                rule["comment"] = comment
+            items.append({"rule": rule})
+        return json.dumps({"nftables": items})
+
+    def test_nft_cleanup_deletes_only_commented_rules_by_handle(self):
+        instance = self.configured_instance("nftables")
+        instance.port_mappings = [("tcp", 8080, 80)]
+        mine = "sandy:ai-dev:tcp:8080"
+        listings = {
+            "output": [(5, mine), (6, "sandy:other:tcp:8081"), (7, None)],
+            "prerouting": [(8, "sandy:ai-dev:tcp:80800"), (9, mine)],
+            "postrouting": [(10, mine), (11, mine)],
+            "forward": [],
+            "output_filter": [(12, "sandy:ai-dev:udp:8080"), (13, mine)],
+        }
+
+        def run(cmd, **kwargs):
+            self.assertEqual(
+                cmd[:7], ["nft", "-j", "-a", "list", "chain", "ip", "sandy"]
+            )
+            self.assertEqual(
+                kwargs, {"capture_output": True, "text": True, "check": False}
+            )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=self.nft_listing(cmd[7], listings[cmd[7]]),
+                stderr="",
+            )
+
+        with patch.object(sandy, "_run_secure_subprocess", side_effect=run):
+            with captured_output() as (stdout, _):
+                self.assertTrue(instance._cleanup_port_forwarding_nft("10.20.30.10"))
+        self.assertEqual(
+            [entry.args for entry in instance.network._run_nft.call_args_list],
+            [
+                ("delete", "rule", "ip", "sandy", "output", "handle", "5"),
+                ("delete", "rule", "ip", "sandy", "prerouting", "handle", "9"),
+                ("delete", "rule", "ip", "sandy", "postrouting", "handle", "10"),
+                ("delete", "rule", "ip", "sandy", "postrouting", "handle", "11"),
+                ("delete", "rule", "ip", "sandy", "output_filter", "handle", "13"),
+            ],
+        )
+        self.assertIn("Removed port forwarding: 127.0.0.1:8080", stdout.getvalue())
+
+    def test_nft_cleanup_continues_past_unlistable_chains(self):
+        mine = "sandy:ai-dev:tcp:8080"
+        for failure in (
+            SimpleNamespace(returncode=1, stdout="", stderr="No such file\x1b"),
+            SimpleNamespace(returncode=0, stdout="not json", stderr=""),
+        ):
+            with self.subTest(returncode=failure.returncode):
+                instance = self.configured_instance("nftables")
+                instance.port_mappings = [("tcp", 8080, 80)]
+
+                def run(cmd, **kwargs):
+                    _ = kwargs
+                    if cmd[7] == "output":
+                        return failure
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=self.nft_listing(cmd[7], [(40, mine)]),
+                        stderr="",
+                    )
+
+                with patch.object(sandy, "_run_secure_subprocess", side_effect=run):
+                    with captured_output() as (stdout, _):
+                        self.assertFalse(
+                            instance._cleanup_port_forwarding_nft("10.20.30.10")
+                        )
+                self.assertEqual(
+                    [
+                        entry.args[4]
+                        for entry in instance.network._run_nft.call_args_list
+                    ],
+                    ["prerouting", "postrouting", "forward", "output_filter"],
+                )
+                self.assertIn("W: ", stdout.getvalue())
+                self.assertNotIn("\x1b", stdout.getvalue())
+
+    def test_nft_port_rule_comment_validates_fields(self):
+        self.assertEqual(
+            sandy._nft_port_rule_comment("ai-dev", "udp", 53), "sandy:ai-dev:udp:53"
+        )
+        for args in (
+            ("Bad", "tcp", 1),
+            ("a", "sctp", 1),
+            ("a", "tcp", 0),
+            ("a", "tcp", 65536),
+            ("a", "tcp", True),
+            ("a", "tcp", "80"),
+        ):
+            with self.subTest(args=args):
+                with self.assertRaises(ValueError):
+                    sandy._nft_port_rule_comment(*args)
+
+    def test_parse_nft_rule_handles_rejects_malformed_output(self):
+        good = self.nft_listing("output", [(5, "c")])
+        self.assertEqual(sandy._parse_nft_rule_handles(good, "output", "c"), [5])
+        self.assertEqual(sandy._parse_nft_rule_handles(good, "output", "d"), [])
+
+        def listing(rule):
+            return json.dumps({"nftables": [{"rule": rule}]})
+
+        base = {"family": "ip", "table": "sandy", "chain": "output", "comment": "c"}
+        for output in (
+            "[]",
+            "{}",
+            '{"nftables": {}}',
+            "x" * (sandy.NFT_LIST_MAX_BYTES + 1),
+            "{",
+            listing("rule"),
+            listing(dict(base, handle=0)),
+            listing(dict(base, handle=True)),
+            listing(dict(base, handle="5")),
+            listing(dict(base, handle=5, chain="forward")),
+            listing(dict(base, handle=5, table="nat")),
+            listing(dict(base, handle=5, family="ip6")),
+        ):
+            with self.subTest(output=output[:60]):
+                with self.assertRaises(ValueError):
+                    sandy._parse_nft_rule_handles(output, "output", "c")
 
     def test_cleanup_dispatches_backend(self):
         instance = self.configured_instance("nftables")
@@ -8104,11 +8255,11 @@ class PortForwardingTests(unittest.TestCase):
         self.assertIn("No firewall backend", stdout.getvalue())
 
     def test_forwarding_rejects_missing_gateway_value(self):
+        # nftables cleanup deletes by comment and needs no gateway.
         for method_name in (
             "_setup_port_forwarding_ipt",
             "_setup_port_forwarding_nft",
             "_cleanup_port_forwarding_ipt",
-            "_cleanup_port_forwarding_nft",
         ):
             with self.subTest(method=method_name):
                 instance = self.configured_instance()
@@ -8120,7 +8271,6 @@ class PortForwardingTests(unittest.TestCase):
         for method_name in (
             "_setup_port_forwarding_nft",
             "_cleanup_port_forwarding_ipt",
-            "_cleanup_port_forwarding_nft",
         ):
             with self.subTest(method=method_name):
                 instance = self.configured_instance()
@@ -8144,7 +8294,14 @@ class PortForwardingTests(unittest.TestCase):
                     runner_name,
                     MagicMock(side_effect=RuntimeError("rule failure")),
                 )
-                with captured_output():
+                listing = SimpleNamespace(
+                    returncode=0,
+                    stdout=self.nft_listing("output", [(5, "sandy:ai-dev:tcp:8080")]),
+                    stderr="",
+                )
+                with patch.object(
+                    sandy, "_run_secure_subprocess", return_value=listing
+                ), captured_output():
                     self.assertFalse(getattr(instance, method_name)("10.20.30.10"))
 
     def test_cleanup_forwarding_skips_missing_ip_and_dispatches_iptables(self):
@@ -8617,6 +8774,23 @@ class RunUpTests(unittest.TestCase):
         )
         self.exec = self.start_patch(sandy.Sandy, "_exec", 0)
         self.machine_poweroff = self.start_patch(sandy.Sandy, "_machine_poweroff", None)
+        # The lifecycle lock and the console-pending marker of up without -d.
+        self.lock_events = []
+
+        @contextmanager
+        def lock():
+            self.lock_events.append("enter")
+            try:
+                yield
+            finally:
+                self.lock_events.append("exit")
+
+        self.start_patch(sandy, "_lifecycle_lock", None).side_effect = lock
+        self.create_pending = self.start_patch(sandy, "_create_console_pending", None)
+        self.create_pending.side_effect = lambda name: self.lock_events.append(
+            f"pending {name}"
+        )
+        self.start_patch(sandy.Sandy, "_ensure_cache_dir", None)
         # The stale port rule cleanup at the start of up.
         self.stale_cleanup = self.start_patch(
             sandy.Sandy, "_cleanup_port_mappings_for_container", None
@@ -8751,6 +8925,34 @@ class RunUpTests(unittest.TestCase):
                 self.exec.assert_not_called()
                 self.assertIn("E: Container 'ai-dev'", stdout.getvalue())
 
+    def test_console_pending_failure_stops_the_started_container(self):
+        for error, expected in (
+            (TimeoutError("The container scope did not appear"), SystemExit),
+            (KeyboardInterrupt(), KeyboardInterrupt),
+        ):
+            with self.subTest(error=type(error).__name__):
+                instance = make_sandy()
+                instance.workspace = None
+                self.create_pending.side_effect = error
+                self.wait_for_container_ready.reset_mock()
+                with tempfile.TemporaryDirectory() as machine:
+                    with patch.object(
+                        instance, "_is_container_running", return_value=None
+                    ), patch.object(
+                        instance, "_get_machine_dir", return_value=machine
+                    ), patch.object(
+                        sandy, "_run_secure_subprocess_popen"
+                    ) as popen, patch.object(
+                        instance, "_stop_failed_start"
+                    ) as stop:
+                        with captured_output() as (stdout, _):
+                            with self.assertRaises(expected):
+                                instance.run_up(self.arguments(detach=False))
+                stop.assert_called_once_with(popen.return_value)
+                self.wait_for_container_ready.assert_not_called()
+                if expected is SystemExit:
+                    self.assertIn("did not start", stdout.getvalue())
+
     def test_init_failure_stops_the_started_container(self):
         instance = make_sandy()
         instance.workspace = None
@@ -8871,6 +9073,8 @@ class RunUpTests(unittest.TestCase):
         self.wait_for_container_ready.assert_called_once()
         self.exec.assert_not_called()
         self.machine_poweroff.assert_not_called()
+        # up -d takes no lock and creates no console-pending marker.
+        self.assertEqual(self.lock_events, [])
         # Stale rules of this name go on every up, also without -p.
         self.stale_cleanup.assert_called_once_with("ai-dev")
         self.assertFalse(
@@ -8995,7 +9199,9 @@ class RunUpTests(unittest.TestCase):
         init.assert_called_once_with(network_mode="lenient")
         # The console is an attach. _exec applies the last-attach rule, and
         # the stop removes the port forwarding rules.
-        self.exec.assert_called_once_with(None, login_shell=True)
+        self.exec.assert_called_once_with(None, login_shell=True, console=True)
+        # The marker exists before the lock is released.
+        self.assertEqual(self.lock_events, ["enter", "pending ai-dev", "exit"])
         self.machine_poweroff.assert_not_called()
         cleanup.assert_not_called()
         # up removes this name's stale rules and state once, at its start.
@@ -10047,6 +10253,22 @@ class AttachCgroupTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sandy._end_attach_leaf(unit_fd, "payload")
 
+    def test_end_attach_leaf_accepts_leaf_removed_meanwhile(self):
+        # Regression: the last-session count of another attach removes an
+        # empty leaf while its owner is still in cleanup (measured on 249).
+        leaf = self.fake_leaf()
+        unit_fd = self.open_unit()
+        self.addCleanup(os.close, unit_fd)
+        (leaf / "cgroup.kill").unlink()
+        with patch.object(sandy.os, "rmdir") as rmdir:
+            sandy._end_attach_leaf(unit_fd, ATTACH_LEAF)
+        rmdir.assert_not_called()
+        (leaf / "cgroup.kill").write_bytes(b"")
+        (leaf / "cgroup.events").unlink()
+        with patch.object(sandy.os, "rmdir") as rmdir:
+            sandy._end_attach_leaf(unit_fd, ATTACH_LEAF)
+        rmdir.assert_not_called()
+
     def test_remove_attach_leaf_skips_missing_scope(self):
         with patch.object(
             sandy, "_open_supervisor_cgroup", side_effect=FileNotFoundError
@@ -10066,6 +10288,51 @@ class AttachCgroupTests(unittest.TestCase):
                 sandy._remove_attach_leaf("ai-dev", ATTACH_LEAF)
         end.assert_called_once_with(unit_fd, ATTACH_LEAF)
         close.assert_called_once_with(unit_fd)
+
+    def test_console_pending_marker_lifecycle(self):
+        unit_fd = self.open_unit()
+        self.addCleanup(os.close, unit_fd)
+        self.assertFalse(sandy._console_pending(unit_fd))
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
+        ):
+            sandy._create_console_pending("ai-dev")
+            # Creating it twice is not an error.
+            sandy._create_console_pending("ai-dev")
+        self.assertTrue((self.unit / "console-pending").is_dir())
+        self.assertTrue(sandy._console_pending(unit_fd))
+        sandy._remove_console_pending(unit_fd)
+        sandy._remove_console_pending(unit_fd)
+        self.assertFalse(sandy._console_pending(unit_fd))
+        # A file of that name is not the marker.
+        (self.unit / "console-pending").write_text("")
+        self.assertFalse(sandy._console_pending(unit_fd))
+
+    def test_create_console_pending_waits_for_the_scope(self):
+        opens = [FileNotFoundError(), FileNotFoundError(), None]
+
+        def open_unit(_name):
+            result = opens.pop(0)
+            if result is not None:
+                raise result
+            return self.open_unit()
+
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=open_unit
+        ), patch.object(sandy.time, "sleep") as sleep:
+            sandy._create_console_pending("ai-dev")
+        self.assertEqual(
+            sleep.call_args_list, [call(sandy.CONSOLE_PENDING_POLL_INTERVAL)] * 2
+        )
+        self.assertTrue((self.unit / "console-pending").is_dir())
+
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=FileNotFoundError
+        ), patch.object(sandy.time, "sleep"), patch.object(
+            sandy.time, "monotonic", side_effect=[0, 1, 10]
+        ):
+            with self.assertRaisesRegex(TimeoutError, "did not appear"):
+                sandy._create_console_pending("ai-dev")
 
     def test_new_attach_leaf_is_random_and_valid(self):
         first = sandy._new_attach_leaf()
@@ -10189,7 +10456,11 @@ class AttachLifecycleTests(unittest.TestCase):
 
     @contextmanager
     def rule_mocks(
-        self, detached: object = False, remaining: object = 0, unit_error=None
+        self,
+        detached: object = False,
+        remaining: object = 0,
+        unit_error=None,
+        pending: object = False,
     ):
         manager = MagicMock()
 
@@ -10206,8 +10477,13 @@ class AttachLifecycleTests(unittest.TestCase):
         if unit_error is not None:
             manager.open_unit.side_effect = unit_error
         manager.count.return_value = remaining
+        manager.pending.return_value = pending
         instance = make_sandy()
         with patch.object(sandy, "_lifecycle_lock", lock), patch.object(
+            sandy, "_console_pending", manager.pending
+        ), patch.object(
+            sandy, "_remove_console_pending", manager.remove_pending
+        ), patch.object(
             sandy, "_supervisor_detached", manager.detached
         ), patch.object(
             sandy, "_open_supervisor_cgroup", manager.open_unit
@@ -10231,10 +10507,11 @@ class AttachLifecycleTests(unittest.TestCase):
             [
                 call.sigmask(sandy.signal.SIG_BLOCK, sandy.ATTACH_HANGUP_SIGNALS),
                 call.lock_enter(),
-                call.detached("ai-dev"),
                 call.open_unit("ai-dev"),
                 call.count(70),
+                call.pending(70),
                 call.close(70),
+                call.detached("ai-dev"),
                 call.poweroff(),
                 call.lock_exit(),
                 call.sigmask(sandy.signal.SIG_UNBLOCK, sandy.ATTACH_HANGUP_SIGNALS),
@@ -10244,10 +10521,12 @@ class AttachLifecycleTests(unittest.TestCase):
 
     def test_last_attach_rule_keeps_container_running(self):
         cases = (
-            ({"detached": True}, "open_unit"),
-            ({"detached": None}, "open_unit"),
+            ({"detached": True}, "poweroff"),
+            ({"detached": None}, "poweroff"),
             ({"unit_error": FileNotFoundError()}, "count"),
-            ({"remaining": 1}, "poweroff"),
+            ({"remaining": 1}, "detached"),
+            # The console has not exited yet (for example, up is starting).
+            ({"pending": True}, "detached"),
         )
         for overrides, not_called in cases:
             with self.subTest(overrides=overrides):
@@ -10260,6 +10539,41 @@ class AttachLifecycleTests(unittest.TestCase):
                     manager.sigmask.call_args_list[-1],
                     call(sandy.signal.SIG_UNBLOCK, sandy.ATTACH_HANGUP_SIGNALS),
                 )
+
+    def test_last_attach_rule_counts_on_detached_containers(self):
+        # Regression: empty leaves after SIGKILL stayed on -d containers,
+        # because the rule returned before the count (measured).
+        with self.rule_mocks(detached=True) as (instance, manager):
+            instance._stop_if_last_attach()
+        manager.count.assert_called_once_with(70)
+        manager.remove_pending.assert_not_called()
+
+    def test_console_exit_removes_marker_before_count(self):
+        with self.rule_mocks() as (instance, manager):
+            with captured_output():
+                instance._stop_if_last_attach(console=True)
+        names = [entry[0] for entry in manager.mock_calls]
+        self.assertLess(names.index("remove_pending"), names.index("count"))
+        manager.remove_pending.assert_called_once_with(70)
+        manager.poweroff.assert_called_once_with()
+
+    def test_console_hangup_removes_marker_without_stop(self):
+        with self.rule_mocks() as (instance, manager):
+            instance._end_console_pending()
+        manager.remove_pending.assert_called_once_with(70)
+        manager.close.assert_called_once_with(70)
+        manager.count.assert_not_called()
+        manager.poweroff.assert_not_called()
+        for error, warned in (
+            (FileNotFoundError(), False),
+            (PermissionError("x"), True),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with self.rule_mocks(unit_error=error) as (instance, manager):
+                    with captured_output() as (stdout, _):
+                        instance._end_console_pending()
+                manager.remove_pending.assert_not_called()
+                self.assertEqual("W: Could not update" in stdout.getvalue(), warned)
 
     def test_last_attach_rule_warns_on_errors(self):
         for target, error in (
@@ -10308,7 +10622,7 @@ class AttachLifecycleTests(unittest.TestCase):
             instance, "_stop_if_last_attach"
         ) as rule:
             self.assertEqual(instance._exec("true"), 3)
-        rule.assert_called_once_with()
+        rule.assert_called_once_with(console=False)
 
         with patch.object(
             instance, "_is_container_running", return_value="123"
