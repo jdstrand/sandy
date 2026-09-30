@@ -13,7 +13,7 @@ PYRIGHT := $(VENV)/bin/pyright
 LANGUAGE_CHECKER ?= language-checker
 
 PYTHON_FILES := sandy $(wildcard tests/*.py) $(wildcard tests/e2e/*.py)
-SHELL_FILES := debootstrap.sh oci.sh setup-container.sh \
+SHELL_FILES := debootstrap.sh oci.sh sandy-keepalive.sh setup-container.sh \
 	$(wildcard tests/e2e/*.sh)
 UNIT_TEST_MODULES := tests.test_sandy tests.test_e2e_harness
 
@@ -22,7 +22,7 @@ UNIT_TEST_MODULES := tests.test_sandy tests.test_e2e_harness
 
 all: check
 
-install: sandy debootstrap.sh oci.sh setup-container.sh
+install: sandy debootstrap.sh oci.sh sandy-keepalive.sh setup-container.sh
 	@set -eu; \
 	normalized=$$(realpath -ms -- "$$INSTALL_DIR" 2>/dev/null || true); \
 	if [ -z "$$INSTALL_DIR" ] || [ "$$INSTALL_DIR" = "/" ] || \
@@ -36,7 +36,7 @@ install: sandy debootstrap.sh oci.sh setup-container.sh
 	esac; \
 	target_dir="$${DESTDIR%/}$$INSTALL_DIR"; \
 	install -d -m 0755 -- "$$target_dir"; \
-	install -m 0755 -- sandy debootstrap.sh oci.sh setup-container.sh \
+	install -m 0755 -- sandy debootstrap.sh oci.sh sandy-keepalive.sh setup-container.sh \
 		"$$target_dir/"; \
 	echo "I: Installed sandy to $$target_dir"; \
 	echo "I: sudoers was not changed"; \

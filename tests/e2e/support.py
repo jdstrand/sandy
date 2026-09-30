@@ -24,12 +24,23 @@ from typing import Iterator, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SANDY = REPO_ROOT / "sandy"
+# sandy and the helper scripts that it requires next to itself.
+SANDY_SCRIPT_NAMES = (
+    "sandy",
+    "debootstrap.sh",
+    "oci.sh",
+    "sandy-keepalive.sh",
+    "setup-container.sh",
+)
 MINIMAL_SETUP = Path(__file__).with_name("setup-container-minimal.sh")
 INSTALL_DIR = Path("/usr/local/lib/sandy")
 SYSTEMD_MACHINES = Path("/var/lib/machines")
 CACHE_DIR = SYSTEMD_MACHINES / "sandy.__cache"
 PORT_STATE = CACHE_DIR / "port_mappings.json"
 PORT_LOCK = CACHE_DIR / "port_mappings.lock"
+LIFECYCLE_LOCK = CACHE_DIR / "lifecycle.lock"
+# Product code never removes these stable lock inodes.
+PERSISTENT_LOCKS = (PORT_LOCK, LIFECYCLE_LOCK)
 BRIDGE_NAME = "sandybr0"
 NAME_PATTERN = re.compile(r"^e2e-[a-z0-9-]{1,48}$")
 DEFAULT_TIMEOUT = 120
@@ -37,6 +48,11 @@ BUILD_TIMEOUT = 1800
 FULL_BUILD_TIMEOUT = 7200
 OUTPUT_TAIL_LENGTH = 12000
 CONTAINER_USER_ID = 1000
+# On systemd < 250 sandy grants workspace access with ACLs. It needs SUDO_UID
+# (the invoking user, who owns the workspace) and asks once for each of the
+# workspace and shared directories, as it does for a real `sudo sandy up`.
+# No other prompt can appear during `up`.
+ACL_PROMPT_ANSWERS = "y\ny\n"
 HOST_SECRET_NAME = "SANDY_HOST_SECRET"
 HOST_SECRET_VALUE = "must-not-enter-container"
 DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -53,6 +69,12 @@ IP6TABLES_CHAINS = (
     ("filter", "sandy-fwd6"),
     ("filter", "sandy-rej6"),
 )
+# Sandy uses nftables only when iptables is missing. To test that backend, run
+# sandy in a private mount namespace where an empty, non-executable file is
+# bound over the iptables binary. The host stays unchanged. The script is
+# static; the paths and the sandy command are positional arguments.
+HIDE_IPTABLES_SCRIPT = 'mount --bind -- "$1" "$2" && shift 2 && exec "$@"'
+IPTABLES_BINARY_DIRS = (Path("/usr/sbin"), Path("/sbin"))
 NFTABLES_TABLES = (
     ("ip", "sandy"),
     ("ip6", "sandy"),
@@ -126,6 +148,10 @@ class E2EContext:
         self.filesystem_name = f"e2e-filesystem-{suffix}"
         self.main_name = f"e2e-main-{suffix}"
         self.full_name = f"e2e-full-{suffix}"
+        self.scope_name = f"e2e-scope-{suffix}"
+        self.other_name = f"e2e-other-{suffix}"
+        self.nft_name = f"e2e-nft-{suffix}"
+        self.nft_other_name = f"e2e-nft-other-{suffix}"
         self.cache_user = "developer"
         self.cache_miss_user = "e2emiss"
         self.main_user = "developer"
@@ -160,6 +186,8 @@ class E2EContext:
             FilesystemFixtureIdentity,
         ] = {}
         self._filesystem_mounts: list[Path] = []
+        # When True, every sandy call runs without a visible iptables.
+        self.hide_iptables = False
 
     def _validate_names(self) -> None:
         for name in (
@@ -168,6 +196,10 @@ class E2EContext:
             self.filesystem_name,
             self.main_name,
             self.full_name,
+            self.scope_name,
+            self.other_name,
+            self.nft_name,
+            self.nft_other_name,
         ):
             if not NAME_PATTERN.fullmatch(name):
                 raise E2EFailure(f"Generated unsafe container name: {name!r}")
@@ -247,10 +279,15 @@ class E2EContext:
         timeout: int = DEFAULT_TIMEOUT,
         environment: Mapping[str, str] | None = None,
         input_text: str | None = None,
+        executable: Path | None = None,
     ) -> CommandResult:
-        """Invoke sandy with the E2E workspace and optional owned container."""
+        """Invoke sandy with the E2E workspace and optional owned container.
+
+        executable selects another copy of sandy, such as the one from
+        group_writable_sandy().
+        """
         command = [
-            str(SANDY),
+            str(executable or SANDY),
             "--workspace",
             self.workspace.name,
             "--shared",
@@ -263,13 +300,60 @@ class E2EContext:
                 raise E2EFailure(f"Refusing unsafe container name: {name!r}")
             command.extend(["--container", name])
         command.extend(arguments)
+        if self.hide_iptables:
+            command = self.without_iptables(command)
+        sandy_environment = dict(environment or self.safe_environment())
+        # sudo sets this for the invoking user. Sandy reads it only for
+        # workspace ACLs on systemd < 250.
+        sandy_environment["SUDO_UID"] = str(CONTAINER_USER_ID)
         return self.run(
             command,
             expected=expected,
             timeout=timeout,
-            environment=environment or self.safe_environment(),
+            environment=sandy_environment,
             input_text=input_text,
         )
+
+    def group_writable_sandy(self) -> Path:
+        """Return a copy of sandy that its group can write, with its scripts.
+
+        The copy is in this run's root directory, which cleanup removes. The
+        checkout does not change.
+        """
+        directory = self.root / "sandy-group-writable"
+        directory.mkdir(mode=0o755, exist_ok=True)
+        for name in SANDY_SCRIPT_NAMES:
+            shutil.copy2(REPO_ROOT / name, directory / name)
+        copy = directory / "sandy"
+        copy.chmod(0o775)
+        return copy
+
+    def without_iptables(self, command: Sequence[str]) -> list[str]:
+        """Return command wrapped so that it sees no iptables binary."""
+        located = shutil.which("iptables", path=self.safe_environment()["PATH"])
+        if located is None:
+            raise E2EFailure("iptables is not installed")
+        target = Path(located).resolve()
+        if target.parent not in IPTABLES_BINARY_DIRS or not target.is_file():
+            raise E2EFailure(f"Unexpected iptables binary: {target}")
+        blocker = self.root / "no-iptables"
+        if not blocker.exists():
+            blocker.write_bytes(b"")
+            blocker.chmod(0o644)
+        return [
+            "unshare",
+            "--mount",
+            "--propagation",
+            "private",
+            "--",
+            "/bin/sh",
+            "-c",
+            HIDE_IPTABLES_SCRIPT,
+            "sh",
+            str(blocker),
+            str(target),
+            *command,
+        ]
 
     @contextmanager
     def case(self, name: str) -> Iterator[None]:
@@ -400,11 +484,7 @@ class E2EContext:
         """Return persistent Sandy machine, bridge, and firewall state."""
         artifacts = []
         for path in sorted(SYSTEMD_MACHINES.glob("sandy.*")):
-            if (
-                path == CACHE_DIR
-                and self._persistent_port_lock_is_safe()
-                and list(CACHE_DIR.iterdir()) == [PORT_LOCK]
-            ):
+            if path == CACHE_DIR and self._cache_holds_only_safe_locks():
                 continue
             artifacts.append(str(path))
         if self.bridge_exists():
@@ -839,6 +919,7 @@ class E2EContext:
             user=user,
             timeout=BUILD_TIMEOUT,
             environment=self.minimal_environment(),
+            input_text=ACL_PROMPT_ANSWERS,
         )
         self.wait_for_machine(name, running=True)
         return result
@@ -858,8 +939,23 @@ class E2EContext:
             user=self.main_user,
             timeout=BUILD_TIMEOUT,
             environment=self.minimal_environment(),
+            input_text=ACL_PROMPT_ANSWERS,
         )
         self.wait_for_machine(self.main_name, running=True)
+        return result
+
+    def build_lenient(self, name: str, user: str) -> CommandResult:
+        """Build a persistent machine with the bridge network; leave it running."""
+        self.register_container(name, user)
+        result = self.sandy(
+            ["up", "--build", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=user,
+            timeout=BUILD_TIMEOUT,
+            environment=self.minimal_environment(),
+            input_text=ACL_PROMPT_ANSWERS,
+        )
+        self.wait_for_machine(name, running=True)
         return result
 
     def build_full(self) -> CommandResult:
@@ -879,6 +975,7 @@ class E2EContext:
             name=self.full_name,
             user=self.full_user,
             timeout=FULL_BUILD_TIMEOUT,
+            input_text=ACL_PROMPT_ANSWERS,
         )
         self.wait_for_machine(self.full_name, running=True)
         return result
@@ -1000,13 +1097,15 @@ class E2EContext:
     def purge_cache(self) -> None:
         if CACHE_DIR.exists():
             self.sandy(["rm", "--cache", "--force"])
-        if PORT_LOCK.exists() or PORT_LOCK.is_symlink():
-            if not self._persistent_port_lock_is_safe():
-                raise E2EFailure(f"Unsafe persistent port lock: {PORT_LOCK}")
-            # Product code never removes this stable inode because a waiter
-            # could still hold it. The harness owns the otherwise-clean VM and
-            # removes it only after all Sandy operations have stopped.
-            PORT_LOCK.unlink()
+        for lock in PERSISTENT_LOCKS:
+            if lock.exists() or lock.is_symlink():
+                if not self._persistent_lock_is_safe(lock):
+                    raise E2EFailure(f"Unsafe persistent lock: {lock}")
+                # Product code never removes this stable inode because a
+                # waiter could still hold it. The harness owns the
+                # otherwise-clean VM and removes it only after all Sandy
+                # operations have stopped.
+                lock.unlink()
         if CACHE_DIR.exists() and not any(CACHE_DIR.iterdir()):
             CACHE_DIR.rmdir()
         if CACHE_DIR.exists():
@@ -1015,11 +1114,19 @@ class E2EContext:
                 f"Cache directory remains after purge: {CACHE_DIR} ({remaining})"
             )
 
-    def _persistent_port_lock_is_safe(self) -> bool:
-        """Return whether the persistent lock has its exact safe metadata."""
-        if not PORT_LOCK.exists() or PORT_LOCK.is_symlink():
+    def _cache_holds_only_safe_locks(self) -> bool:
+        """Return whether the cache directory holds only safe persistent locks."""
+        entries = list(CACHE_DIR.iterdir())
+        return bool(entries) and all(
+            entry in PERSISTENT_LOCKS and self._persistent_lock_is_safe(entry)
+            for entry in entries
+        )
+
+    def _persistent_lock_is_safe(self, lock: Path) -> bool:
+        """Return whether a persistent lock has its exact safe metadata."""
+        if not lock.exists() or lock.is_symlink():
             return False
-        lock_stat = PORT_LOCK.lstat()
+        lock_stat = lock.lstat()
         return (
             stat.S_ISREG(lock_stat.st_mode)
             and (lock_stat.st_uid, lock_stat.st_gid) == (0, 0)
@@ -1111,7 +1218,11 @@ class E2EContext:
 
         if self._host_state_owned:
             try:
-                if self.bridge_exists():
+                # A failed case can leave the Sandy firewall without the
+                # bridge (test_stale_rules deletes the bridge). rm --network
+                # removes that state too: it sets up a bridge first, removes
+                # it, and the ip_forward value is restored below.
+                if self.bridge_exists() or self._sandy_firewall_exists():
                     self.sandy(["rm", "--network", "--force"])
             except Exception as exc:
                 errors.append(f"network: {exc}")

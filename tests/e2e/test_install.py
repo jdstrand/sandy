@@ -14,7 +14,13 @@ from tests.e2e.support import (
     assert_contains,
 )
 
-INSTALL_FILES = ("sandy", "debootstrap.sh", "oci.sh", "setup-container.sh")
+INSTALL_FILES = (
+    "sandy",
+    "debootstrap.sh",
+    "oci.sh",
+    "sandy-keepalive.sh",
+    "setup-container.sh",
+)
 
 
 def _file_digest(path: Path) -> str:

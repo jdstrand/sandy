@@ -55,7 +55,7 @@ jobs:
 
       - name: Install language-checker
         run: |
-          GOBIN="$RUNNER_TEMP" go install github.com/jdstrand/language-checker@9944da58f4e35951cbdcd25416e473fbd19f12ed
+          GOBIN="$RUNNER_TEMP" go install github.com/jdstrand/language-checker@498215da4e76c60d9ad1ce166a349de34f1913b5
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Run inclusivity check

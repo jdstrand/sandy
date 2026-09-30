@@ -10,11 +10,15 @@ import traceback
 
 from tests.e2e import (
     test_cache,
+    test_confinement,
     test_filesystem,
     test_full,
     test_install,
     test_lifecycle,
     test_network,
+    test_nftables,
+    test_scope,
+    test_stale_rules,
     test_unhappy,
 )
 from tests.e2e.support import E2EContext, E2EFailure
@@ -25,7 +29,11 @@ TEST_MODULES = (
     test_filesystem,
     test_cache,
     test_lifecycle,
+    test_confinement,
+    test_scope,
+    test_stale_rules,
     test_network,
+    test_nftables,
 )
 
 
