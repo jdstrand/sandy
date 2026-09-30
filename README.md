@@ -25,7 +25,7 @@ wrapper written by Trevor Hilton (@hiltontj).
 
 ## Requirements
 
-- Linux host with `systemd-nspawn`, `nsenter`, `ip`, ...
+- Linux host with `systemd-nspawn`, `machinectl`, `ip`, ...
 - Either `debootstrap` **or** the combination of `skopeo` and `umoci` for image
   creation
 - Firewall tooling: `iptables` or `nftables` as a fallback for NAT rules with
@@ -134,9 +134,14 @@ $ sudo /path/to/sandy [GLOBAL OPTIONS] [COMMAND] [COMMAND OPTIONS]
 - `down` - Stop the container
 - `rm` - Remove containers, cache, or network artifacts. Accepts `--all`,
   `--force`, `--cache`, `--network`.
-- `bash` - Launch an interactive shell inside the container (default when no
-  command is supplied).
-- `exec` - Execute a specific command (`./sandy exec -- cargo test`).
+- `bash` - Launch an interactive shell inside the running container (default
+  when no command is supplied).
+- `exec` - Execute a specific command in the running container
+  (`./sandy exec -- cargo test`).
+
+`bash` and `exec` attach to a container that `up` started. They run with the
+same seccomp filters and capability bounding set as the container itself, also
+with `-u root` (see "Attached sessions" below).
 - `status` - Show `machinectl status` for the container.
 - `list` - Enumerate managed containers and their paths under
   `/var/lib/machines`.
@@ -152,7 +157,8 @@ allowing loopback-published services via port mappings. Host networking
 Port mapping state uses a persistent `0600` coordination lock in
 `/var/lib/machines/sandy.__cache`. Once created, `rm --cache` retains that
 empty lock and its directory so concurrent Sandy processes always coordinate
-on the same inode; it contains no port mappings or cache payload.
+on the same inode; it contains no port mappings or cache payload. The
+`lifecycle.lock` file in the same directory is retained in the same way.
 
 
 ## Security
@@ -202,6 +208,33 @@ accepted.
 The example limits the sudo command path to the installed `sandy` executable,
 but it is not a privilege or sandbox boundary. Choosing a different group does
 not reduce the effective privilege granted to members of that group.
+
+### Attached sessions
+
+`bash`, `exec`, and the network setup script (`/init.sh`) enter a running
+container through an internal helper mode of `sandy` itself, not through
+`nsenter`. The helper reads the seccomp filters and the capability bounding
+set of the container's init process from the host, joins the container's
+namespaces, and applies both before it runs the command. So an attached
+session has the same confinement as the container's main process, for the
+default user and for `-u root`. If the helper cannot read or apply the
+confinement, it refuses to run the command; there is no unconfined fallback.
+
+Differences from earlier versions:
+
+- There is no PAM session. `su` is no longer used; the helper sets the user,
+  groups, and environment itself. The user, uid, gid, and supplementary groups
+  come from the container's `/etc/passwd` and `/etc/group` at attach time.
+  `root` gets no supplementary groups, as for the container's main process.
+- The environment is a fixed allow-list (`HOME`, `LANG`, `LC_ALL`, `LOGNAME`,
+  `PATH`, `SHELL`, `SYSTEMD_COLORS`, `TERM`, `USER`). Host variables are not
+  passed.
+- An attached session starts in the workspace when it exists, otherwise in
+  `/`.
+
+Current limits: an attached session still runs in the cgroup of the terminal
+that started `sandy`, and a process that an attached session leaves behind
+can keep running in the container until the container stops.
 
 As mentioned above, `sandy` was written with security in mind with the goal of
 creating a strong sandbox for AI agents, but it should be understood there may
@@ -288,6 +321,6 @@ complete default `setup-container.sh`, run:
 sudo env SANDY_E2E=1 make e2e-full
 ```
 
-The additional full build may take 10–20 minutes depending on network and
+The additional full build may take 10-20 minutes depending on network and
 package caches because the default setup installs and compiles complete
 development toolchains.
