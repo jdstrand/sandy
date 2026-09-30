@@ -11,6 +11,7 @@ import base64
 import importlib.machinery
 import importlib.util
 import json
+import os
 import platform
 import shlex
 import subprocess
@@ -345,6 +346,47 @@ def test_main(context: E2EContext) -> None:
     with context.case(f"{STABILITY_RUNS} confined exec runs complete"):
         for _ in range(STABILITY_RUNS):
             _exec(context, "true")
+
+    with context.case("an inherited descriptor does not stop an attach"):
+        # sudo closes descriptors above 2, but root can run sandy directly.
+        # The pty path kept such a descriptor, and the helper refused to run.
+        arguments = [
+            str(SANDY),
+            "--workspace",
+            context.workspace.name,
+            "--shared",
+            context.shared.name,
+            "--user",
+            context.main_user,
+            "--container",
+            context.main_name,
+            "exec",
+            "--",
+            "true",
+        ]
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+        try:
+            print(f"    $ {shlex.join(arguments)} {descriptor}</dev/null", flush=True)
+            inherited = subprocess.run(
+                arguments,
+                pass_fds=(descriptor,),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+                shell=False,
+                cwd=context.root,
+                env=context.safe_environment(),
+            )
+        finally:
+            os.close(descriptor)
+        if inherited.returncode != 0:
+            output = (inherited.stdout + inherited.stderr)[-2000:]
+            raise E2EFailure(
+                f"exec with an inherited descriptor failed with "
+                f"{inherited.returncode}: {output}"
+            )
 
     with context.case("the attach environment is the allow-list"):
         environment = sandy._container_environment("developer", "/home/developer")

@@ -515,26 +515,134 @@ class SubprocessWrapperTests(unittest.TestCase):
                 fork.assert_not_called()
 
     def test_pty_wrapper_marks_only_explicit_fds_inheritable_in_child(self):
+        # Mocks: the fork (this process takes the child branch), the
+        # descriptor cleanup, and the exec, so this process keeps its
+        # descriptors. The child closes the others before exec.
         descriptor = os.open(SANDY_PATH, os.O_RDONLY)
+        manager = MagicMock()
+        manager.execvpe.side_effect = RuntimeError("exec called")
         try:
             with patch.object(sandy.pty, "fork", return_value=(0, 10)):
-                with patch.object(sandy.os, "set_inheritable") as set_inheritable:
+                with patch.object(sandy, "_close_inherited_fds", manager.close):
                     with patch.object(
-                        sandy.os,
-                        "execvpe",
-                        side_effect=RuntimeError("exec called"),
+                        sandy.os, "set_inheritable", manager.set_inheritable
                     ):
-                        with self.assertRaisesRegex(RuntimeError, "exec called"):
-                            sandy._run_secure_subprocess_pty(
-                                ["tool"],
-                                environment={"PATH": sandy.CONTAINER_PATH},
-                                master_read=MagicMock(),
-                                stdin_read=MagicMock(),
-                                pass_fds=(descriptor,),
-                            )
-            set_inheritable.assert_called_once_with(descriptor, True)
+                        with patch.object(sandy.os, "execvpe", manager.execvpe):
+                            with self.assertRaisesRegex(RuntimeError, "exec called"):
+                                sandy._run_secure_subprocess_pty(
+                                    ["tool"],
+                                    environment={"PATH": sandy.CONTAINER_PATH},
+                                    master_read=MagicMock(),
+                                    stdin_read=MagicMock(),
+                                    pass_fds=(descriptor,),
+                                )
+            self.assertEqual(
+                manager.mock_calls,
+                [
+                    call.close((descriptor,)),
+                    call.set_inheritable(descriptor, True),
+                    call.execvpe("tool", ["tool"], {"PATH": sandy.CONTAINER_PATH}),
+                ],
+            )
         finally:
             os.close(descriptor)
+
+    def test_close_inherited_fds_keeps_standard_streams_and_passed_fds(self):
+        # Mocks: the descriptor list and close, so that this process keeps
+        # its descriptors.
+        with patch.object(sandy, "_open_fds", return_value={0, 1, 2, 3, 5, 7, 9}):
+            with patch.object(sandy.os, "close") as close:
+                sandy._close_inherited_fds((5, 9))
+        self.assertEqual(close.call_args_list, [call(3), call(7)])
+
+        with patch.object(sandy, "_open_fds", return_value={0, 1, 2, 4}):
+            with patch.object(
+                sandy.os, "close", side_effect=OSError(errno.EIO, "close failed")
+            ):
+                with self.assertRaises(OSError):
+                    sandy._close_inherited_fds(())
+
+    def test_close_inherited_fds_in_a_real_child(self):
+        # No mocks: a new interpreter inherits two descriptors without
+        # close-on-exec, keeps one, and reports what stays open.
+        script = (
+            "import importlib.machinery, importlib.util, json, sys\n"
+            "loader = importlib.machinery.SourceFileLoader('sandy_child', sys.argv[1])\n"
+            "spec = importlib.util.spec_from_loader(loader.name, loader)\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "loader.exec_module(module)\n"
+            "module._close_inherited_fds((int(sys.argv[2]),))\n"
+            "print(json.dumps(sorted(module._open_fds())))\n"
+        )
+        kept = os.open(SANDY_PATH, os.O_RDONLY)
+        extra = os.open(SANDY_PATH, os.O_RDONLY)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", script, str(SANDY_PATH), str(kept)],
+                pass_fds=(kept, extra),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+                shell=False,
+            )
+        finally:
+            os.close(kept)
+            os.close(extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [0, 1, 2, kept])
+
+    def test_pty_child_gets_no_inherited_descriptor(self):
+        # Regression test for the pty path giving inherited descriptors to the
+        # entry helper. No mocks: a new interpreter inherits a descriptor
+        # without close-on-exec and runs a command through the real PTY
+        # wrapper. The command reports the targets of its own descriptors.
+        command = (
+            "import json, os\n"
+            "fd_dir = '/proc/self/fd'\n"
+            "targets = []\n"
+            "for name in os.listdir(fd_dir):\n"
+            "    try:\n"
+            "        targets.append(os.readlink(os.path.join(fd_dir, name)))\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "print('FDS=' + json.dumps(targets))\n"
+        )
+        runner = (
+            "import importlib.machinery, importlib.util, os, sys\n"
+            "loader = importlib.machinery.SourceFileLoader('sandy_child', sys.argv[1])\n"
+            "spec = importlib.util.spec_from_loader(loader.name, loader)\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "loader.exec_module(module)\n"
+            "sys.exit(module._run_secure_subprocess_pty(\n"
+            "    [sys.executable, '-I', '-c', sys.argv[2]],\n"
+            "    environment={'PATH': '/usr/bin:/bin'},\n"
+            "    master_read=lambda fd: os.read(fd, 1024),\n"
+            "    stdin_read=lambda fd: b'',\n"
+            "))\n"
+        )
+        with tempfile.NamedTemporaryFile(prefix="sandy-inherited-") as marker:
+            descriptor = os.open(marker.name, os.O_RDONLY)
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-I", "-c", runner, str(SANDY_PATH), command],
+                    pass_fds=(descriptor,),
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    check=False,
+                    timeout=60,
+                    shell=False,
+                )
+            finally:
+                os.close(descriptor)
+            lines = result.stdout.decode("utf-8", "replace").splitlines()
+            reports = [line[4:] for line in lines if line.startswith("FDS=")]
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(reports), 1, lines)
+            targets = json.loads(reports[0])
+            self.assertTrue(targets)
+            self.assertNotIn(marker.name, targets)
 
 
 class PtyProcessTests(unittest.TestCase):
@@ -741,28 +849,32 @@ class PtyProcessTests(unittest.TestCase):
 
     def test_child_pty_reports_exec_failure_safely(self):
         executable = "missing\n\x1b[31m"
-        with patch.object(sandy.pty, "fork", return_value=(0, 10)):
-            with patch.object(
-                sandy.os,
-                "execvpe",
-                side_effect=OSError("missing\nforged"),
-            ):
-                with patch.object(
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(sandy.pty, "fork", return_value=(0, 10)))
+            # This process takes the child branch; keep its descriptors.
+            stack.enter_context(patch.object(sandy, "_close_inherited_fds"))
+            stack.enter_context(
+                patch.object(
+                    sandy.os,
+                    "execvpe",
+                    side_effect=OSError("missing\nforged"),
+                )
+            )
+            child_exit = stack.enter_context(
+                patch.object(
                     sandy.os,
                     "_exit",
                     side_effect=RuntimeError("child exited"),
-                ) as child_exit:
-                    with captured_output() as (_, stderr):
-                        with self.assertRaisesRegex(
-                            RuntimeError,
-                            "child exited",
-                        ):
-                            sandy._run_secure_subprocess_pty(
-                                [executable],
-                                environment={"PATH": sandy.CONTAINER_PATH},
-                                master_read=MagicMock(),
-                                stdin_read=MagicMock(),
-                            )
+                )
+            )
+            _, stderr = stack.enter_context(captured_output())
+            with self.assertRaisesRegex(RuntimeError, "child exited"):
+                sandy._run_secure_subprocess_pty(
+                    [executable],
+                    environment={"PATH": sandy.CONTAINER_PATH},
+                    master_read=MagicMock(),
+                    stdin_read=MagicMock(),
+                )
         child_exit.assert_called_once_with(1)
         output = stderr.getvalue()
         diagnostic = output.rstrip("\n")
@@ -778,18 +890,20 @@ class PtyProcessTests(unittest.TestCase):
             "TERM": "xterm-256color",
         }
         with patch.object(sandy.pty, "fork", return_value=(0, 10)):
-            with patch.object(
-                sandy.os,
-                "execvpe",
-                side_effect=RuntimeError("exec called"),
-            ) as explicit_exec:
-                with self.assertRaisesRegex(RuntimeError, "exec called"):
-                    sandy._run_secure_subprocess_pty(
-                        ["tool", "argument"],
-                        master_read=MagicMock(),
-                        stdin_read=MagicMock(),
-                        environment=environment,
-                    )
+            # This process takes the child branch; keep its descriptors.
+            with patch.object(sandy, "_close_inherited_fds"):
+                with patch.object(
+                    sandy.os,
+                    "execvpe",
+                    side_effect=RuntimeError("exec called"),
+                ) as explicit_exec:
+                    with self.assertRaisesRegex(RuntimeError, "exec called"):
+                        sandy._run_secure_subprocess_pty(
+                            ["tool", "argument"],
+                            master_read=MagicMock(),
+                            stdin_read=MagicMock(),
+                            environment=environment,
+                        )
 
         explicit_exec.assert_called_once_with(
             "tool",

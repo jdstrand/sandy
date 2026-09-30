@@ -460,6 +460,18 @@ def _attach_hangup_handlers() -> Iterator[None]:
                 signal.signal(signum, handler)
 
 
+def _close_inherited_fds(keep: Tuple[int, ...]) -> None:
+    """Close every open descriptor except stdin, stdout, stderr, and keep.
+
+    pty.fork() keeps each descriptor of the parent that has no close-on-exec
+    flag, and execve keeps them too. subprocess closes them (close_fds=True);
+    do the same, so that a child gets only what its caller passes. The entry
+    helper refuses to run with any other descriptor.
+    """
+    for fd in sorted(_open_fds() - {0, 1, 2} - set(keep)):
+        os.close(fd)
+
+
 def _run_secure_subprocess_pty(
     cmd: list,
     *,
@@ -494,6 +506,7 @@ def _run_secure_subprocess_pty(
     if pid == 0:
         # Child process - exec the command
         try:
+            _close_inherited_fds(inherited_fds)
             for fd in inherited_fds:
                 os.set_inheritable(fd, True)
             os.execvpe(cmd[0], cmd, child_environment)
