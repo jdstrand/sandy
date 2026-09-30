@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import signal
 import stat
@@ -14,7 +15,7 @@ import unittest
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from tests.e2e.support import (
     ACL_PROMPT_ANSWERS,
@@ -29,16 +30,20 @@ from tests.e2e.support import (
     FilesystemFixtureIdentity,
 )
 from tests.e2e.test_confinement import (
+    PTRACE_CONT,
+    PTRACE_FORK_OPTIONS,
+    PTRACE_GETEVENTMSG,
     START_ATTACHES_AFTER_UP,
     _entry_failure_reason,
     _has_payload,
+    _hold_payload_at_fork,
     _machined_leader,
     _open_scope_process,
     _Session,
     _StartSampler,
 )
 from tests.e2e.test_network import _wait_for_public_https
-from tests.e2e.test_scope import _has_new_only_child
+from tests.e2e.test_scope import _has_new_only_child, _leaves, _read_cgroup_file
 
 
 class CleanupProbeContext(E2EContext):
@@ -643,6 +648,141 @@ class LeaderHoldTests(unittest.TestCase):
                     Path, "read_text", autospec=True, side_effect=read_text
                 ):
                     self.assertEqual(_has_payload(42), expected)
+
+
+class PayloadForkHoldTests(unittest.TestCase):
+    """The S2 case holds the payload at its fork and releases the Leader.
+
+    Mocks: sandy's ptrace helpers (a namespace object), os.waitpid, the
+    payload checks, the pidfd check, and the poll sleep.
+    """
+
+    SEIZE = 0x4206
+    DETACH = 17
+    WALL = 0x40000000
+
+    def fake_sandy(self, events: "list[int]") -> SimpleNamespace:
+        """Return sandy's ptrace helpers; GETEVENTMSG gives the forked child."""
+        calls: list = []
+
+        def entry_syscall(name, request, pid, addr=0, data=0):
+            calls.append((request, pid, data if request != PTRACE_GETEVENTMSG else 0))
+            if request == PTRACE_GETEVENTMSG:
+                ctypes.c_ulong.from_address(data).value = events.pop(0)
+            return 0
+
+        return SimpleNamespace(
+            calls=calls,
+            _entry_syscall=entry_syscall,
+            PTRACE_SEIZE=self.SEIZE,
+            PTRACE_DETACH=self.DETACH,
+            WAIT_ALL=self.WALL,
+            _stop_seized_tracee=MagicMock(return_value=10),
+            _ptrace_detach=MagicMock(),
+        )
+
+    def hold(self, sandy, waits, payloads, existing=False, alive=True):
+        with patch(
+            "tests.e2e.test_confinement.os.waitpid", side_effect=waits
+        ) as waitpid, patch(
+            "tests.e2e.test_confinement._has_payload", return_value=existing
+        ), patch(
+            "tests.e2e.test_confinement._is_payload",
+            side_effect=lambda pid, leader: pid in payloads,
+        ), patch(
+            "tests.e2e.test_confinement._pidfd_alive", return_value=alive
+        ), patch(
+            "tests.e2e.test_confinement.time.sleep"
+        ):
+            return _hold_payload_at_fork(sandy, 42, 5), waitpid
+
+    @staticmethod
+    def event_stop(event: int) -> int:
+        return (event << 16) | (signal.SIGTRAP << 8) | 0x7F
+
+    def test_returns_0_and_releases_a_leader_that_has_its_payload(self):
+        sandy = self.fake_sandy([])
+        result, waitpid = self.hold(sandy, [], set(), existing=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(sandy.calls, [(self.SEIZE, 42, PTRACE_FORK_OPTIONS)])
+        waitpid.assert_not_called()
+        # The Leader runs, so it is stopped first; its signal is given back.
+        sandy._stop_seized_tracee.assert_called_once_with(42)
+        sandy._ptrace_detach.assert_called_once_with(42, 10)
+
+    def test_holds_the_payload_and_releases_the_leader_at_the_fork(self):
+        sandy = self.fake_sandy([90, 77])
+        waits = [
+            (0, 0),
+            # A signal-delivery-stop: the signal goes back to the Leader.
+            (42, (signal.SIGCHLD << 8) | 0x7F),
+            (42, self.event_stop(1)),
+            (90, self.event_stop(128)),
+            (42, self.event_stop(3)),
+            (77, self.event_stop(128)),
+        ]
+        result, waitpid = self.hold(sandy, waits, {77})
+        self.assertEqual(result, 77)
+        self.assertEqual(
+            sandy.calls,
+            [
+                (self.SEIZE, 42, PTRACE_FORK_OPTIONS),
+                (PTRACE_CONT, 42, signal.SIGCHLD),
+                (PTRACE_GETEVENTMSG, 42, 0),
+                # Another child is released at once.
+                (self.DETACH, 90, 0),
+                (PTRACE_CONT, 42, 0),
+                (PTRACE_GETEVENTMSG, 42, 0),
+            ],
+        )
+        self.assertEqual(waitpid.call_args_list[-1], call(77, self.WALL))
+        # The Leader is in its fork stop, so it needs no interrupt.
+        sandy._stop_seized_tracee.assert_not_called()
+        sandy._ptrace_detach.assert_called_once_with(42, 0)
+
+    def test_fails_when_the_leader_exits_or_is_gone(self):
+        sandy = self.fake_sandy([])
+        sandy._stop_seized_tracee.side_effect = ProcessLookupError("gone")
+        with self.assertRaisesRegex(E2EFailure, "exited before its payload"):
+            self.hold(sandy, [(42, 0)], set())
+        sandy._ptrace_detach.assert_not_called()
+        sandy = self.fake_sandy([])
+        with self.assertRaisesRegex(E2EFailure, "exited before the seize"):
+            self.hold(sandy, [], set(), alive=False)
+        sandy._ptrace_detach.assert_called_once_with(42, 10)
+
+
+class CgroupPollTests(unittest.TestCase):
+    """The scope tests poll attach leaves that sandy removes meanwhile.
+
+    Mocks: Path.read_text raises the errors of a removed cgroup. The
+    directory listing is a real temporary directory.
+    """
+
+    def test_a_cgroup_removed_during_the_read_is_skipped(self):
+        # Regression test: a leaf removed between the open and the read gave
+        # OSError ENODEV, which failed "the last attach out stops the
+        # container, once" on systemd 257.
+        leaf = "attach-" + "0" * 32
+        with tempfile.TemporaryDirectory() as temp_dir:
+            unit_dir = Path(temp_dir)
+            (unit_dir / leaf).mkdir()
+            for error in (FileNotFoundError(2, "x"), OSError(19, "No such device")):
+                with self.subTest(error=error):
+                    with patch(
+                        "tests.e2e.test_scope._unit_dir", return_value=unit_dir
+                    ), patch.object(Path, "read_text", side_effect=error):
+                        self.assertEqual(_leaves("e2e-scope-1"), {})
+
+    def test_other_read_errors_are_not_hidden(self):
+        with patch.object(Path, "read_text", side_effect=OSError(13, "denied")):
+            with self.assertRaises(OSError):
+                _read_cgroup_file(Path("/sys/fs/cgroup/x/cgroup.events"))
+        with patch.object(Path, "read_text", return_value="populated 1\n"):
+            self.assertEqual(
+                _read_cgroup_file(Path("/sys/fs/cgroup/x/cgroup.events")),
+                "populated 1\n",
+            )
 
 
 class KeepaliveRestartTests(unittest.TestCase):

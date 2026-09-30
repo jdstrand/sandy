@@ -490,9 +490,16 @@ systemd-run --scope --quiet --unit=sandy-<name>.scope --slice=system.slice \
   `NOTIFY_SOCKET`, `LANG`, `container_host_version_id`, `container_host_id`).
   So the image cannot set `BASH_ENV` for PID 2, and the non-interactive bash
   reads no startup file.
-- sandy removes the host directory once the container is ready. A running
-  PID 2 does not need it: bash keeps its open fd on the deleted script, and
-  the symlink was resolved at exec (tests 8 and 10).
+- sandy removes the host directory once PID 2 has opened the script. After
+  the container is ready, `up` waits up to 10 s until a descriptor of PID 2
+  links to `/run/sandy/keepalive.sh` (read with `readlink` on the host
+  `/proc/<pid>/fd`). From then on PID 2 does not need the directory: bash
+  keeps its open fd on the deleted script, and the symlink was resolved at
+  exec (tests 8 and 10). A ready container proves only that PID 2 exists.
+  Measured with PID 2 held at its fork, before execve, on systemd 249, 255,
+  and 257 with the Debian trixie and Ubuntu 26.04 images: without the wait,
+  `up` removed the directory and returned, and the container stopped when
+  PID 2 ran.
 - Security: the payload runs as container root. With `--user=root`, the stub
   PID 1 also runs as container root for the container's whole life. Container root is an
   unprivileged host UID, limited by nspawn's bounding set and seccomp. The
@@ -899,9 +906,9 @@ with at least two images: the default (Debian trixie) and Ubuntu 26.04
 2. The keepalive: PID 2 has `comm=sandy-keepalive`, runs as container root,
    has no `BASH_ENV`, and UID 1000 cannot send it signals. A killed `sleep`
    child is restarted. The host directory (mode 0755, two entries) is removed
-   after the container is ready. `up` works when the host temporary directory
-   is `noexec`. An image without `sleep` in `PATH` makes `up` fail with a
-   clear error, and the keepalive does not spin. The `noexec` and
+   after PID 2 has opened the script. `up` works when the host temporary
+   directory is `noexec`. An image without `sleep` in `PATH` makes `up` fail
+   with a clear error, and the keepalive does not spin. The `noexec` and
    missing-`sleep` cases were checked by hand; the E2E suite does not cover
    them.
 3. `sandy -c <name> bash` and `exec` through the B2 path.

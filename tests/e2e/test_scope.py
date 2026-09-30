@@ -6,6 +6,7 @@ processes, so unit mocks cannot prove them.
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import signal
@@ -47,6 +48,23 @@ def _systemd_version(context: E2EContext) -> int:
     return int(first.split()[1])
 
 
+def _read_cgroup_file(path: Path) -> str | None:
+    """Return the text of a cgroup file, or None when its cgroup is gone.
+
+    sandy removes attach leaves while the tests poll them. A removal before
+    the open gives ENOENT; a removal between the open and the read gives
+    ENODEV (seen on systemd 257).
+    """
+    try:
+        return path.read_text(encoding="ascii")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno != errno.ENODEV:
+            raise
+        return None
+
+
 def _leaves(name: str) -> dict[str, bool]:
     """Return each attach leaf of the scope and whether it has processes."""
     unit_dir = _unit_dir(name)
@@ -55,11 +73,9 @@ def _leaves(name: str) -> dict[str, bool]:
     leaves = {}
     for path in unit_dir.iterdir():
         if ATTACH_LEAF.fullmatch(path.name):
-            try:
-                events = (path / "cgroup.events").read_text(encoding="ascii")
-            except FileNotFoundError:
-                continue
-            leaves[path.name] = "populated 1" in events
+            events = _read_cgroup_file(path / "cgroup.events")
+            if events is not None:
+                leaves[path.name] = "populated 1" in events
     return leaves
 
 
@@ -118,11 +134,8 @@ def _wait_for(description: str, predicate, timeout: float = WAIT_TIMEOUT) -> Non
 
 
 def _pids_with_comm_in_cgroup(name: str, leaf: str) -> list[int]:
-    procs = _unit_dir(name) / leaf / "cgroup.procs"
-    try:
-        return [int(value) for value in procs.read_text().split()]
-    except FileNotFoundError:
-        return []
+    text = _read_cgroup_file(_unit_dir(name) / leaf / "cgroup.procs")
+    return [int(value) for value in (text or "").split()]
 
 
 def _wait_for_leaf_commands(

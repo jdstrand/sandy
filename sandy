@@ -66,6 +66,8 @@ KEEPALIVE_MOUNT: Final = "/run/sandy"
 KEEPALIVE_LINK_NAME: Final = "sandy-keepalive"
 KEEPALIVE_COPY_NAME: Final = "keepalive.sh"
 KEEPALIVE_SHELL: Final = "/bin/bash"
+# The payload's path of the script copy, in the container's mount namespace.
+KEEPALIVE_SCRIPT_PATH: Final = f"{KEEPALIVE_MOUNT}/{KEEPALIVE_COPY_NAME}"
 # nspawn runs in the transient scope sandy-<name>.scope in system.slice, not
 # in the cgroup of the terminal that runs sandy.
 SUPERVISOR_UNIT_PREFIX: Final = "sandy-"
@@ -75,6 +77,10 @@ SYSTEMCTL_VALUE_MAX_LENGTH: Final = 4096
 UNIT_STATE_PATTERN: Final = re.compile(r"[a-z][a-z-]{0,31}")
 CONTAINER_READY_TIMEOUT: Final = 60
 CONTAINER_READY_INTERVAL: Final = 0.5
+# After the container is ready, the wait until the payload has opened the
+# keepalive script, so that the script's host directory can go.
+KEEPALIVE_OPEN_TIMEOUT: Final = 10
+KEEPALIVE_OPEN_INTERVAL: Final = 0.05
 ATTACH_HANGUP_SIGNALS: Final = (signal.SIGHUP, signal.SIGTERM)
 CONTAINER_STOP_TIMEOUT: Final = 30
 # Bounded so that a stop under the lifecycle lock (10 s wait for others)
@@ -2035,6 +2041,8 @@ SECCOMP_FILTERS_LINE_PATTERN: Final = re.compile(
 )
 PROC_STATUS_MAX_BYTES: Final = 65536
 PROC_READ_CHUNK_BYTES: Final = 4096
+PROC_FD_NAME_PATTERN: Final = re.compile(r"0|[1-9][0-9]{0,9}")
+PROC_FD_MAX_ENTRIES: Final = 1024
 # nspawn --as-pid2 --user=root starts the payload as PID 2 of the container.
 CONTAINER_PAYLOAD_PID: Final = 2
 
@@ -2166,8 +2174,8 @@ def _parse_payload_status(
     )
 
 
-def _find_payload_confinement(proc_fd: int, leader_pid: int) -> ProcessConfinement:
-    """Return the confinement of the container payload, a child of the Leader.
+def _find_payload(proc_fd: int, leader_pid: int) -> Tuple[int, ProcessConfinement]:
+    """Return the host PID and the confinement of the container payload.
 
     nspawn starts the payload only after it has installed the filters and set
     the bounding set on the Leader. So while no payload exists, the container
@@ -2190,8 +2198,61 @@ def _find_payload_confinement(proc_fd: int, leader_pid: int) -> ProcessConfineme
             os.close(child_fd)
         payload = _parse_payload_status(status_text, child, leader_pid)
         if payload is not None:
-            return payload
+            return child, payload
     raise ProcessLookupError("Container is still starting; try again")
+
+
+def _process_has_open_path(proc_fd: int, path: str) -> bool:
+    """Return whether the process of a host /proc/<pid> directory has path open.
+
+    Compare the target of each /proc/<pid>/fd link with path. readlink does
+    not open or stat the target, so no file of the container can make this
+    read block. The target is the path in the process's mount namespace.
+    """
+    fd_dir = os.open("fd", DIRECTORY_OPEN_FLAGS, dir_fd=proc_fd)
+    try:
+        names = os.listdir(fd_dir)
+        if len(names) > PROC_FD_MAX_ENTRIES:
+            raise ValueError("Process has too many open descriptors")
+        for name in names:
+            if not PROC_FD_NAME_PATTERN.fullmatch(name):
+                raise ValueError("Malformed process descriptor entry")
+            try:
+                target = os.readlink(name, dir_fd=fd_dir)
+            except FileNotFoundError:
+                # The process closed this descriptor after the listing.
+                continue
+            if target == path:
+                return True
+    finally:
+        os.close(fd_dir)
+    return False
+
+
+def _payload_has_opened_keepalive(machine_name: str) -> bool:
+    """Return whether the container payload has the keepalive script open.
+
+    Until then, the payload needs the keepalive files: execve resolves the
+    symlink, and bash opens the script after it starts. A ready container
+    proves only that the payload exists (see _find_payload).
+    """
+    leader_pid = _query_machine_leader(machine_name)
+    leader_fd = _open_process_dir(leader_pid)
+    try:
+        payload_pid, _ = _find_payload(leader_fd, leader_pid)
+    finally:
+        os.close(leader_fd)
+    payload_fd = _open_process_dir(payload_pid)
+    try:
+        # The payload can exit, and its PID can go to a new process, after
+        # the search. The status read through payload_fd confirms that the
+        # descriptor is the payload's, so the fd listing below is too.
+        status_text = _read_process_status(payload_fd)
+        if _parse_payload_status(status_text, payload_pid, leader_pid) is None:
+            raise ProcessLookupError("Container payload changed")
+        return _process_has_open_path(payload_fd, KEEPALIVE_SCRIPT_PATH)
+    finally:
+        os.close(payload_fd)
 
 
 def _pidfd_process_alive(pidfd: int) -> bool:
@@ -2565,7 +2626,7 @@ def _extract_leader_confinement(
                 # earlier Sandy started has no payload at PID 2, and it needs
                 # a restart, not a retry.
                 _require_scope_payload_cgroup(_read_process_cgroup(proc_fd), unit)
-                payload = _find_payload_confinement(proc_fd, pid)
+                _, payload = _find_payload(proc_fd, pid)
                 namespace_fds = []
                 for name, _ in NAMESPACE_ENTRY_ORDER:
                     # ns/<name> are kernel magic links, anchored at the pinned
@@ -6471,6 +6532,25 @@ class Sandy:
             time.sleep(min(CONTAINER_READY_INTERVAL, remaining))
         return False
 
+    def _wait_for_keepalive_open(self, supervisor: subprocess.Popen) -> bool:
+        """Wait until the payload has opened the keepalive script.
+
+        Return False when the supervisor exits or the wait times out. A
+        failed check is retried: the payload can still be in execve.
+        """
+        deadline = time.monotonic() + KEEPALIVE_OPEN_TIMEOUT
+        while supervisor.poll() is None:
+            try:
+                if _payload_has_opened_keepalive(self.container):
+                    return True
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(KEEPALIVE_OPEN_INTERVAL, remaining))
+        return False
+
     def _validate_container_ip_for_network(self, container_ip: str) -> str:
         """Verify a parsed container IP belongs to the active Sandy network."""
         network_cidr = self.network.network_cidr if self.network else None
@@ -7455,7 +7535,7 @@ class Sandy:
             cmd.extend(
                 [
                     f"{KEEPALIVE_MOUNT}/{KEEPALIVE_LINK_NAME}",
-                    f"{KEEPALIVE_MOUNT}/{KEEPALIVE_COPY_NAME}",
+                    KEEPALIVE_SCRIPT_PATH,
                 ]
             )
             scope_cmd = (
@@ -7507,8 +7587,11 @@ class Sandy:
                 ready = self._wait_for_container_ready(
                     spinner_line_event=spinner_line_event, supervisor=supervisor
                 )
-                # A running payload keeps its open script; it needs no bind
-                # source.
+                # A ready container proves only that the payload exists. It
+                # needs the bind source until bash has opened the script;
+                # after that, bash keeps the open script.
+                if ready:
+                    ready = self._wait_for_keepalive_open(supervisor)
                 cleanup_keepalive()
                 if not ready:
                     _finish_spinner_line(spinner_line_event)
