@@ -9,6 +9,7 @@ sandy, so unit mocks cannot prove them.
 from __future__ import annotations
 
 import base64
+import ctypes
 import importlib.machinery
 import importlib.util
 import json
@@ -46,6 +47,15 @@ START_TIMEOUT = 300
 HOLD_ATTEMPTS = 3
 HOLD_STOP_TIMEOUT = 10
 MACHINES_STATE = Path("/run/systemd/machines")
+# <linux/ptrace.h>: requests, options, and events that hold the payload at its
+# fork. sandy defines PTRACE_SEIZE and PTRACE_DETACH.
+PTRACE_CONT = 7
+PTRACE_GETEVENTMSG = 0x4201
+PTRACE_FORK_OPTIONS = 0x02 | 0x04 | 0x08
+PTRACE_FORK_EVENTS = (1, 2, 3)
+# Without the S2 fix, up returned in this time after an attach worked.
+KEEPALIVE_HOLD_SECONDS = 3
+KEEPALIVE_DIR_GLOB = "sandy-keepalive-*"
 # aarch64 has 7 of the 10 denied syscalls, and 5.15 hides bpf.
 MIN_OBSERVABLE_DENIED = 6
 # Denied by Docker's default profile and by nspawn's filter; the nsenter path
@@ -321,6 +331,13 @@ def _machined_leader(name: str) -> int:
     return 0
 
 
+def _pidfd_alive(pidfd: int) -> bool:
+    """Return whether the process of pidfd has not exited."""
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    return not poller.poll(0)
+
+
 def _open_scope_process(pid: int, unit: str) -> int:
     """Return a pidfd for pid after a check that pid runs in unit's cgroup.
 
@@ -333,9 +350,7 @@ def _open_scope_process(pid: int, unit: str) -> int:
         scope = f"0::/system.slice/{unit}"
         if cgroup != scope and not cgroup.startswith(scope + "/"):
             raise E2EFailure(f"PID {pid} is not in {unit}: {cgroup!r}")
-        poller = select.poll()
-        poller.register(pidfd, select.POLLIN)
-        if poller.poll(0):
+        if not _pidfd_alive(pidfd):
             raise E2EFailure(f"PID {pid} exited during the check")
     except BaseException:
         os.close(pidfd)
@@ -349,25 +364,81 @@ def _process_state(pid: int) -> str:
     return text.rsplit(")", 1)[1].split()[0]
 
 
+def _is_payload(pid: int, leader: int) -> bool:
+    """Return whether pid is the Leader's child with container PID 2."""
+    try:
+        text = Path(f"/proc/{pid}/status").read_text(encoding="ascii", errors="replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    fields = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        fields[key] = value.split()
+    return fields.get("PPid") == [str(leader)] and fields.get("NSpid") == [
+        str(pid),
+        "2",
+    ]
+
+
 def _has_payload(leader: int) -> bool:
     """Return whether the Leader has a child with container PID 2."""
-    for child in _children(leader):
+    return any(_is_payload(child, leader) for child in _children(leader))
+
+
+def _hold_payload_at_fork(sandy: ModuleType, leader: int, pidfd: int) -> int:
+    """Hold the payload in its first ptrace stop, before it runs execve.
+
+    Seize the Leader with the fork options and wait for the fork of its
+    child with container PID 2. Release the Leader at once, so that an
+    attach can seize it. Return the payload, which stays stopped until the
+    caller detaches it, or 0 when the payload already existed. pidfd pins
+    the Leader: it is alive after the seize, so the seized process is the
+    Leader.
+    """
+
+    def ptrace(request: int, pid: int, addr: int = 0, data: int = 0) -> int:
+        return sandy._entry_syscall("ptrace", request, pid, addr, data)
+
+    ptrace(sandy.PTRACE_SEIZE, leader, 0, PTRACE_FORK_OPTIONS)
+    stopped = False
+    try:
+        if not _pidfd_alive(pidfd):
+            raise E2EFailure("The Leader exited before the seize")
+        if _has_payload(leader):
+            return 0
+        deadline = time.monotonic() + START_TIMEOUT
+        while time.monotonic() < deadline:
+            pid, status = os.waitpid(leader, sandy.WAIT_ALL | os.WNOHANG)
+            if pid == 0:
+                time.sleep(0.001)
+                continue
+            if not os.WIFSTOPPED(status):
+                raise E2EFailure("The Leader exited before its payload started")
+            stopped = True
+            event = status >> 16
+            signal_number = 0
+            if event in PTRACE_FORK_EVENTS:
+                message = ctypes.c_ulong()
+                ptrace(PTRACE_GETEVENTMSG, leader, 0, ctypes.addressof(message))
+                child = message.value
+                # The new child starts traced, in a ptrace stop.
+                os.waitpid(child, sandy.WAIT_ALL)
+                if _is_payload(child, leader):
+                    return child
+                ptrace(sandy.PTRACE_DETACH, child)
+            elif not event:
+                # Give back the signal that a signal-delivery-stop took.
+                signal_number = os.WSTOPSIG(status)
+            ptrace(PTRACE_CONT, leader, 0, signal_number)
+            stopped = False
+        raise E2EFailure("The Leader did not start its payload")
+    finally:
         try:
-            text = Path(f"/proc/{child}/status").read_text(
-                encoding="ascii", errors="replace"
-            )
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        fields = {}
-        for line in text.splitlines():
-            key, _, value = line.partition(":")
-            fields[key] = value.split()
-        if fields.get("PPid") == [str(leader)] and fields.get("NSpid") == [
-            str(child),
-            "2",
-        ]:
-            return True
-    return False
+            signal_number = 0 if stopped else sandy._stop_seized_tracee(leader)
+            sandy._ptrace_detach(leader, signal_number)
+        except OSError:
+            # The Leader exited, which ended the trace.
+            pass
 
 
 def _entry_failure_reason(output: str) -> str:
@@ -795,4 +866,84 @@ def test_main(context: E2EContext) -> None:
             )
         print(f"    held before the payload in start {held_in}", flush=True)
         context.wait_for_machine(context.main_name, running=True)
+        _exec(context, "true")
+
+    with context.case("the keepalive files stay until the payload opened its script"):
+        # Review finding S2: up removed the keepalive files as soon as an
+        # attach worked, before the payload had started the keepalive. Hold
+        # the payload at its fork, before execve: an attach works, and up
+        # must wait and keep the files. Then release it.
+        unit = f"sandy-{context.main_name}.scope"
+        # sandy gets no TMPDIR from the E2E environment.
+        tmp = Path("/tmp")
+        held_in = 0
+        for attempt in range(1, HOLD_ATTEMPTS + 1):
+            context.stop_container(context.main_name, context.main_user)
+            print(f"    $ {shlex.join(up_arguments)}", flush=True)
+            keepalive_log = context.root / f"keepalive-up-{attempt}.log"
+            with keepalive_log.open("w", encoding="utf-8") as stream:
+                up = subprocess.Popen(
+                    up_arguments,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=context.root,
+                    env=start_environment,
+                )
+            try:
+                leader = 0
+                deadline = time.monotonic() + START_TIMEOUT
+                while not leader and up.poll() is None:
+                    if time.monotonic() > deadline:
+                        raise E2EFailure("The container did not register")
+                    leader = _machined_leader(context.main_name)
+                if not leader:
+                    raise E2EFailure(f"up exited {up.returncode} before registration")
+                pidfd = _open_scope_process(leader, unit)
+                try:
+                    payload = _hold_payload_at_fork(sandy, leader, pidfd)
+                finally:
+                    os.close(pidfd)
+                if payload:
+                    held_in = attempt
+                    try:
+                        # The readiness probe of up is an attach too.
+                        _exec(context, "true")
+                        time.sleep(KEEPALIVE_HOLD_SECONDS)
+                        if up.poll() is not None:
+                            raise E2EFailure(
+                                "up returned before the payload opened its script"
+                            )
+                        held_dirs = sorted(tmp.glob(KEEPALIVE_DIR_GLOB))
+                        if len(held_dirs) != 1:
+                            raise E2EFailure(
+                                f"Keepalive directories while held: {held_dirs!r}"
+                            )
+                    finally:
+                        sandy._ptrace_detach(payload)
+                returncode = up.wait(timeout=START_TIMEOUT)
+            finally:
+                if up.poll() is None:
+                    up.kill()
+                    up.wait(timeout=10)
+            if returncode != 0:
+                output = keepalive_log.read_text(encoding="utf-8", errors="replace")
+                raise E2EFailure(f"up -d exited {returncode}: {output[-2000:]}")
+            if held_in:
+                break
+        if not held_in:
+            raise E2EFailure(
+                f"The payload existed at the seize in all {HOLD_ATTEMPTS} starts"
+            )
+        print(f"    held the payload at its fork in start {held_in}", flush=True)
+        context.wait_for_machine(context.main_name, running=True)
+        new_leader = context.machine_leader(context.main_name)
+        if new_leader is None:
+            raise E2EFailure("The container stopped after the payload was released")
+        comm = Path(f"/proc/{_payload_pid(int(new_leader))}/comm").read_text()
+        if comm.strip() != "sandy-keepalive":
+            raise E2EFailure(f"Payload comm is {comm.strip()!r}")
+        leftovers = sorted(tmp.glob(KEEPALIVE_DIR_GLOB))
+        if leftovers:
+            raise E2EFailure(f"Keepalive directories remain: {leftovers!r}")
         _exec(context, "true")

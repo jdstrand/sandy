@@ -3929,7 +3929,7 @@ class LeaderExtractionTests(unittest.TestCase):
             finally:
                 os.close(leader_fd)
 
-    def test_find_payload_confinement_finds_pid_2_among_orphans(self):
+    def test_find_payload_finds_pid_2_among_orphans(self):
         statuses = {
             90: self.payload_status(nspid="90\t14", filters="9"),
             77: self.payload_status(),
@@ -3937,13 +3937,13 @@ class LeaderExtractionTests(unittest.TestCase):
         }
         with self.fake_proc(b"90 77 91 ", statuses) as (leader_fd, opened):
             self.assertEqual(
-                sandy._find_payload_confinement(leader_fd, 42),
-                sandy.ProcessConfinement(2, 0xFDECBFFF),
+                sandy._find_payload(leader_fd, 42),
+                (77, sandy.ProcessConfinement(2, 0xFDECBFFF)),
             )
         # The search stops at the payload; it reads no later child.
         self.assertEqual(opened.call_args_list, [call(90), call(77)])
 
-    def test_find_payload_confinement_reads_no_child_after_the_payload(self):
+    def test_find_payload_reads_no_child_after_the_payload(self):
         # Container root can give an adopted orphan a status that is too
         # large to read (many supplementary groups). The orphan comes after
         # the payload, so it cannot make the attach fail.
@@ -3953,15 +3953,15 @@ class LeaderExtractionTests(unittest.TestCase):
         }
         with self.fake_proc(b"77 90 ", statuses) as (leader_fd, opened):
             self.assertEqual(
-                sandy._find_payload_confinement(leader_fd, 42),
-                sandy.ProcessConfinement(2, 0xFDECBFFF),
+                sandy._find_payload(leader_fd, 42),
+                (77, sandy.ProcessConfinement(2, 0xFDECBFFF)),
             )
         self.assertEqual(opened.call_args_list, [call(77)])
         with self.fake_proc(b"90 77 ", statuses) as (leader_fd, _):
             with self.assertRaisesRegex(ValueError, "too large"):
-                sandy._find_payload_confinement(leader_fd, 42)
+                sandy._find_payload(leader_fd, 42)
 
-    def test_find_payload_confinement_fails_closed_while_starting(self):
+    def test_find_payload_fails_closed_while_starting(self):
         cases = (
             ("no children", b"", {}),
             ("only an orphan", b"90 ", {90: self.payload_status(nspid="90\t3")}),
@@ -3984,9 +3984,9 @@ class LeaderExtractionTests(unittest.TestCase):
             with self.subTest(label=label):
                 with self.fake_proc(children, statuses) as (leader_fd, _):
                     with self.assertRaisesRegex(ProcessLookupError, "still starting"):
-                        sandy._find_payload_confinement(leader_fd, 42)
+                        sandy._find_payload(leader_fd, 42)
 
-    def test_find_payload_confinement_skips_a_child_that_exits(self):
+    def test_find_payload_skips_a_child_that_exits(self):
         statuses = {90: self.payload_status(nspid="90\t3"), 77: self.payload_status()}
         real_read = sandy._read_process_status
         # The first child exits between its directory open and its status read.
@@ -4000,11 +4000,11 @@ class LeaderExtractionTests(unittest.TestCase):
         with self.fake_proc(b"90 77 ", statuses) as (leader_fd, _):
             with patch.object(sandy, "_read_process_status", side_effect=read_status):
                 self.assertEqual(
-                    sandy._find_payload_confinement(leader_fd, 42),
-                    sandy.ProcessConfinement(2, 0xFDECBFFF),
+                    sandy._find_payload(leader_fd, 42),
+                    (77, sandy.ProcessConfinement(2, 0xFDECBFFF)),
                 )
 
-    def test_find_payload_confinement_leaks_no_descriptor(self):
+    def test_find_payload_leaks_no_descriptor(self):
         statuses = {
             90: self.payload_status(nspid="90\t3"),
             77: self.payload_status(),
@@ -4015,20 +4015,182 @@ class LeaderExtractionTests(unittest.TestCase):
                 with self.fake_proc(children, statuses) as (leader_fd, _):
                     before = sandy._open_fds()
                     try:
-                        sandy._find_payload_confinement(leader_fd, 42)
+                        sandy._find_payload(leader_fd, 42)
                     except ProcessLookupError:
                         pass
                     self.assertEqual(sandy._open_fds(), before)
 
-    def test_find_payload_confinement_fails_closed_on_bad_data(self):
+    def test_find_payload_fails_closed_on_bad_data(self):
         payload = {77: self.payload_status()}
         malformed = {77: self.payload_status(filters="x")}
         with self.fake_proc(b"77 ", malformed) as (leader_fd, _):
             with self.assertRaises(ValueError):
-                sandy._find_payload_confinement(leader_fd, 42)
+                sandy._find_payload(leader_fd, 42)
         with self.fake_proc(b"77", payload) as (leader_fd, _):
             with self.assertRaisesRegex(ValueError, "children list"):
-                sandy._find_payload_confinement(leader_fd, 42)
+                sandy._find_payload(leader_fd, 42)
+
+    def fd_links(self, proc_dir: str, links: "Mapping[str, str]") -> None:
+        """Create /proc/<pid>/fd entries; a symlink stands in for a magic link."""
+        fd_dir = Path(proc_dir, "fd")
+        fd_dir.mkdir(exist_ok=True)
+        for name, target in links.items():
+            os.symlink(target, fd_dir / name)
+
+    def test_process_has_open_path_compares_link_targets(self):
+        script = sandy.KEEPALIVE_SCRIPT_PATH
+        self.assertEqual(script, "/run/sandy/keepalive.sh")
+        cases = (
+            ({"0": "/dev/pts/0", "1": "pipe:[81]", "255": script}, True),
+            ({"0": "/dev/pts/0", "1": "pipe:[81]"}, False),
+            # The copy was removed after the open.
+            ({"255": script + " (deleted)"}, False),
+            ({"3": "/run/sandy/keepalive.shx", "4": "run/sandy/keepalive.sh"}, False),
+            ({}, False),
+        )
+        for links, expected in cases:
+            with self.subTest(links=links):
+                with tempfile.TemporaryDirectory() as proc_dir:
+                    self.fd_links(proc_dir, links)
+                    proc_fd = os.open(proc_dir, sandy.DIRECTORY_OPEN_FLAGS)
+                    try:
+                        before = sandy._open_fds()
+                        self.assertEqual(
+                            sandy._process_has_open_path(proc_fd, script), expected
+                        )
+                        self.assertEqual(sandy._open_fds(), before)
+                    finally:
+                        os.close(proc_fd)
+
+    def test_process_has_open_path_fails_closed_on_bad_entries(self):
+        script = sandy.KEEPALIVE_SCRIPT_PATH
+        for links in ({"x": script}, {"01": script}, {"-1": script}):
+            with self.subTest(links=links):
+                with tempfile.TemporaryDirectory() as proc_dir:
+                    self.fd_links(proc_dir, links)
+                    proc_fd = os.open(proc_dir, sandy.DIRECTORY_OPEN_FLAGS)
+                    try:
+                        with self.assertRaises(ValueError):
+                            sandy._process_has_open_path(proc_fd, script)
+                    finally:
+                        os.close(proc_fd)
+        with tempfile.TemporaryDirectory() as proc_dir:
+            self.fd_links(proc_dir, {"0": "a", "1": "b", "2": script})
+            proc_fd = os.open(proc_dir, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(sandy, "PROC_FD_MAX_ENTRIES", 2):
+                    with self.assertRaisesRegex(ValueError, "too many"):
+                        sandy._process_has_open_path(proc_fd, script)
+            finally:
+                os.close(proc_fd)
+        # A process that has exited has no fd directory.
+        with tempfile.TemporaryDirectory() as proc_dir:
+            proc_fd = os.open(proc_dir, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with self.assertRaises(FileNotFoundError):
+                    sandy._process_has_open_path(proc_fd, script)
+            finally:
+                os.close(proc_fd)
+
+    def test_process_has_open_path_skips_a_closed_descriptor(self):
+        # Mocks: os.readlink fails for fd 3, as when the process closes it
+        # after the listing. The listing order is not fixed.
+        script = sandy.KEEPALIVE_SCRIPT_PATH
+        real_readlink = os.readlink
+
+        def readlink(name, *, dir_fd):
+            if name == "3":
+                raise FileNotFoundError(name)
+            return real_readlink(name, dir_fd=dir_fd)
+
+        for links, expected in (
+            ({"3": "/tmp/gone"}, False),
+            ({"3": "/tmp/gone", "255": script}, True),
+        ):
+            with self.subTest(links=links):
+                with tempfile.TemporaryDirectory() as proc_dir:
+                    self.fd_links(proc_dir, links)
+                    proc_fd = os.open(proc_dir, sandy.DIRECTORY_OPEN_FLAGS)
+                    try:
+                        with patch.object(
+                            sandy.os, "readlink", side_effect=readlink
+                        ) as mocked:
+                            self.assertEqual(
+                                sandy._process_has_open_path(proc_fd, script),
+                                expected,
+                            )
+                    finally:
+                        os.close(proc_fd)
+                    if not expected:
+                        mocked.assert_called_once_with("3", dir_fd=ANY)
+
+    @contextmanager
+    def keepalive_proc(
+        self,
+        children: bytes,
+        payload_links: "Mapping[str, str]",
+        reused_status: "str | None" = None,
+    ) -> Iterator[MagicMock]:
+        """Fake /proc with Leader 42 and payload 77; yield the open mock.
+
+        Mocks: machinectl (Leader 42) and _open_process_dir (the fake tree).
+        With reused_status, a second open of PID 77 finds another process,
+        as when the payload exits and its PID goes to a new process.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            leader = Path(root, "42")
+            (leader / "task" / "42").mkdir(parents=True)
+            (leader / "task" / "42" / "children").write_bytes(children)
+            payload = Path(root, "77")
+            payload.mkdir()
+            (payload / "status").write_text(self.payload_status())
+            self.fd_links(str(payload), payload_links)
+            reused = Path(root, "77-reused")
+            reused.mkdir()
+            (reused / "status").write_text(reused_status or "")
+            self.fd_links(str(reused), payload_links)
+            opens = []
+
+            def open_process_dir(pid):
+                name = str(pid)
+                if pid == 77 and reused_status is not None and 77 in opens:
+                    name = "77-reused"
+                opens.append(pid)
+                return os.open(os.path.join(root, name), sandy.DIRECTORY_OPEN_FLAGS)
+
+            with patch.object(
+                sandy, "_query_machine_leader", return_value=42
+            ), patch.object(
+                sandy, "_open_process_dir", side_effect=open_process_dir
+            ) as opened:
+                yield opened
+
+    def test_payload_has_opened_keepalive_reads_the_payload_fds(self):
+        script = sandy.KEEPALIVE_SCRIPT_PATH
+        for links, expected in (({"255": script}, True), ({"0": "/dev/null"}, False)):
+            with self.subTest(links=links):
+                with self.keepalive_proc(b"77 ", links) as opened:
+                    before = sandy._open_fds()
+                    self.assertEqual(
+                        sandy._payload_has_opened_keepalive("ai-dev"), expected
+                    )
+                    self.assertEqual(sandy._open_fds(), before)
+                    sandy._query_machine_leader.assert_called_once_with("ai-dev")
+                # The Leader for the search, then the payload for its fds.
+                self.assertEqual(opened.call_args_list, [call(42), call(77), call(77)])
+
+    def test_payload_has_opened_keepalive_fails_without_the_payload(self):
+        script = sandy.KEEPALIVE_SCRIPT_PATH
+        with self.keepalive_proc(b"", {"255": script}):
+            with self.assertRaisesRegex(ProcessLookupError, "still starting"):
+                sandy._payload_has_opened_keepalive("ai-dev")
+        # The payload exited after the search, and a new process has its PID.
+        other = self.payload_status(ppid="1", nspid="77")
+        with self.keepalive_proc(b"77 ", {"255": script}, reused_status=other):
+            before = sandy._open_fds()
+            with self.assertRaisesRegex(ProcessLookupError, "changed"):
+                sandy._payload_has_opened_keepalive("ai-dev")
+            self.assertEqual(sandy._open_fds(), before)
 
     def test_require_scope_payload_cgroup(self):
         unit = "sandy-ai-dev.scope"
@@ -4237,8 +4399,11 @@ class LeaderExtractionTests(unittest.TestCase):
         )
         manager.join.return_value = 30
         manager.alive.return_value = overrides.get("alive", True)
-        manager.payload.return_value = overrides.get(
-            "payload_confinement", sandy.ProcessConfinement(2, 0xFDECBFFF)
+        manager.payload.return_value = (
+            77,
+            overrides.get(
+                "payload_confinement", sandy.ProcessConfinement(2, 0xFDECBFFF)
+            ),
         )
         for name in ("filters", "capbnd", "pidfd_open", "join", "payload"):
             if name in overrides:
@@ -4264,9 +4429,7 @@ class LeaderExtractionTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(sandy, "_read_process_cgroup", manager.cgroup)
             )
-            stack.enter_context(
-                patch.object(sandy, "_find_payload_confinement", manager.payload)
-            )
+            stack.enter_context(patch.object(sandy, "_find_payload", manager.payload))
             stack.enter_context(
                 patch.object(sandy, "_pidfd_process_alive", manager.alive)
             )
@@ -8562,6 +8725,54 @@ class ExecutionTests(unittest.TestCase):
             sleep.call_args_list, [call(sandy.CONTAINER_READY_INTERVAL)] * 2
         )
 
+    def test_wait_for_keepalive_open_retries_until_the_script_is_open(self):
+        # Mocks: the payload check and the poll sleep. Every failed check is
+        # retried: the payload can still be in execve.
+        instance = make_sandy()
+        supervisor = MagicMock()
+        supervisor.poll.return_value = None
+        with patch.object(
+            sandy,
+            "_payload_has_opened_keepalive",
+            side_effect=[
+                ProcessLookupError("Container is still starting; try again"),
+                False,
+                ValueError("Malformed process descriptor entry"),
+                subprocess.CalledProcessError(1, ["machinectl"]),
+                True,
+            ],
+        ) as check, patch("time.sleep") as sleep:
+            self.assertTrue(instance._wait_for_keepalive_open(supervisor))
+        self.assertEqual(check.call_args_list, [call("ai-dev")] * 5)
+        self.assertEqual(
+            sleep.call_args_list, [call(sandy.KEEPALIVE_OPEN_INTERVAL)] * 4
+        )
+
+    def test_wait_for_keepalive_open_stops_when_the_supervisor_exits(self):
+        instance = make_sandy()
+        supervisor = MagicMock()
+        supervisor.poll.side_effect = [None, 1]
+        with patch.object(
+            sandy, "_payload_has_opened_keepalive", return_value=False
+        ) as check, patch("time.sleep"):
+            self.assertFalse(instance._wait_for_keepalive_open(supervisor))
+        check.assert_called_once_with("ai-dev")
+
+    def test_wait_for_keepalive_open_times_out(self):
+        instance = make_sandy()
+        supervisor = MagicMock()
+        supervisor.poll.return_value = None
+        with patch.object(
+            sandy, "_payload_has_opened_keepalive", return_value=False
+        ) as check, patch(
+            "time.monotonic", side_effect=[0.0, 5.0, sandy.KEEPALIVE_OPEN_TIMEOUT]
+        ), patch(
+            "time.sleep"
+        ) as sleep:
+            self.assertFalse(instance._wait_for_keepalive_open(supervisor))
+        self.assertEqual(check.call_count, 2)
+        sleep.assert_called_once_with(sandy.KEEPALIVE_OPEN_INTERVAL)
+
     def test_wait_for_container_ready_times_out_without_running_machine(self):
         instance = make_sandy()
         with patch.object(instance, "_run_as_root", return_value=None) as run:
@@ -9589,6 +9800,9 @@ class RunUpTests(unittest.TestCase):
         self.wait_for_container_ready = self.start_patch(
             sandy.Sandy, "_wait_for_container_ready", True
         )
+        self.wait_for_keepalive_open = self.start_patch(
+            sandy.Sandy, "_wait_for_keepalive_open", True
+        )
         self.exec = self.start_patch(sandy.Sandy, "_exec", 0)
         self.machine_poweroff = self.start_patch(sandy.Sandy, "_machine_poweroff", None)
         # The lifecycle lock and the up-console marker of up without -d.
@@ -9744,6 +9958,107 @@ class RunUpTests(unittest.TestCase):
                 init.assert_not_called()
                 self.exec.assert_not_called()
                 self.assertIn("E: Container 'ai-dev'", stdout.getvalue())
+
+    def run_detached_up(self, instance, machine):
+        """Run up -d with the host mocks of these tests; return the popen mock."""
+        with patch.object(instance, "_is_container_running", return_value=None):
+            with patch.object(instance, "_remove_port_mappings_from_state"):
+                with patch.object(instance, "_get_machine_dir", return_value=machine):
+                    with patch.object(sandy, "_run_secure_subprocess_popen") as popen:
+                        with patch.object(
+                            instance, "_run_init_script", return_value=False
+                        ):
+                            with captured_output():
+                                instance.run_up(self.arguments())
+        return popen
+
+    def keepalive_dir_of(self, popen):
+        command = self.nspawn_command(popen.call_args.args[0])
+        (bind,) = [a for a in command if a.endswith(":/run/sandy")]
+        return bind.removeprefix("--bind-ro=").split(":", 1)[0]
+
+    def test_keepalive_files_stay_until_the_payload_opened_the_script(self):
+        # Regression test for review finding S2: up removed the keepalive
+        # files as soon as the readiness probe worked, before bash could
+        # have opened the script (reproduced on systemd 249, 255, and 257).
+        # Mocks: as in the detached command test.
+        instance = make_sandy()
+        instance.workspace = None
+        order = []
+        popens = []
+
+        def ready(**kwargs):
+            order.append("ready")
+            return True
+
+        self.wait_for_container_ready.side_effect = ready
+
+        def keepalive_open(supervisor):
+            (popen,) = popens
+            self.assertIs(supervisor, popen.return_value)
+            present = os.path.isdir(self.keepalive_dir_of(popen))
+            order.append(f"keepalive open, files present={present}")
+            return True
+
+        self.wait_for_keepalive_open.side_effect = keepalive_open
+        with tempfile.TemporaryDirectory() as machine, patch.object(
+            sandy, "_run_secure_subprocess_popen"
+        ) as popen, patch.object(
+            instance, "_is_container_running", return_value=None
+        ), patch.object(
+            instance, "_remove_port_mappings_from_state"
+        ), patch.object(
+            instance, "_run_init_script", return_value=False
+        ), patch.object(
+            instance, "_get_machine_dir", return_value=machine
+        ):
+            popens.append(popen)
+            with captured_output():
+                instance.run_up(self.arguments())
+        self.assertEqual(order, ["ready", "keepalive open, files present=True"])
+        self.assertFalse(os.path.lexists(self.keepalive_dir_of(popen)))
+
+    def test_keepalive_open_failure_stops_the_started_container(self):
+        for detach in (True, False):
+            with self.subTest(detach=detach):
+                instance = make_sandy()
+                instance.workspace = None
+                self.wait_for_keepalive_open.return_value = False
+                self.exec.reset_mock()
+                with tempfile.TemporaryDirectory() as machine, patch.object(
+                    instance, "_is_container_running", return_value=None
+                ), patch.object(
+                    instance, "_get_machine_dir", return_value=machine
+                ), patch.object(
+                    instance, "_remove_port_mappings_from_state"
+                ), patch.object(
+                    sandy, "_run_secure_subprocess_popen"
+                ) as popen, patch.object(
+                    instance, "_stop_failed_start"
+                ) as stop, patch.object(
+                    instance, "_run_init_script"
+                ) as init:
+                    with captured_output() as (stdout, _):
+                        with self.assertRaises(SystemExit):
+                            instance.run_up(self.arguments(detach=detach))
+                supervisor = popen.return_value
+                self.wait_for_keepalive_open.assert_called_with(supervisor)
+                stop.assert_called_once_with(supervisor)
+                init.assert_not_called()
+                self.exec.assert_not_called()
+                self.assertIn("E: Container 'ai-dev'", stdout.getvalue())
+                self.assertFalse(os.path.lexists(self.keepalive_dir_of(popen)))
+
+    def test_keepalive_open_is_not_awaited_before_ready(self):
+        instance = make_sandy()
+        instance.workspace = None
+        self.wait_for_container_ready.return_value = False
+        with tempfile.TemporaryDirectory() as machine, patch.object(
+            instance, "_stop_failed_start"
+        ):
+            with self.assertRaises(SystemExit):
+                self.run_detached_up(instance, machine)
+        self.wait_for_keepalive_open.assert_not_called()
 
     def test_entry_setup_failure_stops_the_started_container(self):
         # Regression test for a setup error in the readiness probe, which
