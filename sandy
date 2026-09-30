@@ -56,7 +56,31 @@ LIFECYCLE_LOCK_FILENAME: Final = "lifecycle.lock"
 LIFECYCLE_LOCK_TIMEOUT: Final = 10
 LIFECYCLE_LOCK_RETRY_INTERVAL: Final = 0.05
 INIT_SCRIPT_MAX_BYTES: Final = 8192
+# The container payload (PID 2) is the image's bash, started through a symlink
+# named sandy-keepalive, reading a copy of sandy-keepalive.sh. Both are in a
+# private host directory that nspawn binds read-only at KEEPALIVE_MOUNT.
+KEEPALIVE_SCRIPT_FILENAME: Final = "sandy-keepalive.sh"
+KEEPALIVE_SCRIPT_MAX_BYTES: Final = 4096
+KEEPALIVE_DIR_PREFIX: Final = "sandy-keepalive-"
+KEEPALIVE_MOUNT: Final = "/run/sandy"
+KEEPALIVE_LINK_NAME: Final = "sandy-keepalive"
+KEEPALIVE_COPY_NAME: Final = "keepalive.sh"
+KEEPALIVE_SHELL: Final = "/bin/bash"
+# nspawn runs in the transient scope sandy-<name>.scope in system.slice, not
+# in the cgroup of the terminal that runs sandy.
+SUPERVISOR_UNIT_PREFIX: Final = "sandy-"
+SUPERVISOR_SLICE: Final = "system.slice"
+SUPERVISOR_TASKS_MAX: Final = 16384
+SYSTEMCTL_VALUE_MAX_LENGTH: Final = 4096
+UNIT_STATE_PATTERN: Final = re.compile(r"[a-z][a-z-]{0,31}")
 CONTAINER_READY_TIMEOUT: Final = 60
+CONTAINER_READY_INTERVAL: Final = 0.5
+ATTACH_HANGUP_SIGNALS: Final = (signal.SIGHUP, signal.SIGTERM)
+CONTAINER_STOP_TIMEOUT: Final = 30
+# Bounded so that a stop under the lifecycle lock (10 s wait for others)
+# stays short. The keepalive stops in well under a second (measured).
+CONTAINER_POWEROFF_TIMEOUT: Final = 5
+CONTAINER_STOP_POLL_INTERVAL: Final = 0.1
 CONTAINER_IP_UNSET: Final = object()
 CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 DEFAULT_CONTAINER_TERM: Final = "xterm-256color"
@@ -383,6 +407,46 @@ def _validate_command_args(cmd: list):
     """Validate subprocess command arguments."""
     if not cmd or not all(isinstance(arg, str) and arg for arg in cmd):
         raise ValueError("Invalid command arguments")
+
+
+class _AttachHangup(Exception):
+    """The terminal of an attach went away (SIGHUP) or sandy got SIGTERM."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+@contextmanager  # installs and restores the hangup handlers around an attach
+def _attach_hangup_handlers() -> Iterator[None]:
+    """Turn SIGHUP and SIGTERM into _AttachHangup in the main thread.
+
+    After the first signal both stay ignored, so that the attach cleanup
+    that follows is not interrupted.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def hangup(signum: int, frame: Any) -> None:
+        _ = frame
+        for other in ATTACH_HANGUP_SIGNALS:
+            signal.signal(other, signal.SIG_IGN)
+        raise _AttachHangup(signum)
+
+    previous = {
+        signum: signal.signal(signum, hangup) for signum in ATTACH_HANGUP_SIGNALS
+    }
+    hung_up = False
+    try:
+        yield
+    except _AttachHangup:
+        hung_up = True
+        raise
+    finally:
+        if not hung_up:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
 
 
 def _run_secure_subprocess_pty(
@@ -939,6 +1003,169 @@ def _remove_init_bind_copy(temporary_dir: str) -> None:
     shutil.rmtree(normalized_dir)
 
 
+def _read_keepalive_script(path: str) -> bytes:
+    """Read the keepalive script that Sandy installs next to itself."""
+    fd = os.open(path, READ_FILE_OPEN_FLAGS)
+    try:
+        # Sandy runs as root, so the owner of its own files is trusted as
+        # much as Sandy is. No other user may change the script.
+        _verify_entry_script(os.fstat(fd))
+        content = os.pread(fd, KEEPALIVE_SCRIPT_MAX_BYTES + 1, 0)
+    finally:
+        os.close(fd)
+    if not content or len(content) > KEEPALIVE_SCRIPT_MAX_BYTES:
+        raise PermissionError("Keepalive script has an unexpected size")
+    if not content.isascii() or b"\x00" in content:
+        raise PermissionError("Keepalive script is not ASCII text")
+    return content
+
+
+def _create_keepalive_dir(script: bytes) -> str:
+    """Create the private directory that nspawn binds at KEEPALIVE_MOUNT.
+
+    It holds exactly a symlink to the image's bash and a copy of the script.
+    The container resolves the symlink in its own mount namespace, so the
+    host directory holds no binary. bash only reads the script, so the bind
+    source may be noexec.
+    """
+    temporary_dir = tempfile.mkdtemp(prefix=KEEPALIVE_DIR_PREFIX)
+    script_fd: Optional[int] = None
+    try:
+        os.symlink(KEEPALIVE_SHELL, os.path.join(temporary_dir, KEEPALIVE_LINK_NAME))
+        script_fd = os.open(
+            os.path.join(temporary_dir, KEEPALIVE_COPY_NAME),
+            TEMPORARY_FILE_OPEN_FLAGS,
+            0o600,
+        )
+        remaining = memoryview(script)
+        while remaining:
+            written = os.write(script_fd, remaining)
+            if written <= 0:
+                raise OSError("Keepalive script write made no progress")
+            remaining = remaining[written:]
+        # Container root reads the copy through a read-only bind. Below
+        # systemd 250 host root maps to the overflow uid in the container, so
+        # the copy must be world-readable.
+        os.fchmod(script_fd, 0o644)
+        os.fsync(script_fd)
+        os.chmod(temporary_dir, 0o755)
+        return temporary_dir
+    except BaseException:
+        shutil.rmtree(temporary_dir, ignore_errors=True)
+        raise
+    finally:
+        if script_fd is not None:
+            os.close(script_fd)
+
+
+def _remove_keepalive_dir(temporary_dir: str) -> None:
+    """Remove the exact keepalive directory and only its two known entries."""
+    normalized_dir = os.path.normpath(temporary_dir)
+    expected_parent = os.path.normpath(tempfile.gettempdir())
+    basename = os.path.basename(normalized_dir)
+    if os.path.dirname(normalized_dir) != expected_parent or not basename.startswith(
+        KEEPALIVE_DIR_PREFIX
+    ):
+        raise PermissionError("Refusing to remove unexpected keepalive directory")
+    directory_fd = os.open(normalized_dir, DIRECTORY_OPEN_FLAGS)
+    try:
+        directory_stat = os.fstat(directory_fd)
+        if (
+            directory_stat.st_uid != os.geteuid()
+            or directory_stat.st_gid != os.getegid()
+        ):
+            raise PermissionError("Keepalive directory has unexpected ownership")
+        if directory_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise PermissionError("Keepalive directory has unsafe permissions")
+        entries = set(os.listdir(directory_fd))
+        if not entries <= {KEEPALIVE_LINK_NAME, KEEPALIVE_COPY_NAME}:
+            raise PermissionError("Keepalive directory has unexpected entries")
+        for name in sorted(entries):
+            os.unlink(name, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+    os.rmdir(normalized_dir)
+
+
+def _supervisor_unit_name(machine_name: str) -> str:
+    """Return the name of the transient scope that runs a container."""
+    if not _validate_container_name(machine_name):
+        raise ValueError("Invalid container name")
+    return f"{SUPERVISOR_UNIT_PREFIX}{machine_name}.scope"
+
+
+def _supervisor_description(machine_name: str, detached: bool) -> str:
+    """Return the scope description, which records how up started it."""
+    mode = "detached" if detached else "attached"
+    return f"Sandy container {machine_name} ({mode})"
+
+
+def _supervisor_scope_argv(
+    machine_name: str, systemd_version: int, detached: bool
+) -> list:
+    """Return the systemd-run prefix that starts nspawn in its own scope.
+
+    systemd-run --scope execs its command, so nspawn inherits the machine
+    directory descriptor. machined sets TasksMax=16384 on the scopes that it
+    creates, and a systemd-run scope gets DefaultTasksMax instead, so set it.
+    Scope units accept OOMPolicy= only from systemd 253.
+    """
+    argv = [
+        "systemd-run",
+        "--scope",
+        "--quiet",
+        f"--unit={_supervisor_unit_name(machine_name)}",
+        f"--slice={SUPERVISOR_SLICE}",
+        f"--description={_supervisor_description(machine_name, detached)}",
+        "--property=Delegate=yes",
+    ]
+    if systemd_version >= 253:
+        argv.append("--property=OOMPolicy=continue")
+    argv.extend([f"--property=TasksMax={SUPERVISOR_TASKS_MAX}", "--"])
+    return argv
+
+
+def _systemctl_show_value(unit: str, prop: str) -> str:
+    """Return one property value of unit from systemctl show."""
+    result = _run_secure_subprocess(
+        ["systemctl", "show", unit, "-p", prop, "--value"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout
+    if output.endswith("\n"):
+        output = output[:-1]
+    if len(output) > SYSTEMCTL_VALUE_MAX_LENGTH or _contains_control_character(output):
+        raise ValueError(f"Malformed {prop} of {unit}")
+    return output
+
+
+def _supervisor_detached(machine_name: str) -> Optional[bool]:
+    """Return whether up started the container with -d, from its scope.
+
+    Return None when the scope does not exist or has another description.
+    Only root can set the description of a system unit.
+    """
+    description = _systemctl_show_value(
+        _supervisor_unit_name(machine_name), "Description"
+    )
+    for detached in (True, False):
+        if description == _supervisor_description(machine_name, detached):
+            return detached
+    return None
+
+
+def _supervisor_unit_loaded(machine_name: str) -> bool:
+    """Return whether systemd knows the container's scope in any state."""
+    load_state = _systemctl_show_value(_supervisor_unit_name(machine_name), "LoadState")
+    if load_state == "not-found":
+        return False
+    if not UNIT_STATE_PATTERN.fullmatch(load_state):
+        raise ValueError("Malformed LoadState of the container scope")
+    return True
+
+
 def _validate_container_ip_for_cidr(
     container_ip: str,
     network_cidr: Optional[str],
@@ -1475,6 +1702,7 @@ PTRACE_SECCOMP_GET_FILTER: Final = 0x420C
 PR_CAPBSET_READ: Final = 23
 PR_CAPBSET_DROP: Final = 24
 PR_SET_CHILD_SUBREAPER: Final = 36
+PR_SET_PDEATHSIG: Final = 1
 SECCOMP_SET_MODE_FILTER: Final = 1
 # The kernel limits one classic BPF program to BPF_MAXINSNS instructions.
 BPF_MAXINSNS: Final = 4096
@@ -1651,6 +1879,12 @@ def _set_child_subreaper() -> None:
     _entry_syscall("prctl", PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
 
 
+def _set_parent_death_signal(signum: int) -> None:
+    """Have the kernel send signum to this process when its parent thread exits."""
+    _require_int_in_range(signum, "signal", 1, SIGNAL_MAX)
+    _entry_syscall("prctl", PR_SET_PDEATHSIG, signum, 0, 0, 0)
+
+
 def _setns(fd: int, nstype: int) -> None:
     """Join the namespace of fd; nstype must name exactly that namespace type."""
     fd = _require_int_in_range(fd, "namespace descriptor", 0, 2**31 - 1)
@@ -1716,6 +1950,16 @@ def _lifecycle_lock(timeout: float = LIFECYCLE_LOCK_TIMEOUT) -> Iterator[None]:
 
 
 LEADER_PID_PATTERN: Final = re.compile(r"[1-9][0-9]{0,6}")
+# Each attach runs in its own leaf cgroup in the container's scope, next to
+# nspawn's payload and supervisor cgroups.
+CGROUP_ROOT: Final = "/sys/fs/cgroup"
+ATTACH_LEAF_PREFIX: Final = "attach-"
+ATTACH_LEAF_PATTERN: Final = re.compile(r"attach-[0-9a-f]{32}")
+ATTACH_LEAF_KILL_TIMEOUT: Final = 5
+ATTACH_LEAF_POLL_INTERVAL: Final = 0.02
+CGROUP_EVENTS_MAX_BYTES: Final = 4096
+PROC_CGROUP_MAX_BYTES: Final = 4096
+PROC_CGROUP_PATTERN: Final = re.compile(r"0::(/[^\n]*)\n")
 CAPBND_LINE_PATTERN: Final = re.compile(r"CapBnd:\t([0-9a-f]{16})")
 PROC_STATUS_MAX_BYTES: Final = 65536
 
@@ -1729,6 +1973,8 @@ class LeaderConfinement(NamedTuple):
     # Oldest first, which is the order in which to install them.
     seccomp_filters: Tuple[bytes, ...]
     capability_bounding_set: int
+    # cgroup.kill of the attach leaf that this process joined.
+    attach_kill_fd: int
 
 
 def _parse_leader_pid(value: str) -> int:
@@ -1796,6 +2042,188 @@ def _pidfd_process_alive(pidfd: int) -> bool:
     poller.register(pidfd, select.POLLIN)
     # A pidfd becomes readable when its process exits. Any event means exit.
     return not poller.poll(0)
+
+
+def _read_process_cgroup(proc_fd: int) -> str:
+    """Return the cgroup v2 path of an open host /proc/<pid> directory."""
+    cgroup_fd = os.open("cgroup", READ_FILE_OPEN_FLAGS, dir_fd=proc_fd)
+    try:
+        data = os.read(cgroup_fd, PROC_CGROUP_MAX_BYTES + 1)
+    finally:
+        os.close(cgroup_fd)
+    text = data.decode("ascii", errors="replace")
+    match = PROC_CGROUP_PATTERN.fullmatch(text)
+    if len(data) > PROC_CGROUP_MAX_BYTES or match is None:
+        raise ValueError("Malformed process cgroup (Sandy requires cgroup v2)")
+    return match.group(1)
+
+
+def _open_supervisor_cgroup(machine_name: str) -> int:
+    """Open the cgroup directory of the container's scope.
+
+    The path comes from the validated container name, not from container
+    data. FileNotFoundError means that the scope does not exist.
+    """
+    unit = _supervisor_unit_name(machine_name)
+    fd = os.open(CGROUP_ROOT, DIRECTORY_OPEN_FLAGS)
+    try:
+        root_dev = os.fstat(fd).st_dev
+        for component in (SUPERVISOR_SLICE, unit):
+            next_fd = os.open(component, DIRECTORY_OPEN_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+            component_stat = os.fstat(fd)
+            if component_stat.st_uid != 0 or component_stat.st_dev != root_dev:
+                raise PermissionError(f"Unexpected cgroup directory {component}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _write_cgroup_file(dir_fd: int, name: str, value: bytes) -> None:
+    """Write one value to a cgroup interface file of an open cgroup."""
+    fd = os.open(name, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        if os.write(fd, value) != len(value):
+            raise OSError(f"Short write to cgroup {name}")
+    finally:
+        os.close(fd)
+
+
+def _cgroup_populated(dir_fd: int) -> bool:
+    """Return whether an open cgroup or any of its descendants has processes."""
+    fd = os.open("cgroup.events", READ_FILE_OPEN_FLAGS, dir_fd=dir_fd)
+    try:
+        data = os.read(fd, CGROUP_EVENTS_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > CGROUP_EVENTS_MAX_BYTES:
+        raise ValueError("Malformed cgroup.events")
+    values = [
+        line.split(" ")
+        for line in data.decode("ascii", errors="replace").split("\n")
+        if line
+    ]
+    if any(len(fields) != 2 for fields in values):
+        raise ValueError("Malformed cgroup.events")
+    populated = [fields[1] for fields in values if fields[0] == "populated"]
+    if len(populated) != 1 or populated[0] not in ("0", "1"):
+        raise ValueError("Malformed cgroup.events")
+    return populated[0] == "1"
+
+
+def _join_attach_leaf(machine_name: str, attach_leaf: str) -> int:
+    """Create attach_leaf in the container's scope and move this process in.
+
+    The caller holds the lifecycle lock. Return a descriptor for the leaf's
+    cgroup.kill. The leaf is a sibling of nspawn's payload cgroup, so the
+    container cannot see or change it.
+    """
+    if not ATTACH_LEAF_PATTERN.fullmatch(attach_leaf):
+        raise ValueError("Invalid attach cgroup name")
+    unit_fd = _open_supervisor_cgroup(machine_name)
+    try:
+        # The name is random; an existing entry is never reused.
+        os.mkdir(attach_leaf, 0o755, dir_fd=unit_fd)
+        leaf_fd: Optional[int] = None
+        kill_fd: Optional[int] = None
+        try:
+            leaf_fd = os.open(attach_leaf, DIRECTORY_OPEN_FLAGS, dir_fd=unit_fd)
+            kill_fd = os.open(
+                "cgroup.kill",
+                os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=leaf_fd,
+            )
+            # "0" moves the writing process.
+            _write_cgroup_file(leaf_fd, "cgroup.procs", b"0")
+        except BaseException:
+            if kill_fd is not None:
+                os.close(kill_fd)
+            try:
+                os.rmdir(attach_leaf, dir_fd=unit_fd)
+            except OSError:
+                pass
+            raise
+        finally:
+            if leaf_fd is not None:
+                os.close(leaf_fd)
+    finally:
+        os.close(unit_fd)
+    return kill_fd
+
+
+def _end_attach_leaf(unit_fd: int, attach_leaf: str) -> None:
+    """Kill every process of attach_leaf, wait until it is empty, remove it."""
+    if not ATTACH_LEAF_PATTERN.fullmatch(attach_leaf):
+        raise ValueError("Invalid attach cgroup name")
+    try:
+        leaf_fd = os.open(attach_leaf, DIRECTORY_OPEN_FLAGS, dir_fd=unit_fd)
+    except FileNotFoundError:
+        return
+    try:
+        _write_cgroup_file(leaf_fd, "cgroup.kill", b"1")
+        deadline = time.monotonic() + ATTACH_LEAF_KILL_TIMEOUT
+        while _cgroup_populated(leaf_fd):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Attach cgroup did not become empty")
+            time.sleep(ATTACH_LEAF_POLL_INTERVAL)
+    finally:
+        os.close(leaf_fd)
+    try:
+        os.rmdir(attach_leaf, dir_fd=unit_fd)
+    except FileNotFoundError:
+        pass
+
+
+def _remove_attach_leaf(machine_name: str, attach_leaf: str) -> None:
+    """End and remove an attach leaf; do nothing when the scope is gone.
+
+    When the scope stops, systemd kills its processes and removes the whole
+    cgroup tree, leaves included.
+    """
+    try:
+        unit_fd = _open_supervisor_cgroup(machine_name)
+    except FileNotFoundError:
+        return
+    try:
+        _end_attach_leaf(unit_fd, attach_leaf)
+    finally:
+        os.close(unit_fd)
+
+
+def _count_populated_attaches(unit_fd: int) -> int:
+    """Count the attach leaves that have processes; remove the empty ones.
+
+    The caller holds the lifecycle lock. A helper creates and joins its leaf
+    under that lock, so an empty leaf here belongs to an attach that ended,
+    for example one whose sandy process got SIGKILL.
+    """
+    count = 0
+    for name in os.listdir(unit_fd):
+        if not ATTACH_LEAF_PATTERN.fullmatch(name):
+            continue
+        try:
+            leaf_fd = os.open(name, DIRECTORY_OPEN_FLAGS, dir_fd=unit_fd)
+        except FileNotFoundError:
+            continue
+        try:
+            populated = _cgroup_populated(leaf_fd)
+        finally:
+            os.close(leaf_fd)
+        if populated:
+            count += 1
+            continue
+        try:
+            os.rmdir(name, dir_fd=unit_fd)
+        except OSError:
+            pass
+    return count
+
+
+def _new_attach_leaf() -> str:
+    """Return a new random attach leaf name."""
+    return f"{ATTACH_LEAF_PREFIX}{secrets.token_hex(16)}"
 
 
 def _stop_seized_tracee(pid: int) -> int:
@@ -1866,19 +2294,25 @@ def _close_fds(fds: Tuple[int, ...]) -> None:
 
 def _close_leader_confinement(confinement: LeaderConfinement) -> None:
     """Close the descriptors of a LeaderConfinement."""
-    _close_fds((confinement.pidfd,) + confinement.namespace_fds)
+    _close_fds(
+        (confinement.pidfd,) + confinement.namespace_fds + (confinement.attach_kill_fd,)
+    )
 
 
 def _extract_leader_confinement(
-    machine_name: str, leader_pid: int
+    machine_name: str, leader_pid: int, attach_leaf: str
 ) -> LeaderConfinement:
-    """Pin the Leader and read its filters and CapBnd on the host side.
+    """Pin the Leader, read its filters and CapBnd, and join the attach leaf.
 
-    Hold the lifecycle lock for the whole extraction. Every read uses the host
-    /proc, before any setns, so the container cannot change what Sandy reads.
-    The caller owns the returned descriptors.
+    Hold the lifecycle lock for the whole extraction and for the creation of
+    the leaf, so that a stop decision cannot interleave with a new attach.
+    Every read uses the host /proc, before any setns, so the container cannot
+    change what Sandy reads. The caller owns the returned descriptors.
     """
     pid = _require_pid(leader_pid)
+    unit = _supervisor_unit_name(machine_name)
+    if not ATTACH_LEAF_PATTERN.fullmatch(attach_leaf):
+        raise ValueError("Invalid attach cgroup name")
     opened = []
     with _lifecycle_lock():
         try:
@@ -1901,12 +2335,23 @@ def _extract_leader_confinement(
                     namespace_fds.append(ns_fd)
                 seccomp_filters = _read_seccomp_filters(pid)
                 capability_bounding_set = _read_capability_bounding_set(proc_fd)
+                leader_cgroup = _read_process_cgroup(proc_fd)
             finally:
                 os.close(proc_fd)
             # The process was alive from pidfd_open to here, so the PID
             # referred to it for every read above.
             if not _pidfd_process_alive(pidfd):
                 raise ProcessLookupError("Container Leader exited during extraction")
+            # Only host root can create cgroups outside the container's
+            # delegated payload subtree. So a Leader below the payload of
+            # the Sandy scope proves that the scope runs this container.
+            payload = f"/{SUPERVISOR_SLICE}/{unit}/payload"
+            if leader_cgroup != payload and not leader_cgroup.startswith(payload + "/"):
+                raise PermissionError(
+                    f"Container is not running in {unit}; restart it with this "
+                    "version of Sandy"
+                )
+            attach_kill_fd = _join_attach_leaf(machine_name, attach_leaf)
         except BaseException:
             _close_fds(tuple(opened))
             raise
@@ -1915,6 +2360,7 @@ def _extract_leader_confinement(
         namespace_fds=tuple(namespace_fds),
         seccomp_filters=seccomp_filters,
         capability_bounding_set=capability_bounding_set,
+        attach_kill_fd=attach_kill_fd,
     )
 
 
@@ -1922,7 +2368,7 @@ def _extract_leader_confinement(
 # [python, -I, /proc/self/fd/<pinned sandy>, ENTRY_HELPER_MODE, ...] with only
 # stdin, stdout, stderr, and the pinned script descriptor open.
 ENTRY_HELPER_MODE: Final = "__sandy-entry-helper"
-ENTRY_HELPER_ARGC: Final = 9
+ENTRY_HELPER_ARGC: Final = 11
 ENTRY_HELPER_FAILURE: Final = 125
 ENTRY_KIND_TTY: Final = "tty"
 ENTRY_KIND_SH: Final = "sh"
@@ -1934,10 +2380,10 @@ CONTAINER_ID_MAX: Final = 65534
 CONTAINER_ID_PATTERN: Final = re.compile(r"0|[1-9][0-9]{0,4}")
 PINNED_SCRIPT_PATTERN: Final = re.compile(r"/proc/self/fd/([3-9]|[1-9][0-9]{1,3})")
 CAP_LAST_CAP_PATTERN: Final = re.compile(r"([0-9]{1,2})\n")
-# The helper and the middle process pass these on to their child. They ignore
-# SIGINT and SIGQUIT while they wait, as system(3) does, because a terminal
-# sends those to the whole foreground process group.
-ENTRY_FORWARDED_SIGNALS: Final = (signal.SIGHUP, signal.SIGTERM)
+# On these the helper ends its whole attach. It ignores SIGINT and SIGQUIT
+# while it waits, as system(3) does, because a terminal sends those to the
+# whole foreground process group.
+ENTRY_END_SIGNALS: Final = (signal.SIGHUP, signal.SIGTERM)
 ENTRY_WAIT_IGNORED_SIGNALS: Final = (signal.SIGINT, signal.SIGQUIT)
 # Python ignores SIGPIPE and SIGXFSZ, and an ignored signal stays ignored after
 # execve. Restore the defaults, as subprocess does with restore_signals.
@@ -1956,6 +2402,9 @@ class EntryRequest(NamedTuple):
 
     machine: str
     leader_pid: int
+    # The sandy process that starts the helper, for the parent-death check.
+    parent_pid: int
+    attach_leaf: str
     user: str
     home: str
     workdir: str
@@ -2058,14 +2507,22 @@ def _parse_entry_request(args: list) -> EntryRequest:
     """Parse the helper arguments that follow ENTRY_HELPER_MODE."""
     if len(args) != ENTRY_HELPER_ARGC - 2:
         raise ValueError("Invalid entry helper argument count")
-    machine, leader, user, home, workdir, kind, command = args
+    machine, leader, parent, attach_leaf, user, home, workdir, kind, command = args
     if not _validate_container_name(machine):
         raise ValueError("Invalid container name")
+    if not isinstance(parent, str) or not LEADER_PID_PATTERN.fullmatch(parent):
+        raise ValueError("Invalid parent PID")
+    if not isinstance(attach_leaf, str) or not ATTACH_LEAF_PATTERN.fullmatch(
+        attach_leaf
+    ):
+        raise ValueError("Invalid attach cgroup name")
     if not _validate_username(user):
         raise ValueError("Invalid container username")
     request = EntryRequest(
         machine=machine,
         leader_pid=_parse_leader_pid(leader),
+        parent_pid=_require_pid(int(parent)),
+        attach_leaf=attach_leaf,
         user=user,
         home=home,
         workdir=workdir,
@@ -2091,6 +2548,8 @@ def _entry_request_args(request: EntryRequest) -> list:
     args = [
         request.machine,
         str(request.leader_pid),
+        str(request.parent_pid),
+        request.attach_leaf,
         request.user,
         request.home,
         request.workdir,
@@ -2219,23 +2678,31 @@ def _entry_error(exc: BaseException) -> None:
         pass
 
 
-def _wait_forwarding_signals(child: int) -> int:
-    """Wait for child, pass forwarded signals on, and return its wait status.
+def _wait_ending_attach_on_signal(child: int, attach_kill_fd: int) -> int:
+    """Wait for child; on SIGHUP or SIGTERM end the whole attach.
 
-    The caller blocks ENTRY_FORWARDED_SIGNALS before it forks, so a signal that
+    SIGHUP means that the terminal is gone. SIGTERM also comes from the
+    parent-death signal when the sandy process that started this helper
+    exits. Both end every process in the attach leaf, this one included. If
+    the kill fails, pass the signal on to the child.
+
+    The caller blocks ENTRY_END_SIGNALS before it forks, so a signal that
     arrives before the handler exists stays pending until the unblock below.
     """
 
-    def forward(signum: int, frame: Any) -> None:
+    def end_attach(signum: int, frame: Any) -> None:
         _ = frame
         try:
-            os.kill(child, signum)
-        except ProcessLookupError:
-            pass
+            os.write(attach_kill_fd, b"1")
+        except OSError:
+            try:
+                os.kill(child, signum)
+            except ProcessLookupError:
+                pass
 
-    for signum in ENTRY_FORWARDED_SIGNALS:
-        signal.signal(signum, forward)
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, ENTRY_FORWARDED_SIGNALS)
+    for signum in ENTRY_END_SIGNALS:
+        signal.signal(signum, end_attach)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, ENTRY_END_SIGNALS)
     _, status = os.waitpid(child, 0)
     return status
 
@@ -2320,6 +2787,8 @@ def _enter_namespaces_and_fork(
         # imports; make any later import fail instead.
         sys.meta_path.clear()
         sys.path.clear()
+        # Only the helper ends the attach leaf.
+        _close_fds((confinement.attach_kill_fd,))
         for fd, (_, nstype) in zip(confinement.namespace_fds, NAMESPACE_ENTRY_ORDER):
             _setns(fd, nstype)
         # setns(CLONE_NEWUSER) keeps host uid 0, which may signal every host
@@ -2329,7 +2798,7 @@ def _enter_namespaces_and_fork(
         os.setgroups([])
         os.setresgid(0, 0, 0)
         os.setresuid(0, 0, 0)
-        _close_leader_confinement(confinement)
+        _close_fds((confinement.pidfd,) + confinement.namespace_fds)
         # setns(CLONE_NEWPID) applies only to children.
         child = os.fork()
         if child == 0:
@@ -2351,9 +2820,11 @@ def _run_confined_entry(
 
     The helper is a child subreaper, so the session becomes its child when the
     middle process exits. Orphans inside the container go to the container's
-    PID 1, not to the helper.
+    PID 1, not to the helper. The helper, the middle process, and the session
+    are all in the attach leaf. The helper keeps only the leaf's cgroup.kill
+    descriptor.
     """
-    signal.pthread_sigmask(signal.SIG_BLOCK, ENTRY_FORWARDED_SIGNALS)
+    signal.pthread_sigmask(signal.SIG_BLOCK, ENTRY_END_SIGNALS)
     for signum in ENTRY_WAIT_IGNORED_SIGNALS:
         signal.signal(signum, signal.SIG_IGN)
     try:
@@ -2365,7 +2836,7 @@ def _run_confined_entry(
         return ENTRY_HELPER_FAILURE
     if middle == 0:
         _enter_namespaces_and_fork(request, environment, confinement, cap_last)
-    _close_leader_confinement(confinement)
+    _close_fds((confinement.pidfd,) + confinement.namespace_fds)
     _, middle_status = os.waitpid(middle, 0)
     if not os.WIFEXITED(middle_status) or os.WEXITSTATUS(middle_status) != 0:
         # The middle process failed before or at its fork and reported why.
@@ -2385,7 +2856,9 @@ def _run_confined_entry(
                 pass
         _entry_error(RuntimeError("Expected exactly one container session process"))
         return ENTRY_HELPER_FAILURE
-    return _propagate_wait_status(_wait_forwarding_signals(children[0]))
+    return _propagate_wait_status(
+        _wait_ending_attach_on_signal(children[0], confinement.attach_kill_fd)
+    )
 
 
 def _entry_helper_main(argv: list) -> int:
@@ -2402,9 +2875,17 @@ def _entry_helper_main(argv: list) -> int:
         script_fd = _verify_entry_helper_fds(argv[0])
         os.close(script_fd)
         request = _parse_entry_request(argv[2:])
+        # End the attach when the sandy process that started this helper
+        # exits for any reason, SIGKILL included. The parent may have exited
+        # before the prctl; then this process has a new parent.
+        _set_parent_death_signal(signal.SIGTERM)
+        if os.getppid() != request.parent_pid:
+            raise ProcessLookupError("Sandy exited before the entry helper started")
         environment = _container_environment(request.user, request.home)
         cap_last = _read_cap_last_cap()
-        confinement = _extract_leader_confinement(request.machine, request.leader_pid)
+        confinement = _extract_leader_confinement(
+            request.machine, request.leader_pid, request.attach_leaf
+        )
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         _entry_error(exc)
         return ENTRY_HELPER_FAILURE
@@ -4376,8 +4857,10 @@ class Sandy:
             "ip",
             "machinectl",
             "sysctl",
+            "systemctl",
             "systemd-machine-id-setup",
             "systemd-nspawn",
+            "systemd-run",
         ]
 
         # Add setfacl for systemd < 250
@@ -4423,6 +4906,12 @@ class Sandy:
         self.cn_oci = os.path.join(self.script_dir, "oci.sh")
         if not os.path.exists(self.cn_oci):
             print("E: Missing required script: oci.sh")
+            sys.exit(1)
+
+        # Check sandy-keepalive.sh
+        self.cn_keepalive = os.path.join(self.script_dir, KEEPALIVE_SCRIPT_FILENAME)
+        if not os.path.exists(self.cn_keepalive):
+            print(f"E: Missing required script: {KEEPALIVE_SCRIPT_FILENAME}")
             sys.exit(1)
 
         # Check setup-container.sh
@@ -4631,11 +5120,36 @@ class Sandy:
         # Clean up port forwarding rules before stopping container
         self._cleanup_port_mappings_for_container(container_name)
 
-        # Actually stop the container
+        # Actually stop the container. After a successful poweroff, the
+        # machine is gone and terminate would fail, so terminate only a
+        # container that did not stop in time. Wait until the scope is gone
+        # too, so that a following up can start the same name.
         _run_secure_subprocess(["machinectl", "poweroff", container_name])
+        if self._wait_for_container_stop(container_name):
+            return
         _run_secure_subprocess(
             ["machinectl", "terminate", container_name], stderr=subprocess.DEVNULL
         )
+        if not self._wait_for_container_stop(container_name):
+            print(f"W: Container '{container_name}' did not stop")
+
+    def _wait_for_container_stop(
+        self, container_name: str, timeout: float = CONTAINER_POWEROFF_TIMEOUT
+    ) -> bool:
+        """Wait until the machine and its Sandy scope are gone."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if not self._is_container_running(
+                    container_name
+                ) and not _supervisor_unit_loaded(container_name):
+                    return True
+            except (ValueError, subprocess.SubprocessError):
+                # A stop that cannot be confirmed is not a stop.
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(CONTAINER_STOP_POLL_INTERVAL)
 
     def _get_machine_dir(self):
         return os.path.join(SYSTEMD_MACHINES, f"sandy.{self.container}")
@@ -5334,6 +5848,8 @@ class Sandy:
         request = EntryRequest(
             machine=self.container,
             leader_pid=_parse_leader_pid(leader),
+            parent_pid=os.getpid(),
+            attach_leaf=_new_attach_leaf(),
             user=user,
             home=user_home,
             workdir=workdir,
@@ -5344,18 +5860,35 @@ class Sandy:
         _entry_request_args(request)
         return request
 
-    @contextmanager  # closes the pinned script descriptor after the helper exits
+    @contextmanager  # closes the script descriptor and ends the attach leaf
     def _entry_helper_command(
         self, request: EntryRequest
     ) -> Iterator[Tuple[list, int]]:
-        """Yield the entry helper argv and the script descriptor to pass to it."""
+        """Yield the entry helper argv and the script descriptor to pass to it.
+
+        After the helper exits, kill what is left in its attach leaf, such as
+        background jobs of the session, and remove the leaf.
+        """
         # The helper takes the lifecycle lock, which lives in the cache directory.
         self._ensure_cache_dir()
         script_fd = _open_entry_script()
         try:
             yield _entry_helper_argv(script_fd, request), script_fd
         finally:
-            os.close(script_fd)
+            try:
+                os.close(script_fd)
+            finally:
+                self._end_attach_leaf(request.attach_leaf)
+
+    def _end_attach_leaf(self, attach_leaf: str) -> None:
+        """End and remove an attach leaf; warn if that fails."""
+        try:
+            _remove_attach_leaf(self.container, attach_leaf)
+        except (OSError, ValueError) as exc:
+            print(
+                f"W: Could not remove attach cgroup {attach_leaf}: "
+                f"{_terminal_safe_repr(str(exc))}"
+            )
 
     def _exec(self, command: Optional[str], *, login_shell: bool = False) -> int:
         """Run a command or a login shell in the container as self.user.
@@ -5390,14 +5923,58 @@ class Sandy:
             print(f"E: Invalid container entry: {_terminal_safe_repr(str(exc))}")
             sys.exit(1)
 
-        with self._entry_helper_command(request) as (argv, script_fd):
-            # The helper runs the command through script, which allocates a
-            # terminal from the container's devpts instance.
-            return self._run_container_interactive(
-                argv,
-                environment=container_environment,
-                pass_fds=(script_fd,),
+        try:
+            with self._entry_helper_command(request) as (argv, script_fd):
+                with _attach_hangup_handlers():
+                    # The helper runs the command through script, which
+                    # allocates a terminal from the container's devpts
+                    # instance.
+                    status = self._run_container_interactive(
+                        argv,
+                        environment=container_environment,
+                        pass_fds=(script_fd,),
+                    )
+        except _AttachHangup as hangup:
+            # Loss of the terminal ends only this attach; the attach leaf is
+            # already removed. It never stops the container.
+            sys.exit(128 + hangup.signum)
+        self._stop_if_last_attach()
+        return status
+
+    def _stop_if_last_attach(self) -> None:
+        """Stop a container that up started without -d when no attach is left.
+
+        Decide and stop under the lifecycle lock, so that a new attach cannot
+        start in between and two exits cannot both stop the container. Block
+        SIGHUP and SIGTERM meanwhile, so that the stop is not cut short.
+        """
+        blocked = threading.current_thread() is threading.main_thread()
+        if blocked:
+            signal.pthread_sigmask(signal.SIG_BLOCK, ATTACH_HANGUP_SIGNALS)
+        try:
+            with _lifecycle_lock():
+                if _supervisor_detached(self.container) is not False:
+                    return
+                try:
+                    unit_fd = _open_supervisor_cgroup(self.container)
+                except FileNotFoundError:
+                    return
+                try:
+                    remaining = _count_populated_attaches(unit_fd)
+                finally:
+                    os.close(unit_fd)
+                if remaining:
+                    return
+                print(f"I: Stopping '{self.container}': no session is attached")
+                self._machine_poweroff()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(
+                f"W: Could not check the sessions of '{self.container}': "
+                f"{_terminal_safe_repr(str(exc))}"
             )
+        finally:
+            if blocked:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, ATTACH_HANGUP_SIGNALS)
 
     def _run_as_root(
         self, command: str, **kwargs: Any
@@ -5439,23 +6016,15 @@ class Sandy:
         self,
         cmd,
         environment: Mapping[str, str],
-        spinner_line_event: Optional[threading.Event] = None,
         pass_fds: Tuple[int, ...] = (),
     ) -> int:
-        """Run systemd-nspawn interactively while monitoring output for spinner."""
-        newline_injected = False
+        """Run an entry helper command under a pty that relays the terminal."""
 
         def master_read(fd: int) -> bytes:
-            nonlocal newline_injected
             try:
-                data = os.read(fd, 1024)
+                return os.read(fd, 1024)
             except OSError:
                 return b""
-            if data and not newline_injected:
-                newline_injected = True
-                if spinner_line_event:
-                    _finish_spinner_line(spinner_line_event)
-            return data
 
         def stdin_read(fd: int) -> bytes:
             try:
@@ -5463,27 +6032,24 @@ class Sandy:
             except OSError:
                 return b""
 
-        try:
-            return_code = _run_secure_subprocess_pty(
-                cmd,
-                master_read=master_read,
-                stdin_read=stdin_read,
-                environment=environment,
-                pass_fds=pass_fds,
-            )
-        finally:
-            if spinner_line_event and not spinner_line_event.is_set():
-                spinner_line_event.set()
-        return return_code
+        return _run_secure_subprocess_pty(
+            cmd,
+            master_read=master_read,
+            stdin_read=stdin_read,
+            environment=environment,
+            pass_fds=pass_fds,
+        )
 
     def _wait_for_container_ready(
         self,
         spinner_line_event: Optional[threading.Event] = None,
         timeout: int = CONTAINER_READY_TIMEOUT,
+        supervisor: Optional[subprocess.Popen] = None,
     ) -> bool:
-        """Wait for container readiness; show spinner dots only when requested."""
-        import time
+        """Wait for container readiness; show spinner dots only when requested.
 
+        Return False at once when the supervisor has exited.
+        """
         if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
             return False
 
@@ -5493,6 +6059,8 @@ class Sandy:
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
+            if supervisor is not None and supervisor.poll() is not None:
+                return False
             # Ready means that the entry helper can confine and run a command.
             # Until nspawn has installed the payload's filters, extraction
             # fails, so an early probe fails closed and is retried.
@@ -5514,7 +6082,7 @@ class Sandy:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            time.sleep(min(1, remaining))
+            time.sleep(min(CONTAINER_READY_INTERVAL, remaining))
         return False
 
     def _validate_container_ip_for_network(self, container_ip: str) -> str:
@@ -6127,49 +6695,25 @@ class Sandy:
             )
             return False
 
-    def _run_init_script(
-        self,
-        silent=False,
-        network_mode="lenient",
-        spinner_line_event: Optional[threading.Event] = None,
-    ):
+    def _run_init_script(self, network_mode: str = "lenient") -> None:
         """Execute /init.sh as root if it exists and network is configured.
 
-        Returns True if readiness wait was performed, False otherwise.
+        The caller has already waited until the container is ready.
         """
-        wait_attempted = False
         if network_mode == "host":
             # Skip init script in host networking mode
-            return wait_attempted
+            return
         if not (self.network and self.network.configured):
-            return wait_attempted
+            return
 
         mdir = self._get_machine_dir()
         init_script_path = os.path.join(mdir, "init.sh")
+        if not os.path.exists(init_script_path):
+            return
 
-        if os.path.exists(init_script_path):
-            wait_attempted = True
-            if not silent:
-                print("I: Waiting for container to be ready...")
-            if not self._wait_for_container_ready(
-                spinner_line_event=spinner_line_event
-            ):
-                if not silent:
-                    print("W: Container not ready for network initialization")
-                return wait_attempted
-
-            if not silent:
-                print("I: Executing network initialization script as root")
-            result = self._exec_as_root("/bin/sh /init.sh")
-            if result.returncode != 0:
-                if not silent:
-                    print("W: Network initialization script failed")
-            else:
-                if not silent:
-                    print("I: Network initialization completed")
-            return wait_attempted
-
-        return wait_attempted
+        result = self._exec_as_root("/bin/sh /init.sh")
+        if result.returncode != 0:
+            print("W: Network initialization script failed")
 
     def _build(
         self,
@@ -6209,7 +6753,17 @@ class Sandy:
             print(f"E: Container '{self.container}' is already running")
             sys.exit(1)
 
-        remove_stale_port_state = False
+        # The container's scope must not exist yet. Fail closed rather than
+        # reuse or stop a unit that this run did not start.
+        unit = _supervisor_unit_name(self.container)
+        try:
+            unit_loaded = _supervisor_unit_loaded(self.container)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(f"E: Could not query unit '{unit}': {_terminal_safe_repr(str(exc))}")
+            sys.exit(1)
+        if unit_loaded:
+            print(f"E: Unit '{unit}' already exists")
+            sys.exit(1)
 
         # Parse and validate port mappings
         if hasattr(args, "ports") and args.ports:
@@ -6231,8 +6785,11 @@ class Sandy:
                     sys.exit(1)
                 self.port_mappings.append(validated)
             self.port_mappings = self._dedupe_port_mappings(self.port_mappings)
-        else:
-            remove_stale_port_state = True
+
+        # A container that stopped without sandy (its payload ended, or its
+        # scope was stopped) leaves its port forwarding rules and state.
+        # Remove only this name's Sandy-owned rules and state.
+        self._cleanup_port_mappings_for_container(self.container)
 
         mdir = self._get_machine_dir()
         planned_guest_network = None
@@ -6271,6 +6828,7 @@ class Sandy:
             sys.exit(1)
         runtime_fds = [machine_fd]
         init_bind_dir: Optional[str] = None
+        keepalive_dir: Optional[str] = None
 
         def close_runtime_fds() -> None:
             nonlocal runtime_fds
@@ -6286,6 +6844,14 @@ class Sandy:
                 finally:
                     init_bind_dir = None
 
+        def cleanup_keepalive() -> None:
+            nonlocal keepalive_dir
+            if keepalive_dir is not None:
+                try:
+                    _remove_keepalive_dir(keepalive_dir)
+                finally:
+                    keepalive_dir = None
+
         def reject_unsafe_init(exc: BaseException) -> None:
             close_runtime_fds()
             cleanup_init_bind()
@@ -6296,21 +6862,27 @@ class Sandy:
 
         # --directory=/proc/self/fd/<machine-fd>
         # --machine=foo           # show up as 'foo', not 'sandy.foo'
+        # --keep-unit             # the systemd-run scope is the machine unit
+        # --console=passive       # no console; sessions attach through the
+        #                         # entry helper
         # --tmpfs=/tmp:mode=1777  # memory tmpfs
         # --private-users         # user namespace - pick for >=250, fixed for <250
         # --as-pid2               # emulate docker app container (no init
         #                         # process; just minimal systemd stub init for
         #                         # signal forwarding and zombies only)
         # --timezone=bind         # bind mount host localetime into container
-        # --user=self.user        # change to this user within the container
+        # --user=root             # the keepalive payload runs as container
+        #                         # root, so container users cannot signal it
         cmd = [
             "systemd-nspawn",
             f"--directory={_proc_self_fd_path(machine_fd)}",
             f"--machine={self.container}",
+            "--keep-unit",
+            "--console=passive",
             "--tmpfs=/tmp:mode=1777",
             "--as-pid2",
             "--timezone=bind",
-            f"--user={self.user}",
+            "--user=root",
         ]
 
         try:
@@ -6339,6 +6911,19 @@ class Sandy:
                 init_bind_options = ":idmap" if self.systemd_version >= 250 else ""
                 cmd.append(f"--bind-ro={init_bind_path}:/init.sh{init_bind_options}")
                 print(f"I: Bind mounting /init.sh as read-only")
+
+            # Create the keepalive payload before any host network change.
+            try:
+                keepalive_dir = _create_keepalive_dir(
+                    _read_keepalive_script(self.cn_keepalive)
+                )
+            except (OSError, PermissionError, ValueError) as exc:
+                print(
+                    "E: Could not prepare the keepalive payload: "
+                    f"{_terminal_safe_repr(str(exc))}"
+                )
+                sys.exit(1)
+            cmd.append(f"--bind-ro={keepalive_dir}:{KEEPALIVE_MOUNT}")
 
             # Setup networking based on network mode after validating the machine
             # image and init script. Network construction mutates host state.
@@ -6382,9 +6967,6 @@ class Sandy:
                     print("I: Using host networking mode (no bridge setup)")
                 else:
                     print("I: Using host networking mode (ignoring existing bridge)")
-
-            if remove_stale_port_state:
-                self._remove_port_mappings_from_state(self.container)
 
             # Use bridge network if configured and not in host mode
             if args.network != "host" and self.network and self.network.configured:
@@ -6454,8 +7036,7 @@ class Sandy:
             if self.shared:
                 mount_specs.append(("shared", self.shared, "shared", False))
 
-            chdir_set = False
-            for label, host_rel, subdir, do_chdir in mount_specs:
+            for label, host_rel, subdir, _ in mount_specs:
                 realp = os.path.realpath(host_rel)
                 intp = f"{self.user_home}/{subdir}"
                 if not os.path.isdir(realp):
@@ -6474,12 +7055,6 @@ class Sandy:
                 else:
                     cmd.append(f"--bind={realp}:{intp}")
                 print(f"I: Mounting '{realp}' on '{intp}'")
-                if do_chdir:
-                    cmd.append(f"--chdir={intp}")
-                    chdir_set = True
-
-            if not chdir_set:
-                cmd.append(f"--chdir={self.user_home}")
 
             # ACL fallback for systemd < 250
             if self.systemd_version < 250:
@@ -6488,79 +7063,98 @@ class Sandy:
                     if os.path.isdir(realp):
                         self._setfacl(realp, self.container)
 
-            # XXX: probably should create a systemd unit for this
-            if args.detach:
-                spinner_line_event = threading.Event()
-                print(
-                    f"I: Starting '{self.container}' in detached state ",
-                    end="",
-                    flush=True,
+            # The payload: the image's bash, named sandy-keepalive, reads the
+            # keepalive script.
+            cmd.extend(
+                [
+                    f"{KEEPALIVE_MOUNT}/{KEEPALIVE_LINK_NAME}",
+                    f"{KEEPALIVE_MOUNT}/{KEEPALIVE_COPY_NAME}",
+                ]
+            )
+            scope_cmd = (
+                _supervisor_scope_argv(
+                    self.container, self.systemd_version, bool(args.detach)
                 )
-                try:
-                    try:
-                        _run_secure_subprocess_popen(
-                            cmd,
-                            start_new_session=True,
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            env=container_environment,
-                            pass_fds=tuple(runtime_fds),
-                        )
-                    finally:
-                        close_runtime_fds()
-                    # Run network initialization after detached start
-                    waited_for_readiness = self._run_init_script(
-                        silent=True,
-                        network_mode=args.network,
-                        spinner_line_event=spinner_line_event,
-                    )
-                finally:
-                    cleanup_init_bind()
-                if waited_for_readiness:
-                    _finish_spinner_line(spinner_line_event, suffix=" done")
-                else:
+                + cmd
+            )
+            spinner_line_event = threading.Event()
+            mode = " in detached state" if args.detach else ""
+            print(f"I: Starting '{self.container}'{mode} ", end="", flush=True)
+            # The supervisor has no terminal and its own session, and runs in
+            # its own scope. So a closed terminal, or a stop or OOM kill of
+            # the terminal's scope, does not reach it.
+            try:
+                supervisor = _run_secure_subprocess_popen(
+                    scope_cmd,
+                    start_new_session=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=container_environment,
+                    pass_fds=tuple(runtime_fds),
+                )
+            finally:
+                close_runtime_fds()
+            try:
+                ready = self._wait_for_container_ready(
+                    spinner_line_event=spinner_line_event, supervisor=supervisor
+                )
+                # A running payload keeps its open script; it needs no bind
+                # source.
+                cleanup_keepalive()
+                if not ready:
                     _finish_spinner_line(spinner_line_event)
-            else:
-                spinner_line_event = threading.Event()
-                print(f"I: Starting '{self.container}' ", end="", flush=True)
-                # Run network initialization in background thread
-                init_thread = threading.Thread(
-                    target=lambda: self._run_init_script(
-                        silent=True,
-                        network_mode=args.network,
-                        spinner_line_event=spinner_line_event,
-                    )
-                )
-                init_thread.daemon = True
-                init_thread.start()
-
-                # Run container interactively in main thread for proper SIGWINCH handling
-                try:
-                    try:
-                        self._run_container_interactive(
-                            cmd,
-                            spinner_line_event=spinner_line_event,
-                            environment=container_environment,
-                            pass_fds=tuple(runtime_fds),
-                        )
-                    finally:
-                        close_runtime_fds()
-                finally:
-                    cleanup_init_bind()
-
-                # Wait for init thread to complete
-                init_thread.join()
-
-                # Clean up port forwarding rules after container exits
-                if self.port_mappings and self.network and self.network.configured:
-                    self._cleanup_port_forwarding_rules()
-                    self._remove_port_mappings_from_state(self.container)
+                    self._report_failed_start(supervisor)
+                    sys.exit(1)
+                _finish_spinner_line(spinner_line_event, suffix=" done")
+                self._run_init_script(network_mode=args.network)
+            except BaseException:
+                self._stop_failed_start(supervisor)
+                raise
         finally:
             try:
                 cleanup_init_bind()
             finally:
-                close_runtime_fds()
+                try:
+                    cleanup_keepalive()
+                finally:
+                    close_runtime_fds()
+
+        if args.detach:
+            return
+        # The console is one more attach. When it exits, the container stops
+        # unless another attach is still running.
+        status = self._exec(None, login_shell=True)
+        _raise_for_container_status(status)
+
+    def _report_failed_start(self, supervisor: subprocess.Popen) -> None:
+        """Explain why a started container did not become ready."""
+        status = supervisor.poll()
+        if status is None:
+            print(f"E: Container '{self.container}' did not become ready")
+            return
+        print(
+            f"E: Container '{self.container}' exited before it was ready "
+            f"(exit status {status})"
+        )
+        print(
+            f"   The container needs {KEEPALIVE_SHELL} and 'sleep' in PATH for its "
+            "keepalive payload"
+        )
+
+    def _stop_failed_start(self, supervisor: subprocess.Popen) -> None:
+        """Stop a supervisor that this run started, then remove its port rules.
+
+        SIGTERM makes nspawn power off the container.
+        """
+        if supervisor.poll() is None:
+            supervisor.terminate()
+            try:
+                supervisor.wait(timeout=CONTAINER_STOP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                supervisor.kill()
+                supervisor.wait()
+        self._cleanup_port_mappings_for_container(self.container)
 
     def run_rm(self, args, all=False, cache=False, network=False):
         """Remove container(s)"""

@@ -18,7 +18,7 @@ import unittest
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, mock_open, patch
+from unittest.mock import ANY, MagicMock, call, mock_open, patch
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SANDY_PATH = PROJECT_DIR / "sandy"
@@ -58,6 +58,7 @@ def make_sandy():
     instance.port_mappings = []
     instance.cn_debootstrap = str(PROJECT_DIR / "debootstrap.sh")
     instance.cn_oci = str(PROJECT_DIR / "oci.sh")
+    instance.cn_keepalive = str(PROJECT_DIR / "sandy-keepalive.sh")
     instance.cn_setup_container = str(PROJECT_DIR / "setup-container.sh")
     instance.bootstrap_method = "OCI"
     instance.bootstrap_script = instance.cn_oci
@@ -2814,7 +2815,8 @@ class SandyInitializationTests(unittest.TestCase):
         for exists_values, expected in (
             ([False], "debootstrap.sh"),
             ([True, False], "oci.sh"),
-            ([True, True, False], "setup-container.sh"),
+            ([True, True, False], "sandy-keepalive.sh"),
+            ([True, True, True, False], "setup-container.sh"),
         ):
             with self.subTest(expected=expected):
                 with patch.object(
@@ -3338,6 +3340,17 @@ class EntryPrimitiveTests(unittest.TestCase):
             sandy._set_child_subreaper()
         syscall.assert_called_once_with(157, 36, 1, 0, 0, 0, 0)
 
+    def test_set_parent_death_signal_exact_call(self):
+        with mocked_entry_syscall() as syscall:
+            sandy._set_parent_death_signal(sandy.signal.SIGTERM)
+        syscall.assert_called_once_with(157, 1, 15, 0, 0, 0, 0)
+        for signum in (0, 65, True, "15"):
+            with self.subTest(signum=signum):
+                with mocked_entry_syscall() as syscall:
+                    with self.assertRaises(ValueError):
+                        sandy._set_parent_death_signal(signum)
+                syscall.assert_not_called()
+
     def test_setns_exact_calls_for_each_namespace(self):
         with mocked_entry_syscall() as syscall:
             for fd, (_, nstype) in enumerate(sandy.NAMESPACE_ENTRY_ORDER, start=10):
@@ -3757,13 +3770,17 @@ class LeaderExtractionTests(unittest.TestCase):
 
     def test_close_leader_confinement_closes_every_descriptor(self):
         confinement = sandy.LeaderConfinement(
-            pidfd=3, namespace_fds=(4, 5), seccomp_filters=(), capability_bounding_set=0
+            pidfd=3,
+            namespace_fds=(4, 5),
+            seccomp_filters=(),
+            capability_bounding_set=0,
+            attach_kill_fd=6,
         )
         with patch.object(
-            sandy.os, "close", side_effect=[None, OSError(errno.EBADF, "x"), None]
+            sandy.os, "close", side_effect=[None, OSError(errno.EBADF, "x"), None, None]
         ) as close:
             sandy._close_leader_confinement(confinement)
-        self.assertEqual(close.call_args_list, [call(3), call(4), call(5)])
+        self.assertEqual(close.call_args_list, [call(3), call(4), call(5), call(6)])
 
     @contextmanager
     def extraction_mocks(self, **overrides):
@@ -3789,8 +3806,12 @@ class LeaderExtractionTests(unittest.TestCase):
         manager.query.return_value = overrides.get("leader", 42)
         manager.filters.return_value = (b"old", b"new")
         manager.capbnd.return_value = 0xFDECBFFF
+        manager.cgroup.return_value = overrides.get(
+            "cgroup", "/system.slice/sandy-ai-dev.scope/payload"
+        )
+        manager.join.return_value = 30
         manager.alive.return_value = overrides.get("alive", True)
-        for name in ("filters", "capbnd", "pidfd_open"):
+        for name in ("filters", "capbnd", "pidfd_open", "join"):
             if name in overrides:
                 getattr(manager, name).side_effect = overrides[name]
         with ExitStack() as stack:
@@ -3810,13 +3831,17 @@ class LeaderExtractionTests(unittest.TestCase):
                 patch.object(sandy, "_read_capability_bounding_set", manager.capbnd)
             )
             stack.enter_context(
+                patch.object(sandy, "_read_process_cgroup", manager.cgroup)
+            )
+            stack.enter_context(
                 patch.object(sandy, "_pidfd_process_alive", manager.alive)
             )
+            stack.enter_context(patch.object(sandy, "_join_attach_leaf", manager.join))
             yield manager
 
     def test_extract_leader_confinement_success_order(self):
         with self.extraction_mocks() as manager:
-            confinement = sandy._extract_leader_confinement("ai-dev", 42)
+            confinement = sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
         self.assertEqual(
             confinement,
             sandy.LeaderConfinement(
@@ -3824,6 +3849,7 @@ class LeaderExtractionTests(unittest.TestCase):
                 namespace_fds=(21, 22, 23, 24, 25, 26, 27),
                 seccomp_filters=(b"old", b"new"),
                 capability_bounding_set=0xFDECBFFF,
+                attach_kill_fd=30,
             ),
         )
         ns_flags = os.O_RDONLY | os.O_CLOEXEC
@@ -3843,16 +3869,66 @@ class LeaderExtractionTests(unittest.TestCase):
                 call.open("ns/user", ns_flags, dir_fd=20),
                 call.filters(42),
                 call.capbnd(20),
+                call.cgroup(20),
                 call.close(20),
                 call.alive(10),
+                call.join("ai-dev", ATTACH_LEAF),
                 call.lock_exit(),
             ],
         )
 
+    def test_extract_leader_confinement_accepts_nested_payload_cgroup(self):
+        cgroup = "/system.slice/sandy-ai-dev.scope/payload/init.scope"
+        with self.extraction_mocks(cgroup=cgroup) as manager:
+            confinement = sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
+        self.assertEqual(confinement.attach_kill_fd, 30)
+        manager.join.assert_called_once_with("ai-dev", ATTACH_LEAF)
+
+    def test_extract_leader_confinement_rejects_leader_outside_scope(self):
+        for cgroup in (
+            "/machine.slice/machine-ai-dev.scope/payload",
+            "/system.slice/sandy-ai-dev.scope/supervisor",
+            "/system.slice/sandy-ai-dev.scope/payloadx",
+            "/system.slice/sandy-ai-dev.scope",
+            "/system.slice/sandy-other.scope/payload",
+        ):
+            with self.subTest(cgroup=cgroup):
+                with self.extraction_mocks(cgroup=cgroup) as manager:
+                    with self.assertRaisesRegex(PermissionError, "restart it"):
+                        sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
+                manager.join.assert_not_called()
+                self.assertEqual(
+                    manager.close.call_args_list[1:],
+                    [call(fd) for fd in (10, 21, 22, 23, 24, 25, 26, 27)],
+                )
+                manager.lock_exit.assert_called_once_with()
+
+    def test_extract_leader_confinement_closes_fds_when_join_fails(self):
+        with self.extraction_mocks(join=OSError(errno.ENOENT, "x")) as manager:
+            with self.assertRaises(OSError):
+                sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
+        self.assertEqual(
+            manager.close.call_args_list[1:],
+            [call(fd) for fd in (10, 21, 22, 23, 24, 25, 26, 27)],
+        )
+
+    def test_extract_leader_confinement_validates_leaf_and_name_before_lock(self):
+        for machine, leaf in (
+            ("ai-dev", "attach-x"),
+            ("ai-dev", "../payload"),
+            ("ai-dev", ATTACH_LEAF + "0"),
+            ("Bad", ATTACH_LEAF),
+        ):
+            with self.subTest(machine=machine, leaf=leaf):
+                with self.extraction_mocks() as manager:
+                    with self.assertRaises(ValueError):
+                        sandy._extract_leader_confinement(machine, 42, leaf)
+                manager.lock_enter.assert_not_called()
+
     def test_extract_leader_confinement_rejects_changed_leader(self):
         with self.extraction_mocks(leader=43) as manager:
             with self.assertRaises(PermissionError):
-                sandy._extract_leader_confinement("ai-dev", 42)
+                sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
         manager.open.assert_not_called()
         manager.close.assert_called_once_with(10)
         manager.lock_exit.assert_called_once_with()
@@ -3860,7 +3936,7 @@ class LeaderExtractionTests(unittest.TestCase):
     def test_extract_leader_confinement_closes_fds_when_leader_exits(self):
         with self.extraction_mocks(alive=False) as manager:
             with self.assertRaises(ProcessLookupError):
-                sandy._extract_leader_confinement("ai-dev", 42)
+                sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
         self.assertEqual(
             manager.close.call_args_list,
             [
@@ -3879,7 +3955,7 @@ class LeaderExtractionTests(unittest.TestCase):
     def test_extract_leader_confinement_closes_fds_on_partial_open(self):
         with self.extraction_mocks(open="ns/pid") as manager:
             with self.assertRaises(FileNotFoundError):
-                sandy._extract_leader_confinement("ai-dev", 42)
+                sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
         manager.filters.assert_not_called()
         self.assertEqual(
             manager.close.call_args_list,
@@ -3895,7 +3971,7 @@ class LeaderExtractionTests(unittest.TestCase):
             with self.subTest(name=name):
                 with self.extraction_mocks(**{name: error}) as manager:
                     with self.assertRaises(type(error)):
-                        sandy._extract_leader_confinement("ai-dev", 42)
+                        sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
                 manager.alive.assert_not_called()
                 manager.lock_exit.assert_called_once_with()
                 if name != "pidfd_open":
@@ -3906,7 +3982,7 @@ class LeaderExtractionTests(unittest.TestCase):
             with self.subTest(pid=pid):
                 with self.extraction_mocks() as manager:
                     with self.assertRaises(ValueError):
-                        sandy._extract_leader_confinement("ai-dev", pid)
+                        sandy._extract_leader_confinement("ai-dev", pid, ATTACH_LEAF)
                 manager.lock_enter.assert_not_called()
 
     def test_extract_leader_confinement_opens_nothing_without_lock(self):
@@ -3914,7 +3990,7 @@ class LeaderExtractionTests(unittest.TestCase):
             sandy, "_lifecycle_lock", side_effect=TimeoutError("busy")
         ), patch.object(sandy.os, "pidfd_open", create=True) as pidfd_open:
             with self.assertRaises(TimeoutError):
-                sandy._extract_leader_confinement("ai-dev", 42)
+                sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
         pidfd_open.assert_not_called()
 
 
@@ -3922,11 +3998,16 @@ class _ExitCalled(Exception):
     """Raised by a mocked os._exit so that a test can observe the exit code."""
 
 
+ATTACH_LEAF = "attach-" + "0123456789abcdef" * 2
+
+
 def entry_args(**overrides):
     """Return valid entry helper arguments that follow the mode argument."""
     values = {
         "machine": "ai-dev",
         "leader": "4242",
+        "parent": "4100",
+        "attach_leaf": ATTACH_LEAF,
         "user": "developer",
         "home": "/home/developer",
         "workdir": "/home/developer/workspace",
@@ -3947,6 +4028,7 @@ def entry_confinement(mask=0b101010):
         namespace_fds=(21, 22, 23, 24, 25, 26, 27),
         seccomp_filters=(b"oldest00", b"newest00"),
         capability_bounding_set=mask,
+        attach_kill_fd=30,
     )
 
 
@@ -3964,6 +4046,8 @@ class EntryHelperTests(unittest.TestCase):
             sandy.EntryRequest(
                 machine="ai-dev",
                 leader_pid=4242,
+                parent_pid=4100,
+                attach_leaf=ATTACH_LEAF,
                 user="developer",
                 home="/home/developer",
                 workdir="/home/developer/workspace",
@@ -4256,27 +4340,54 @@ class EntryHelperTests(unittest.TestCase):
         with patch.object(sandy.sys, "stderr", broken):
             sandy._entry_error(OSError("x"))
 
-    def test_wait_forwarding_signals_installs_then_unblocks_then_waits(self):
+    def test_wait_ending_attach_on_signal_installs_then_unblocks_then_waits(self):
         manager = MagicMock()
         manager.waitpid.return_value = (77, 0x300)
         with patch.object(sandy.signal, "signal", manager.signal), patch.object(
             sandy.signal, "pthread_sigmask", manager.sigmask
         ), patch.object(sandy.os, "waitpid", manager.waitpid), patch.object(
             sandy.os, "kill", manager.kill
+        ), patch.object(
+            sandy.os, "write", manager.write
         ):
-            self.assertEqual(sandy._wait_forwarding_signals(77), 0x300)
+            self.assertEqual(sandy._wait_ending_attach_on_signal(77, 30), 0x300)
             handler = manager.signal.call_args_list[0].args[1]
             handler(sandy.signal.SIGTERM, None)
-            manager.kill.side_effect = ProcessLookupError()
             handler(sandy.signal.SIGHUP, None)
         self.assertEqual(
             manager.mock_calls,
             [
                 call.signal(sandy.signal.SIGHUP, handler),
                 call.signal(sandy.signal.SIGTERM, handler),
-                call.sigmask(sandy.signal.SIG_UNBLOCK, sandy.ENTRY_FORWARDED_SIGNALS),
+                call.sigmask(sandy.signal.SIG_UNBLOCK, sandy.ENTRY_END_SIGNALS),
                 call.waitpid(77, 0),
+                call.write(30, b"1"),
+                call.write(30, b"1"),
+            ],
+        )
+
+    def test_wait_ending_attach_on_signal_forwards_when_kill_fails(self):
+        manager = MagicMock()
+        manager.waitpid.return_value = (77, 0)
+        manager.write.side_effect = OSError(errno.EBADF, "x")
+        with patch.object(sandy.signal, "signal", manager.signal), patch.object(
+            sandy.signal, "pthread_sigmask", manager.sigmask
+        ), patch.object(sandy.os, "waitpid", manager.waitpid), patch.object(
+            sandy.os, "kill", manager.kill
+        ), patch.object(
+            sandy.os, "write", manager.write
+        ):
+            sandy._wait_ending_attach_on_signal(77, 30)
+            handler = manager.signal.call_args_list[0].args[1]
+            handler(sandy.signal.SIGTERM, None)
+            manager.kill.side_effect = ProcessLookupError()
+            handler(sandy.signal.SIGHUP, None)
+        self.assertEqual(
+            manager.mock_calls[-4:],
+            [
+                call.write(30, b"1"),
                 call.kill(77, sandy.signal.SIGTERM),
+                call.write(30, b"1"),
                 call.kill(77, sandy.signal.SIGHUP),
             ],
         )
@@ -4474,9 +4585,11 @@ class EntryHelperTests(unittest.TestCase):
         ), patch.object(
             sandy, "_close_leader_confinement", manager.close
         ), patch.object(
+            sandy, "_close_fds", manager.close_fds
+        ), patch.object(
             sandy.os, "fork", manager.fork
         ), patch.object(
-            sandy, "_wait_forwarding_signals", manager.wait
+            sandy, "_wait_ending_attach_on_signal", manager.wait
         ), patch.object(
             sandy, "_propagate_wait_status", manager.propagate
         ), patch.object(
@@ -4502,6 +4615,8 @@ class EntryHelperTests(unittest.TestCase):
         self.assertEqual(
             manager.mock_calls,
             [
+                # Only the helper keeps the attach leaf's cgroup.kill.
+                call.close_fds((30,)),
                 call.setns(21, sandy.CLONE_NEWCGROUP),
                 call.setns(22, sandy.CLONE_NEWIPC),
                 call.setns(23, sandy.CLONE_NEWUTS),
@@ -4512,7 +4627,7 @@ class EntryHelperTests(unittest.TestCase):
                 call.setgroups([]),
                 call.setresgid(0, 0, 0),
                 call.setresuid(0, 0, 0),
-                call.close(confinement),
+                call.close_fds((10, 21, 22, 23, 24, 25, 26, 27)),
                 call.fork(),
                 # The middle process does not wait: the session is reparented
                 # to the helper.
@@ -4581,7 +4696,9 @@ class EntryHelperTests(unittest.TestCase):
         ), patch.object(
             sandy, "_close_leader_confinement", manager.close
         ), patch.object(
-            sandy, "_wait_forwarding_signals", manager.wait
+            sandy, "_close_fds", manager.close_fds
+        ), patch.object(
+            sandy, "_wait_ending_attach_on_signal", manager.wait
         ), patch.object(
             sandy, "_propagate_wait_status", manager.propagate
         ), patch.object(
@@ -4600,15 +4717,16 @@ class EntryHelperTests(unittest.TestCase):
         self.assertEqual(
             manager.mock_calls,
             [
-                call.sigmask(sandy.signal.SIG_BLOCK, sandy.ENTRY_FORWARDED_SIGNALS),
+                call.sigmask(sandy.signal.SIG_BLOCK, sandy.ENTRY_END_SIGNALS),
                 call.signal(sandy.signal.SIGINT, sandy.signal.SIG_IGN),
                 call.signal(sandy.signal.SIGQUIT, sandy.signal.SIG_IGN),
                 call.subreaper(),
                 call.fork(),
-                call.close(confinement),
+                # The helper keeps the leaf's cgroup.kill for its handler.
+                call.close_fds((10, 21, 22, 23, 24, 25, 26, 27)),
                 call.waitpid(77, 0),
                 call.children(),
-                call.wait(88),
+                call.wait(88, 30),
                 call.propagate(0),
             ],
         )
@@ -4690,6 +4808,7 @@ class EntryHelperTests(unittest.TestCase):
                 sandy._run_confined_entry(request, {"A": "b"}, confinement, 5)
         manager.middle.assert_called_once_with(request, {"A": "b"}, confinement, 5)
         manager.close.assert_not_called()
+        manager.close_fds.assert_not_called()
 
     @contextmanager
     def helper_mocks(self, **overrides):
@@ -4702,10 +4821,13 @@ class EntryHelperTests(unittest.TestCase):
             "confinement", entry_confinement(0xFDECBFFF)
         )
         manager.run.return_value = 0
-        for name in ("verify", "extract", "cap_last"):
+        manager.getppid.return_value = overrides.get("ppid", 4100)
+        for name in ("verify", "extract", "cap_last", "pdeathsig"):
             if name in overrides:
                 getattr(manager, name).side_effect = overrides[name]
         with patch.object(sandy.os, "geteuid", manager.geteuid), patch.object(
+            sandy, "_set_parent_death_signal", manager.pdeathsig
+        ), patch.object(sandy.os, "getppid", manager.getppid), patch.object(
             sandy.threading, "active_count", manager.active_count
         ), patch.object(
             sandy, "_verify_entry_helper_fds", manager.verify
@@ -4734,7 +4856,13 @@ class EntryHelperTests(unittest.TestCase):
             self.assertEqual(sandy._entry_helper_main(self.helper_argv()), 0)
         manager.verify.assert_called_once_with("/proc/self/fd/3")
         manager.os_close.assert_called_once_with(3)
-        manager.extract.assert_called_once_with("ai-dev", 4242)
+        manager.pdeathsig.assert_called_once_with(sandy.signal.SIGTERM)
+        manager.extract.assert_called_once_with("ai-dev", 4242, ATTACH_LEAF)
+        # The parent-death signal is set before the parent check and before
+        # the extraction joins the attach leaf.
+        names = [entry[0] for entry in manager.mock_calls]
+        self.assertLess(names.index("pdeathsig"), names.index("getppid"))
+        self.assertLess(names.index("getppid"), names.index("extract"))
         manager.run.assert_called_once_with(
             entry_request(),
             sandy._container_environment("developer", "/home/developer")
@@ -4752,6 +4880,11 @@ class EntryHelperTests(unittest.TestCase):
             ({}, ["/proc/self/fd/3"]),
             ({"verify": PermissionError("fds")}, self.helper_argv()),
             ({}, self.helper_argv(workdir="relative")),
+            ({}, self.helper_argv(parent="0")),
+            ({}, self.helper_argv(attach_leaf="attach-../x")),
+            ({"pdeathsig": OSError(errno.EINVAL, "x")}, self.helper_argv()),
+            # The parent exited before the prctl, so this is a new parent.
+            ({"ppid": 1}, self.helper_argv()),
             ({"cap_last": ValueError("bad")}, self.helper_argv()),
         )
         for overrides, argv in cases:
@@ -7195,21 +7328,101 @@ class ExecutionTests(unittest.TestCase):
 
     def test_machine_poweroff_cleans_state_first(self):
         instance = make_sandy()
+        manager = MagicMock()
+        manager.wait.return_value = True
         with patch.object(instance, "_is_container_running", return_value="123"):
             with patch.object(
-                instance,
-                "_cleanup_port_mappings_for_container",
-            ) as cleanup:
-                with patch.object(sandy, "_run_secure_subprocess") as run:
-                    instance._machine_poweroff()
-        cleanup.assert_called_once_with("ai-dev")
+                instance, "_cleanup_port_mappings_for_container", manager.cleanup
+            ):
+                with patch.object(sandy, "_run_secure_subprocess", manager.run):
+                    with patch.object(
+                        instance, "_wait_for_container_stop", manager.wait
+                    ):
+                        instance._machine_poweroff()
+        # A successful poweroff is not followed by terminate, which would
+        # fail with "No machine known".
         self.assertEqual(
-            [entry.args[0] for entry in run.call_args_list],
+            manager.mock_calls,
             [
-                ["machinectl", "poweroff", "ai-dev"],
-                ["machinectl", "terminate", "ai-dev"],
+                call.cleanup("ai-dev"),
+                call.run(["machinectl", "poweroff", "ai-dev"]),
+                call.wait("ai-dev"),
             ],
         )
+
+    def test_machine_poweroff_terminates_only_after_timeout(self):
+        for stopped_after_terminate in (True, False):
+            with self.subTest(stopped_after_terminate=stopped_after_terminate):
+                instance = make_sandy()
+                manager = MagicMock()
+                manager.wait.side_effect = [False, stopped_after_terminate]
+                with patch.object(
+                    instance, "_is_container_running", return_value="123"
+                ), patch.object(
+                    instance, "_cleanup_port_mappings_for_container", manager.cleanup
+                ), patch.object(
+                    sandy, "_run_secure_subprocess", manager.run
+                ), patch.object(
+                    instance, "_wait_for_container_stop", manager.wait
+                ):
+                    with captured_output() as (stdout, _):
+                        instance._machine_poweroff("other")
+                self.assertEqual(
+                    manager.mock_calls[1:],
+                    [
+                        call.run(["machinectl", "poweroff", "other"]),
+                        call.wait("other"),
+                        call.run(
+                            ["machinectl", "terminate", "other"],
+                            stderr=subprocess.DEVNULL,
+                        ),
+                        call.wait("other"),
+                    ],
+                )
+                self.assertEqual(
+                    "did not stop" in stdout.getvalue(), not stopped_after_terminate
+                )
+
+    def test_machine_poweroff_skips_stopped_container(self):
+        instance = make_sandy()
+        with patch.object(instance, "_is_container_running", return_value=None):
+            with patch.object(sandy, "_run_secure_subprocess") as run:
+                with captured_output() as (stdout, _):
+                    instance._machine_poweroff()
+        run.assert_not_called()
+        self.assertIn("not found or not running", stdout.getvalue())
+
+    def test_wait_for_container_stop_needs_machine_and_scope_gone(self):
+        instance = make_sandy()
+        with patch.object(
+            instance, "_is_container_running", side_effect=["123", None, None]
+        ) as running, patch.object(
+            sandy,
+            "_supervisor_unit_loaded",
+            side_effect=[ValueError("Malformed"), False],
+        ) as loaded, patch.object(
+            sandy.time, "sleep"
+        ) as sleep:
+            self.assertTrue(instance._wait_for_container_stop("ai-dev"))
+        self.assertEqual(running.call_count, 3)
+        self.assertEqual(loaded.call_args_list, [call("ai-dev")] * 2)
+        self.assertEqual(
+            sleep.call_args_list, [call(sandy.CONTAINER_STOP_POLL_INTERVAL)] * 2
+        )
+
+    def test_wait_for_container_stop_times_out(self):
+        instance = make_sandy()
+        with patch.object(
+            instance, "_is_container_running", return_value=None
+        ), patch.object(
+            sandy, "_supervisor_unit_loaded", return_value=True
+        ), patch.object(
+            sandy.time, "monotonic", side_effect=[0, 0, 1, 6]
+        ), patch.object(
+            sandy.time, "sleep"
+        ) as sleep:
+            self.assertFalse(instance._wait_for_container_stop("ai-dev"))
+        self.assertEqual(sleep.call_count, 2)
 
     @contextmanager
     def entry_script(self, instance):
@@ -7228,8 +7441,18 @@ class ExecutionTests(unittest.TestCase):
             sandy.os, "close", side_effect=close
         ), patch.object(instance, "_ensure_cache_dir") as ensure, patch.object(
             sandy.sys, "executable", "/usr/bin/python3"
-        ):
-            yield SimpleNamespace(fd=fd, closed=closed, ensure=ensure)
+        ), patch.object(
+            sandy, "_new_attach_leaf", return_value=ATTACH_LEAF
+        ), patch.object(
+            sandy.os, "getpid", return_value=4100
+        ), patch.object(
+            sandy, "_remove_attach_leaf"
+        ) as remove_leaf, patch.object(
+            instance, "_stop_if_last_attach"
+        ) as rule:
+            yield SimpleNamespace(
+                fd=fd, closed=closed, ensure=ensure, remove_leaf=remove_leaf, rule=rule
+            )
 
     def helper_argv(self, fd, *args):
         return [
@@ -7258,6 +7481,8 @@ class ExecutionTests(unittest.TestCase):
                 script.fd,
                 "ai-dev",
                 "123",
+                "4100",
+                ATTACH_LEAF,
                 "developer",
                 "/home/developer",
                 "/home/developer/workspace",
@@ -7269,6 +7494,7 @@ class ExecutionTests(unittest.TestCase):
         )
         script.ensure.assert_called_once_with()
         self.assertEqual(script.closed, [script.fd])
+        script.remove_leaf.assert_called_once_with("ai-dev", ATTACH_LEAF)
         environment = interactive.call_args.kwargs["environment"]
         self.assertNotIn("SANDY_TEST_HOST_SECRET", environment)
 
@@ -7318,6 +7544,8 @@ class ExecutionTests(unittest.TestCase):
                 script.fd,
                 "ai-dev",
                 "123",
+                "4100",
+                ATTACH_LEAF,
                 "developer",
                 "/home/developer",
                 "/",
@@ -7339,7 +7567,7 @@ class ExecutionTests(unittest.TestCase):
                         ) as interactive:
                             instance._exec("id")
         self.assertEqual(
-            interactive.call_args.args[0][6:10], ["root", "/root", "/", "tty"]
+            interactive.call_args.args[0][8:12], ["root", "/root", "/", "tty"]
         )
 
     def test_exec_as_root_runs_entry_helper(self):
@@ -7361,6 +7589,8 @@ class ExecutionTests(unittest.TestCase):
                 script.fd,
                 "ai-dev",
                 "123",
+                "4100",
+                ATTACH_LEAF,
                 "root",
                 "/root",
                 "/",
@@ -7371,6 +7601,7 @@ class ExecutionTests(unittest.TestCase):
             pass_fds=(script.fd,),
         )
         self.assertEqual(script.closed, [script.fd])
+        script.remove_leaf.assert_called_once_with("ai-dev", ATTACH_LEAF)
 
         with captured_output():
             with self.assertRaises(SystemExit):
@@ -7391,6 +7622,8 @@ class ExecutionTests(unittest.TestCase):
         request = sandy.EntryRequest(
             machine="ai-dev",
             leader_pid=123,
+            parent_pid=4100,
+            attach_leaf=ATTACH_LEAF,
             user="root",
             home="/root",
             workdir="/",
@@ -7402,6 +7635,27 @@ class ExecutionTests(unittest.TestCase):
                 with instance._entry_helper_command(request):
                     raise RuntimeError("helper failed")
         self.assertEqual(script.closed, [script.fd])
+        script.remove_leaf.assert_called_once_with("ai-dev", ATTACH_LEAF)
+
+    def test_entry_helper_command_warns_when_leaf_removal_fails(self):
+        instance = make_sandy()
+        for error in (
+            TimeoutError("Attach cgroup did not become empty"),
+            OSError(errno.EBUSY, "busy\x1b[0m"),
+            ValueError("Malformed cgroup.events"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(
+                    sandy, "_remove_attach_leaf", side_effect=error
+                ) as remove:
+                    with captured_output() as (stdout, _):
+                        instance._end_attach_leaf(ATTACH_LEAF)
+                remove.assert_called_once_with("ai-dev", ATTACH_LEAF)
+                self.assertIn(
+                    f"W: Could not remove attach cgroup {ATTACH_LEAF}",
+                    stdout.getvalue(),
+                )
+                self.assertNotIn("\x1b", stdout.getvalue())
 
     def test_open_entry_script_checks_the_running_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7434,9 +7688,8 @@ class ExecutionTests(unittest.TestCase):
         self.assertNotIn('"nsenter"', source)
         self.assertNotIn('"su"', source)
 
-    def test_interactive_wrapper_wires_callbacks_and_finishes_spinner(self):
+    def test_interactive_wrapper_wires_callbacks(self):
         instance = make_sandy()
-        spinner = threading.Event()
 
         def run_pty(command, *, master_read, stdin_read, environment, pass_fds):
             self.assertEqual(command, ["tool"])
@@ -7457,11 +7710,9 @@ class ExecutionTests(unittest.TestCase):
                     instance._run_container_interactive(
                         ["tool"],
                         environment={"PATH": sandy.CONTAINER_PATH},
-                        spinner_line_event=spinner,
                     ),
                     7,
                 )
-        self.assertTrue(spinner.is_set())
 
     def test_wait_for_container_ready_retries(self):
         instance = make_sandy()
@@ -7471,7 +7722,7 @@ class ExecutionTests(unittest.TestCase):
         ) as run_as_root:
             with patch("time.sleep") as sleep:
                 self.assertTrue(instance._wait_for_container_ready())
-        sleep.assert_called_once_with(1)
+        sleep.assert_called_once_with(sandy.CONTAINER_READY_INTERVAL)
         self.assertEqual(
             run_as_root.call_args_list,
             [call("true", capture_output=True, timeout=5)] * 2,
@@ -7552,24 +7803,21 @@ class ExecutionTests(unittest.TestCase):
 
     def test_run_init_script_conditions_and_success(self):
         instance = make_sandy()
-        self.assertFalse(instance._run_init_script(network_mode="host"))
         instance.network = make_network()
         result = SimpleNamespace(returncode=0)
         with patch.object(instance, "_get_machine_dir", return_value="/machine"):
             with patch.object(sandy.os.path, "exists", return_value=True):
                 with patch.object(
                     instance,
-                    "_wait_for_container_ready",
-                    return_value=True,
-                ):
-                    with patch.object(
-                        instance,
-                        "_exec_as_root",
-                        return_value=result,
-                    ) as execute:
-                        with captured_output():
-                            self.assertTrue(instance._run_init_script())
+                    "_exec_as_root",
+                    return_value=result,
+                ) as execute:
+                    with captured_output() as (stdout, _):
+                        instance._run_init_script(network_mode="host")
+                        execute.assert_not_called()
+                        instance._run_init_script()
         execute.assert_called_once_with("/bin/sh /init.sh")
+        self.assertEqual(stdout.getvalue(), "")
 
     def test_spinner_finishes_once_with_optional_suffix(self):
         event = threading.Event()
@@ -7596,7 +7844,6 @@ class ExecutionTests(unittest.TestCase):
 
     def test_interactive_wrapper_handles_io_errors_and_pty_failure(self):
         instance = make_sandy()
-        spinner = threading.Event()
 
         def run_pty(_command, *, master_read, stdin_read, environment, pass_fds):
             self.assertEqual(environment, {"PATH": sandy.CONTAINER_PATH})
@@ -7615,9 +7862,7 @@ class ExecutionTests(unittest.TestCase):
                 instance._run_container_interactive(
                     ["tool"],
                     environment={"PATH": sandy.CONTAINER_PATH},
-                    spinner_line_event=spinner,
                 )
-        self.assertTrue(spinner.is_set())
 
     def test_wait_for_container_ready_handles_failures_and_spinner_stop(self):
         instance = make_sandy()
@@ -7670,28 +7915,19 @@ class ExecutionTests(unittest.TestCase):
                     self.assertIsNone(instance._get_container_ip())
         self.assertIn("Could not read container IP", stdout.getvalue())
 
-    def test_run_init_script_skips_or_reports_readiness_failure(self):
+    def test_run_init_script_skips_without_network_or_script(self):
         instance = make_sandy()
-        self.assertFalse(instance._run_init_script())
-
-        instance.network = make_network()
-        with patch.object(
-            instance,
-            "_get_machine_dir",
-            return_value="/machine",
-        ):
-            with patch.object(sandy.os.path, "exists", return_value=False):
-                self.assertFalse(instance._run_init_script())
-
-            with patch.object(sandy.os.path, "exists", return_value=True):
-                with patch.object(
-                    instance,
-                    "_wait_for_container_ready",
-                    return_value=False,
-                ):
-                    with captured_output() as (stdout, _):
-                        self.assertTrue(instance._run_init_script())
-        self.assertIn("not ready", stdout.getvalue())
+        with patch.object(instance, "_exec_as_root") as execute:
+            instance._run_init_script()
+            instance.network = make_network()
+            with patch.object(
+                instance,
+                "_get_machine_dir",
+                return_value="/machine",
+            ):
+                with patch.object(sandy.os.path, "exists", return_value=False):
+                    instance._run_init_script()
+        execute.assert_not_called()
 
     def test_run_init_script_reports_command_failure(self):
         instance = make_sandy()
@@ -7705,16 +7941,11 @@ class ExecutionTests(unittest.TestCase):
             with patch.object(sandy.os.path, "exists", return_value=True):
                 with patch.object(
                     instance,
-                    "_wait_for_container_ready",
-                    return_value=True,
+                    "_exec_as_root",
+                    return_value=failed,
                 ):
-                    with patch.object(
-                        instance,
-                        "_exec_as_root",
-                        return_value=failed,
-                    ):
-                        with captured_output() as (stdout, _):
-                            self.assertTrue(instance._run_init_script())
+                    with captured_output() as (stdout, _):
+                        instance._run_init_script()
         self.assertIn("script failed", stdout.getvalue())
 
 
@@ -8375,6 +8606,38 @@ class RunUpTests(unittest.TestCase):
         )
         verifier.start()
         self.addCleanup(verifier.stop)
+        # Mock the systemd unit query, readiness, the console attach, and the
+        # stop. The keepalive directory is real, in the temporary directory.
+        self.keepalive_script = PROJECT_DIR / "sandy-keepalive.sh"
+        self.supervisor_unit_loaded = self.start_patch(
+            sandy, "_supervisor_unit_loaded", False
+        )
+        self.wait_for_container_ready = self.start_patch(
+            sandy.Sandy, "_wait_for_container_ready", True
+        )
+        self.exec = self.start_patch(sandy.Sandy, "_exec", 0)
+        self.machine_poweroff = self.start_patch(sandy.Sandy, "_machine_poweroff", None)
+        # The stale port rule cleanup at the start of up.
+        self.stale_cleanup = self.start_patch(
+            sandy.Sandy, "_cleanup_port_mappings_for_container", None
+        )
+        reader = patch.object(
+            sandy,
+            "_read_keepalive_script",
+            return_value=self.keepalive_script.read_bytes(),
+        )
+        reader.start()
+        self.addCleanup(reader.stop)
+
+    def start_patch(self, target, attribute, value):
+        patcher = patch.object(target, attribute, return_value=value)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    @staticmethod
+    def nspawn_command(command):
+        """Return the nspawn part of a systemd-run command."""
+        return command[command.index("systemd-nspawn") :]
 
     def arguments(self, **overrides):
         values = {
@@ -8394,12 +8657,130 @@ class RunUpTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     instance.run_up(self.arguments())
 
+    def test_rejects_existing_or_unknown_unit_before_host_changes(self):
+        for loaded, message in (
+            ({"return_value": True}, "Unit 'sandy-ai-dev.scope' already exists"),
+            (
+                {"side_effect": ValueError("Malformed LoadState")},
+                "Could not query unit 'sandy-ai-dev.scope': 'Malformed LoadState'",
+            ),
+            (
+                {"side_effect": subprocess.CalledProcessError(1, ["systemctl"])},
+                "Could not query unit",
+            ),
+        ):
+            with self.subTest(message=message):
+                instance = make_sandy()
+                self.supervisor_unit_loaded.reset_mock(
+                    return_value=True, side_effect=True
+                )
+                self.supervisor_unit_loaded.configure_mock(**loaded)
+                with patch.object(instance, "_is_container_running", return_value=None):
+                    with patch.object(instance, "_get_machine_dir") as machine_dir:
+                        with patch.object(
+                            sandy, "_run_secure_subprocess_popen"
+                        ) as popen:
+                            with captured_output() as (stdout, _):
+                                with self.assertRaises(SystemExit):
+                                    instance.run_up(self.arguments())
+                self.assertIn(message, stdout.getvalue())
+                machine_dir.assert_not_called()
+                popen.assert_not_called()
+
+    def test_keepalive_failure_rejects_before_network_setup(self):
+        instance = make_sandy()
+        instance.workspace = None
+        with tempfile.TemporaryDirectory() as machine:
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(instance, "_get_machine_dir", return_value=machine):
+                    with patch.object(
+                        sandy,
+                        "_read_keepalive_script",
+                        side_effect=PermissionError("unsafe"),
+                    ):
+                        with patch.object(sandy, "SandyNet") as network:
+                            with patch.object(
+                                sandy, "_run_secure_subprocess_popen"
+                            ) as popen:
+                                with captured_output() as (stdout, _):
+                                    with self.assertRaises(SystemExit):
+                                        instance.run_up(
+                                            self.arguments(network="lenient")
+                                        )
+        self.assertIn("Could not prepare the keepalive payload", stdout.getvalue())
+        network.assert_not_called()
+        popen.assert_not_called()
+
+    def test_not_ready_container_is_stopped_and_reported(self):
+        for detach in (True, False):
+            with self.subTest(detach=detach):
+                instance = make_sandy()
+                instance.workspace = None
+                self.wait_for_container_ready.return_value = False
+                self.exec.reset_mock()
+                with tempfile.TemporaryDirectory() as machine:
+                    with patch.object(
+                        instance, "_is_container_running", return_value=None
+                    ):
+                        with patch.object(
+                            instance, "_get_machine_dir", return_value=machine
+                        ):
+                            with patch.object(
+                                instance, "_remove_port_mappings_from_state"
+                            ):
+                                with patch.object(
+                                    sandy, "_run_secure_subprocess_popen"
+                                ) as popen:
+                                    with patch.object(
+                                        instance, "_stop_failed_start"
+                                    ) as stop:
+                                        with patch.object(
+                                            instance, "_run_init_script"
+                                        ) as init:
+                                            with captured_output() as (stdout, _):
+                                                with self.assertRaises(SystemExit):
+                                                    instance.run_up(
+                                                        self.arguments(detach=detach)
+                                                    )
+                supervisor = popen.return_value
+                self.wait_for_container_ready.assert_called_with(
+                    spinner_line_event=ANY, supervisor=supervisor
+                )
+                stop.assert_called_once_with(supervisor)
+                init.assert_not_called()
+                self.exec.assert_not_called()
+                self.assertIn("E: Container 'ai-dev'", stdout.getvalue())
+
+    def test_init_failure_stops_the_started_container(self):
+        instance = make_sandy()
+        instance.workspace = None
+        with tempfile.TemporaryDirectory() as machine:
+            with patch.object(instance, "_is_container_running", return_value=None):
+                with patch.object(instance, "_get_machine_dir", return_value=machine):
+                    with patch.object(instance, "_remove_port_mappings_from_state"):
+                        with patch.object(
+                            sandy, "_run_secure_subprocess_popen"
+                        ) as popen:
+                            with patch.object(instance, "_stop_failed_start") as stop:
+                                with patch.object(
+                                    instance,
+                                    "_run_init_script",
+                                    side_effect=KeyboardInterrupt,
+                                ):
+                                    with captured_output():
+                                        with self.assertRaises(KeyboardInterrupt):
+                                            instance.run_up(self.arguments())
+        stop.assert_called_once_with(popen.return_value)
+        self.exec.assert_not_called()
+
     def test_rejects_ports_with_host_network(self):
         instance = make_sandy()
         with patch.object(instance, "_is_container_running", return_value=None):
             with captured_output():
                 with self.assertRaises(SystemExit):
                     instance.run_up(self.arguments(ports=["tcp:8080:80"]))
+        # CLI values are validated before any host change.
+        self.stale_cleanup.assert_not_called()
 
     def test_rejects_invalid_port_mapping(self):
         instance = make_sandy()
@@ -8412,6 +8793,7 @@ class RunUpTests(unittest.TestCase):
                             ports=["tcp:bad:80"],
                         )
                     )
+        self.stale_cleanup.assert_not_called()
 
     def test_detached_host_command_has_security_flags(self):
         instance = make_sandy()
@@ -8439,14 +8821,58 @@ class RunUpTests(unittest.TestCase):
                                 with captured_output():
                                     instance.run_up(self.arguments())
 
-        command = popen.call_args.args[0]
+        scope_command = popen.call_args.args[0]
+        self.assertEqual(
+            scope_command[: scope_command.index("systemd-nspawn")],
+            [
+                "systemd-run",
+                "--scope",
+                "--quiet",
+                "--unit=sandy-ai-dev.scope",
+                "--slice=system.slice",
+                "--description=Sandy container ai-dev (detached)",
+                "--property=Delegate=yes",
+                "--property=OOMPolicy=continue",
+                "--property=TasksMax=16384",
+                "--",
+            ],
+        )
+        command = self.nspawn_command(scope_command)
+        self.assertEqual(
+            command[2:9],
+            [
+                "--machine=ai-dev",
+                "--keep-unit",
+                "--console=passive",
+                "--tmpfs=/tmp:mode=1777",
+                "--as-pid2",
+                "--timezone=bind",
+                "--user=root",
+            ],
+        )
+        self.assertEqual(
+            command[-2:], ["/run/sandy/sandy-keepalive", "/run/sandy/keepalive.sh"]
+        )
         self.assertIn("--private-users=pick", command)
         self.assertIn("--ephemeral", command)
-        self.assertIn("--chdir=/home/developer", command)
+        self.assertFalse(any(argument.startswith("--chdir") for argument in command))
         self.assertTrue(
             any(argument.startswith("--system-call-filter=") for argument in command)
         )
         self.assertRegex(command[1], r"^--directory=/proc/self/fd/[0-9]+$")
+        # The keepalive directory is bound read-only and removed after start.
+        keepalive = [a for a in command if a.endswith(":/run/sandy")]
+        self.assertEqual(len(keepalive), 1)
+        keepalive_dir = keepalive[0].removeprefix("--bind-ro=").split(":", 1)[0]
+        self.assertTrue(
+            keepalive_dir.startswith(f"{tempfile.gettempdir()}/sandy-keepalive-")
+        )
+        self.assertFalse(os.path.lexists(keepalive_dir))
+        self.wait_for_container_ready.assert_called_once()
+        self.exec.assert_not_called()
+        self.machine_poweroff.assert_not_called()
+        # Stale rules of this name go on every up, also without -p.
+        self.stale_cleanup.assert_called_once_with("ai-dev")
         self.assertFalse(
             any(argument.startswith("--network-bridge=") for argument in command)
         )
@@ -8542,9 +8968,9 @@ class RunUpTests(unittest.TestCase):
                                     return_value=True,
                                 ) as init:
                                     with patch.object(
-                                        instance,
-                                        "_run_container_interactive",
-                                    ) as interactive:
+                                        sandy,
+                                        "_run_secure_subprocess_popen",
+                                    ) as popen:
                                         with patch.object(
                                             instance,
                                             "_cleanup_port_forwarding_rules",
@@ -8566,20 +8992,26 @@ class RunUpTests(unittest.TestCase):
 
         setup_forwarding.assert_called_once_with("10.200.1.10")
         self.assertEqual(setfacl.call_count, 2)
-        init.assert_called_once()
-        cleanup.assert_called_once_with()
-        self.assertEqual(remove_state.call_count, 2)
-        self.assertEqual(
-            remove_state.call_args_list,
-            [call("ai-dev"), call("ai-dev")],
-        )
+        init.assert_called_once_with(network_mode="lenient")
+        # The console is an attach. _exec applies the last-attach rule, and
+        # the stop removes the port forwarding rules.
+        self.exec.assert_called_once_with(None, login_shell=True)
+        self.machine_poweroff.assert_not_called()
+        cleanup.assert_not_called()
+        # up removes this name's stale rules and state once, at its start.
+        self.stale_cleanup.assert_called_once_with("ai-dev")
+        remove_state.assert_not_called()
         fchown.assert_called_once()
         self.assertEqual(
             fchown.call_args.args[1:],
             (sandy.CONTAINER_BASE_UID, sandy.CONTAINER_BASE_UID),
         )
-        command = interactive.call_args.args[0]
-        environment = interactive.call_args.kwargs["environment"]
+        scope_command = popen.call_args.args[0]
+        self.assertIn("--description=Sandy container ai-dev (attached)", scope_command)
+        # Scope units accept OOMPolicy= only from systemd 253.
+        self.assertFalse(any("OOMPolicy" in item for item in scope_command))
+        command = self.nspawn_command(scope_command)
+        environment = popen.call_args.kwargs["env"]
         self.assertEqual(environment["HOME"], "/home/developer")
         self.assertEqual(environment["USER"], "developer")
         self.assertIn(
@@ -8595,19 +9027,19 @@ class RunUpTests(unittest.TestCase):
             f"--bind={host_shared}:/home/developer/shared",
             command,
         )
-        self.assertIn("--chdir=/home/developer/workspace", command)
+        self.assertFalse(any(item.startswith("--chdir") for item in command))
         self.assertRegex(command[1], r"^--directory=/proc/self/fd/[0-9]+$")
         bind_ro = [
             argument for argument in command if argument.startswith("--bind-ro=")
         ]
-        self.assertEqual(len(bind_ro), 1)
+        self.assertEqual(len(bind_ro), 2)
         self.assertTrue(
             bind_ro[0].startswith(f"--bind-ro={tempfile.gettempdir()}/sandy-init-")
         )
         self.assertTrue(bind_ro[0].endswith("/init.sh:/init.sh"))
         bind_source = bind_ro[0].removeprefix("--bind-ro=").split(":", 1)[0]
         self.assertFalse(Path(bind_source).parent.exists())
-        self.assertEqual(len(interactive.call_args.kwargs["pass_fds"]), 1)
+        self.assertEqual(len(popen.call_args.kwargs["pass_fds"]), 1)
         self.assertIn("unknown architecture", stdout.getvalue())
 
     def test_modern_init_bind_uses_idmapped_read_only_mount(self):
@@ -8642,8 +9074,10 @@ class RunUpTests(unittest.TestCase):
         bind_ro = [
             argument for argument in command if argument.startswith("--bind-ro=")
         ]
-        self.assertEqual(len(bind_ro), 1)
+        self.assertEqual(len(bind_ro), 2)
         self.assertTrue(bind_ro[0].endswith("/init.sh:/init.sh:idmap"))
+        # The keepalive bind has no idmap: its files are world-readable.
+        self.assertTrue(bind_ro[1].endswith(":/run/sandy"))
 
     def test_init_bind_copy_is_cleaned_after_prelaunch_failure(self):
         instance = make_sandy()
@@ -8684,13 +9118,13 @@ class RunUpTests(unittest.TestCase):
                             side_effect=create_init_bind_copy,
                         ):
                             with patch.object(
-                                instance,
-                                "_remove_port_mappings_from_state",
-                                side_effect=RuntimeError("port state failure"),
+                                sandy,
+                                "_create_keepalive_dir",
+                                side_effect=RuntimeError("keepalive failure"),
                             ):
                                 with self.assertRaisesRegex(
                                     RuntimeError,
-                                    "port state failure",
+                                    "keepalive failure",
                                 ):
                                     with captured_output():
                                         instance.run_up(
@@ -8738,8 +9172,8 @@ class RunUpTests(unittest.TestCase):
                                 with captured_output() as (stdout, _):
                                     instance.run_up(self.arguments())
 
-        command = popen.call_args.args[0]
-        self.assertIn("--chdir=/home/developer", command)
+        command = self.nspawn_command(popen.call_args.args[0])
+        self.assertFalse(any(item.startswith("--chdir") for item in command))
         self.assertFalse(any(item.startswith("--bind=") for item in command))
         self.assertIn("skipping workspace mount", stdout.getvalue())
         self.assertIn("Skipping shared mount", stdout.getvalue())
@@ -9072,6 +9506,825 @@ class RunUpTests(unittest.TestCase):
                                 with captured_output() as (stdout, _):
                                     instance.run_up(self.arguments())
         self.assertIn("ignoring existing bridge", stdout.getvalue())
+
+
+class KeepaliveTests(unittest.TestCase):
+    """The keepalive payload files on the host.
+
+    Tests use real files in a private temporary directory. E2E tests must
+    prove that nspawn binds them and that the payload runs.
+    """
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        # Keep every keepalive directory of a test in its own tempdir.
+        patcher = patch.object(
+            sandy.tempfile, "gettempdir", return_value=self.tempdir.name
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(sandy.tempfile, "tempdir", self.tempdir.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_script(self, content, mode=0o755):
+        path = Path(self.tempdir.name) / "sandy-keepalive.sh"
+        path.write_bytes(content)
+        path.chmod(mode)
+        return str(path)
+
+    def test_read_keepalive_script_returns_the_repository_script(self):
+        content = (PROJECT_DIR / "sandy-keepalive.sh").read_bytes()
+        self.assertEqual(
+            sandy._read_keepalive_script(self.write_script(content)), content
+        )
+
+    def test_read_keepalive_script_rejects_unsafe_scripts(self):
+        cases = {
+            "group-writable": (b"#!/bin/bash\n", 0o775),
+            "world-writable": (b"#!/bin/bash\n", 0o757),
+            "empty": (b"", 0o755),
+            "too large": (b"#" * (sandy.KEEPALIVE_SCRIPT_MAX_BYTES + 1), 0o755),
+            "not ASCII": ("# é\n".encode("utf-8"), 0o755),
+            "NUL": (b"#!/bin/bash\n\x00", 0o755),
+        }
+        for label, (content, mode) in cases.items():
+            with self.subTest(label=label):
+                path = self.write_script(content, mode)
+                with self.assertRaises(PermissionError):
+                    sandy._read_keepalive_script(path)
+
+    def test_read_keepalive_script_rejects_symlink_and_directory(self):
+        target = self.write_script(b"#!/bin/bash\n")
+        link = os.path.join(self.tempdir.name, "link.sh")
+        os.symlink(target, link)
+        with self.assertRaises(OSError):
+            sandy._read_keepalive_script(link)
+        with self.assertRaises(PermissionError):
+            sandy._read_keepalive_script(self.tempdir.name)
+
+    def test_create_keepalive_dir_holds_exactly_link_and_copy(self):
+        directory = sandy._create_keepalive_dir(b"script\n")
+        self.assertTrue(
+            os.path.basename(directory).startswith(sandy.KEEPALIVE_DIR_PREFIX)
+        )
+        self.assertEqual(os.path.dirname(directory), self.tempdir.name)
+        self.assertEqual(stat.S_IMODE(os.lstat(directory).st_mode), 0o755)
+        self.assertEqual(
+            sorted(os.listdir(directory)), ["keepalive.sh", "sandy-keepalive"]
+        )
+        link = os.path.join(directory, "sandy-keepalive")
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.readlink(link), "/bin/bash")
+        copy = os.path.join(directory, "keepalive.sh")
+        self.assertEqual(stat.S_IMODE(os.lstat(copy).st_mode), 0o644)
+        self.assertEqual(Path(copy).read_bytes(), b"script\n")
+
+    def test_create_keepalive_dir_removes_partial_directory(self):
+        with patch.object(sandy.os, "write", return_value=0):
+            with self.assertRaisesRegex(OSError, "no progress"):
+                sandy._create_keepalive_dir(b"script\n")
+        self.assertEqual(os.listdir(self.tempdir.name), [])
+
+    def test_remove_keepalive_dir_removes_exact_entries(self):
+        directory = sandy._create_keepalive_dir(b"script\n")
+        sandy._remove_keepalive_dir(directory)
+        self.assertFalse(os.path.lexists(directory))
+
+    def test_remove_keepalive_dir_rejects_unexpected_paths(self):
+        other = os.path.join(self.tempdir.name, "other-dir")
+        os.mkdir(other)
+        for path in (
+            other,
+            "/etc/sandy-keepalive-x",
+            os.path.join(other, sandy.KEEPALIVE_DIR_PREFIX + "x"),
+        ):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(PermissionError, "unexpected"):
+                    sandy._remove_keepalive_dir(path)
+        self.assertTrue(os.path.isdir(other))
+
+    def test_remove_keepalive_dir_keeps_unexpected_entries(self):
+        directory = sandy._create_keepalive_dir(b"script\n")
+        extra = os.path.join(directory, "extra")
+        Path(extra).write_text("x")
+        with self.assertRaisesRegex(PermissionError, "unexpected entries"):
+            sandy._remove_keepalive_dir(directory)
+        self.assertTrue(os.path.exists(extra))
+        self.assertTrue(os.path.lexists(os.path.join(directory, "sandy-keepalive")))
+
+    def test_remove_keepalive_dir_rejects_unsafe_directory(self):
+        directory = sandy._create_keepalive_dir(b"script\n")
+        os.chmod(directory, 0o775)
+        with self.assertRaisesRegex(PermissionError, "unsafe permissions"):
+            sandy._remove_keepalive_dir(directory)
+        os.chmod(directory, 0o755)
+        with patch.object(sandy.os, "geteuid", return_value=12345):
+            with self.assertRaisesRegex(PermissionError, "ownership"):
+                sandy._remove_keepalive_dir(directory)
+        link = os.path.join(self.tempdir.name, sandy.KEEPALIVE_DIR_PREFIX + "link")
+        os.symlink(directory, link)
+        with self.assertRaises(OSError):
+            sandy._remove_keepalive_dir(link)
+        self.assertTrue(os.path.isdir(directory))
+
+
+class SupervisorScopeTests(unittest.TestCase):
+    """The transient scope that runs nspawn.
+
+    Tests mock _run_secure_subprocess. E2E tests must prove the unit layout
+    and its properties on each systemd version.
+    """
+
+    def test_unit_name_and_description(self):
+        self.assertEqual(sandy._supervisor_unit_name("ai-dev"), "sandy-ai-dev.scope")
+        for name in ("", "Ai", "-x", "a" * 64, "a.b", "a/b"):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    sandy._supervisor_unit_name(name)
+        self.assertEqual(
+            sandy._supervisor_description("ai-dev", True),
+            "Sandy container ai-dev (detached)",
+        )
+        self.assertEqual(
+            sandy._supervisor_description("ai-dev", False),
+            "Sandy container ai-dev (attached)",
+        )
+
+    def test_scope_argv_sets_oom_policy_only_from_systemd_253(self):
+        prefix = [
+            "systemd-run",
+            "--scope",
+            "--quiet",
+            "--unit=sandy-ai-dev.scope",
+            "--slice=system.slice",
+            "--description=Sandy container ai-dev (attached)",
+            "--property=Delegate=yes",
+        ]
+        suffix = ["--property=TasksMax=16384", "--"]
+        for version in (249, 252):
+            with self.subTest(version=version):
+                self.assertEqual(
+                    sandy._supervisor_scope_argv("ai-dev", version, False),
+                    prefix + suffix,
+                )
+        for version in (253, 257):
+            with self.subTest(version=version):
+                self.assertEqual(
+                    sandy._supervisor_scope_argv("ai-dev", version, False),
+                    prefix + ["--property=OOMPolicy=continue"] + suffix,
+                )
+        with self.assertRaises(ValueError):
+            sandy._supervisor_scope_argv("Bad", 255, False)
+
+    def test_systemctl_show_value_runs_exact_command(self):
+        result = SimpleNamespace(stdout="loaded\n")
+        with patch.object(sandy, "_run_secure_subprocess", return_value=result) as run:
+            self.assertEqual(
+                sandy._systemctl_show_value("sandy-x.scope", "LoadState"), "loaded"
+            )
+        run.assert_called_once_with(
+            ["systemctl", "show", "sandy-x.scope", "-p", "LoadState", "--value"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def test_systemctl_show_value_rejects_malformed_output(self):
+        for output in (
+            "a\nb\n",
+            "a\x1b[0m\n",
+            "x" * (sandy.SYSTEMCTL_VALUE_MAX_LENGTH + 1),
+        ):
+            with self.subTest(output=output[:10]):
+                with patch.object(
+                    sandy,
+                    "_run_secure_subprocess",
+                    return_value=SimpleNamespace(stdout=output),
+                ):
+                    with self.assertRaises(ValueError):
+                        sandy._systemctl_show_value("u.scope", "LoadState")
+        error = subprocess.CalledProcessError(1, ["systemctl"])
+        with patch.object(sandy, "_run_secure_subprocess", side_effect=error):
+            with self.assertRaises(subprocess.CalledProcessError):
+                sandy._systemctl_show_value("u.scope", "LoadState")
+
+    def test_unit_loaded_states(self):
+        for value, expected in (
+            ("not-found", False),
+            ("loaded", True),
+            ("masked", True),
+            ("bad-setting", True),
+        ):
+            with self.subTest(value=value):
+                with patch.object(
+                    sandy, "_systemctl_show_value", return_value=value
+                ) as show:
+                    self.assertIs(sandy._supervisor_unit_loaded("ai-dev"), expected)
+                show.assert_called_once_with("sandy-ai-dev.scope", "LoadState")
+        for value in ("", "Loaded", "not found", "x" * 40):
+            with self.subTest(value=value):
+                with patch.object(sandy, "_systemctl_show_value", return_value=value):
+                    with self.assertRaises(ValueError):
+                        sandy._supervisor_unit_loaded("ai-dev")
+
+
+class StartFailureTests(unittest.TestCase):
+    """What up does when the started container does not become ready.
+
+    Tests mock the supervisor process, the readiness probe, and the port
+    cleanup.
+    """
+
+    def test_wait_for_container_ready_stops_when_supervisor_exits(self):
+        instance = make_sandy()
+        supervisor = MagicMock()
+        supervisor.poll.return_value = 127
+        with patch.object(instance, "_run_as_root") as run_as_root:
+            self.assertFalse(instance._wait_for_container_ready(supervisor=supervisor))
+        run_as_root.assert_not_called()
+
+    def test_report_failed_start_reports_exit_status(self):
+        instance = make_sandy()
+        supervisor = MagicMock()
+        supervisor.poll.return_value = 127
+        with captured_output() as (stdout, _):
+            instance._report_failed_start(supervisor)
+        self.assertIn("exited before it was ready (exit status 127)", stdout.getvalue())
+        self.assertIn("/bin/bash and 'sleep'", stdout.getvalue())
+        supervisor.poll.return_value = None
+        with captured_output() as (stdout, _):
+            instance._report_failed_start(supervisor)
+        self.assertIn("did not become ready", stdout.getvalue())
+
+    def test_stop_failed_start_terminates_then_removes_port_rules(self):
+        instance = make_sandy()
+        manager = MagicMock()
+        manager.supervisor.poll.return_value = None
+        with patch.object(
+            instance, "_cleanup_port_mappings_for_container", manager.cleanup
+        ):
+            instance._stop_failed_start(manager.supervisor)
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                call.supervisor.poll(),
+                call.supervisor.terminate(),
+                call.supervisor.wait(timeout=sandy.CONTAINER_STOP_TIMEOUT),
+                call.cleanup("ai-dev"),
+            ],
+        )
+
+    def test_stop_failed_start_kills_after_timeout(self):
+        instance = make_sandy()
+        manager = MagicMock()
+        manager.supervisor.poll.return_value = None
+        manager.supervisor.wait.side_effect = [
+            subprocess.TimeoutExpired(["systemd-run"], 30),
+            0,
+        ]
+        with patch.object(
+            instance, "_cleanup_port_mappings_for_container", manager.cleanup
+        ):
+            instance._stop_failed_start(manager.supervisor)
+        self.assertEqual(
+            manager.mock_calls[1:],
+            [
+                call.supervisor.terminate(),
+                call.supervisor.wait(timeout=sandy.CONTAINER_STOP_TIMEOUT),
+                call.supervisor.kill(),
+                call.supervisor.wait(),
+                call.cleanup("ai-dev"),
+            ],
+        )
+
+    def test_stop_failed_start_skips_exited_supervisor(self):
+        instance = make_sandy()
+        supervisor = MagicMock()
+        supervisor.poll.return_value = 1
+        with patch.object(instance, "_cleanup_port_mappings_for_container") as clean:
+            instance._stop_failed_start(supervisor)
+        supervisor.terminate.assert_not_called()
+        clean.assert_called_once_with("ai-dev")
+
+
+class AttachCgroupTests(unittest.TestCase):
+    """Attach leaf cgroups in the container's scope.
+
+    Tests use plain directories and regular files in place of cgroupfs, and
+    mock the checks that need root. E2E tests must prove the real cgroup
+    moves, cgroup.kill, and removal.
+    """
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.unit = self.root / "system.slice" / "sandy-ai-dev.scope"
+        self.unit.mkdir(parents=True)
+
+    def fake_leaf(self, name=ATTACH_LEAF, events="populated 0\nfrozen 0\n"):
+        leaf = self.unit / name
+        leaf.mkdir()
+        for filename in ("cgroup.kill", "cgroup.procs"):
+            (leaf / filename).write_bytes(b"")
+        (leaf / "cgroup.events").write_text(events)
+        return leaf
+
+    def root_fstat(self):
+        """Report every directory as owned by root, as on cgroupfs."""
+        real_fstat = os.fstat
+
+        def fstat(fd):
+            result = real_fstat(fd)
+            return SimpleNamespace(st_uid=0, st_dev=result.st_dev)
+
+        return patch.object(sandy.os, "fstat", side_effect=fstat)
+
+    def open_unit(self):
+        return os.open(self.unit, sandy.DIRECTORY_OPEN_FLAGS)
+
+    def test_read_process_cgroup(self):
+        proc = self.root / "proc"
+        proc.mkdir()
+        cases = {
+            "0::/system.slice/sandy-ai-dev.scope/payload\n": (
+                "/system.slice/sandy-ai-dev.scope/payload"
+            ),
+            "0::/\n": "/",
+        }
+        proc_fd = os.open(proc, sandy.DIRECTORY_OPEN_FLAGS)
+        self.addCleanup(os.close, proc_fd)
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                (proc / "cgroup").write_text(text)
+                self.assertEqual(sandy._read_process_cgroup(proc_fd), expected)
+        for text in (
+            "",
+            "0::/a",
+            "0::relative\n",
+            "1:name=systemd:/a\n0::/a\n",
+            "0::/a\n0::/b\n",
+            "0::/" + "a" * sandy.PROC_CGROUP_MAX_BYTES + "\n",
+        ):
+            with self.subTest(text=text[:30]):
+                (proc / "cgroup").write_text(text)
+                with self.assertRaisesRegex(ValueError, "cgroup v2"):
+                    sandy._read_process_cgroup(proc_fd)
+
+    def test_open_supervisor_cgroup_walks_without_symlinks(self):
+        with patch.object(sandy, "CGROUP_ROOT", str(self.root)), self.root_fstat():
+            fd = sandy._open_supervisor_cgroup("ai-dev")
+        try:
+            self.assertTrue(os.path.samestat(os.fstat(fd), self.unit.stat()))
+        finally:
+            os.close(fd)
+
+        with patch.object(sandy, "CGROUP_ROOT", str(self.root)), self.root_fstat():
+            with self.assertRaises(FileNotFoundError):
+                sandy._open_supervisor_cgroup("other")
+        with patch.object(sandy, "CGROUP_ROOT", str(self.root)):
+            with self.assertRaises(ValueError):
+                sandy._open_supervisor_cgroup("Bad")
+            # Not owned by root: this test does not run as root.
+            if os.geteuid() != 0:
+                with self.assertRaisesRegex(PermissionError, "Unexpected cgroup"):
+                    sandy._open_supervisor_cgroup("ai-dev")
+
+        link_root = self.root / "link-root"
+        (link_root / "system.slice").mkdir(parents=True)
+        (link_root / "system.slice" / "sandy-ai-dev.scope").symlink_to(self.unit)
+        with patch.object(sandy, "CGROUP_ROOT", str(link_root)), self.root_fstat():
+            with self.assertRaises(OSError):
+                sandy._open_supervisor_cgroup("ai-dev")
+
+    def test_open_supervisor_cgroup_rejects_other_filesystem(self):
+        real_fstat = os.fstat
+        devices = iter((1, 2))
+
+        def fstat(fd):
+            _ = real_fstat(fd)
+            return SimpleNamespace(st_uid=0, st_dev=next(devices))
+
+        with patch.object(sandy, "CGROUP_ROOT", str(self.root)), patch.object(
+            sandy.os, "fstat", side_effect=fstat
+        ), patch.object(sandy.os, "close", wraps=os.close) as close:
+            with self.assertRaisesRegex(PermissionError, "system.slice"):
+                sandy._open_supervisor_cgroup("ai-dev")
+        # The root and the slice descriptors are closed.
+        self.assertEqual(close.call_count, 2)
+
+    def test_cgroup_populated(self):
+        leaf = self.fake_leaf()
+        leaf_fd = os.open(leaf, sandy.DIRECTORY_OPEN_FLAGS)
+        self.addCleanup(os.close, leaf_fd)
+        for text, expected in (
+            ("populated 0\nfrozen 0\n", False),
+            ("populated 1\nfrozen 0\n", True),
+        ):
+            with self.subTest(text=text):
+                (leaf / "cgroup.events").write_text(text)
+                self.assertIs(sandy._cgroup_populated(leaf_fd), expected)
+        for text in (
+            "",
+            "frozen 0\n",
+            "populated 2\n",
+            "populated 0\npopulated 1\n",
+            "populated\n",
+            "populated 0\n" + "x" * sandy.CGROUP_EVENTS_MAX_BYTES,
+        ):
+            with self.subTest(text=text[:20]):
+                (leaf / "cgroup.events").write_text(text)
+                with self.assertRaisesRegex(ValueError, "cgroup.events"):
+                    sandy._cgroup_populated(leaf_fd)
+
+    def test_write_cgroup_file_rejects_short_write(self):
+        leaf = self.fake_leaf()
+        leaf_fd = os.open(leaf, sandy.DIRECTORY_OPEN_FLAGS)
+        self.addCleanup(os.close, leaf_fd)
+        sandy._write_cgroup_file(leaf_fd, "cgroup.kill", b"1")
+        self.assertEqual((leaf / "cgroup.kill").read_bytes(), b"1")
+        with patch.object(sandy.os, "write", return_value=0):
+            with self.assertRaisesRegex(OSError, "Short write"):
+                sandy._write_cgroup_file(leaf_fd, "cgroup.kill", b"1")
+        with self.assertRaises(FileNotFoundError):
+            sandy._write_cgroup_file(leaf_fd, "cgroup.missing", b"1")
+
+    def test_join_attach_leaf_creates_leaf_and_moves_this_process(self):
+        real_mkdir = os.mkdir
+
+        def mkdir(name, mode, dir_fd):
+            real_mkdir(name, mode, dir_fd=dir_fd)
+            for filename in ("cgroup.kill", "cgroup.procs"):
+                (self.unit / name / filename).write_bytes(b"")
+
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
+        ), patch.object(sandy.os, "mkdir", side_effect=mkdir) as make:
+            kill_fd = sandy._join_attach_leaf("ai-dev", ATTACH_LEAF)
+        try:
+            self.assertEqual(make.call_args.args[:2], (ATTACH_LEAF, 0o755))
+            self.assertEqual(
+                (self.unit / ATTACH_LEAF / "cgroup.procs").read_bytes(), b"0"
+            )
+            os.write(kill_fd, b"1")
+            self.assertEqual(
+                (self.unit / ATTACH_LEAF / "cgroup.kill").read_bytes(), b"1"
+            )
+            self.assertFalse(os.get_inheritable(kill_fd))
+        finally:
+            os.close(kill_fd)
+
+    def test_join_attach_leaf_removes_leaf_when_move_fails(self):
+        real_mkdir = os.mkdir
+
+        def mkdir(name, mode, dir_fd):
+            real_mkdir(name, mode, dir_fd=dir_fd)
+            (self.unit / name / "cgroup.kill").write_bytes(b"")
+
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
+        ), patch.object(sandy.os, "mkdir", side_effect=mkdir):
+            with patch.object(sandy.os, "rmdir", wraps=os.rmdir) as rmdir:
+                with self.assertRaises(FileNotFoundError):
+                    sandy._join_attach_leaf("ai-dev", ATTACH_LEAF)
+        # The fake leaf still holds a file, so the rmdir fails; it is tried.
+        rmdir.assert_called_once_with(ATTACH_LEAF, dir_fd=ANY)
+
+    def test_join_attach_leaf_rejects_existing_leaf_and_bad_names(self):
+        self.fake_leaf()
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
+        ):
+            with self.assertRaises(FileExistsError):
+                sandy._join_attach_leaf("ai-dev", ATTACH_LEAF)
+            for leaf in ("payload", "attach-", "../attach-" + "0" * 32):
+                with self.subTest(leaf=leaf):
+                    with self.assertRaises(ValueError):
+                        sandy._join_attach_leaf("ai-dev", leaf)
+        self.assertEqual((self.unit / ATTACH_LEAF / "cgroup.procs").read_bytes(), b"")
+
+    def test_end_attach_leaf_kills_waits_and_removes(self):
+        leaf = self.fake_leaf(events="populated 1\n")
+        polls = []
+
+        def sleep(_seconds):
+            polls.append(_seconds)
+            (leaf / "cgroup.events").write_text("populated 0\n")
+
+        unit_fd = self.open_unit()
+        self.addCleanup(os.close, unit_fd)
+        with patch.object(sandy.time, "sleep", side_effect=sleep), patch.object(
+            sandy.os, "rmdir"
+        ) as rmdir:
+            sandy._end_attach_leaf(unit_fd, ATTACH_LEAF)
+        self.assertEqual((leaf / "cgroup.kill").read_bytes(), b"1")
+        self.assertEqual(polls, [sandy.ATTACH_LEAF_POLL_INTERVAL])
+        rmdir.assert_called_once_with(ATTACH_LEAF, dir_fd=unit_fd)
+
+    def test_end_attach_leaf_is_idempotent_and_times_out(self):
+        unit_fd = self.open_unit()
+        self.addCleanup(os.close, unit_fd)
+        with patch.object(sandy.os, "rmdir") as rmdir:
+            sandy._end_attach_leaf(unit_fd, ATTACH_LEAF)
+        rmdir.assert_not_called()
+
+        self.fake_leaf(events="populated 1\n")
+        with patch.object(
+            sandy.time, "monotonic", side_effect=[0, 0, 10]
+        ), patch.object(sandy.time, "sleep"), patch.object(sandy.os, "rmdir") as rmdir:
+            with self.assertRaisesRegex(TimeoutError, "did not become empty"):
+                sandy._end_attach_leaf(unit_fd, ATTACH_LEAF)
+        rmdir.assert_not_called()
+
+        (self.unit / ATTACH_LEAF / "cgroup.events").write_text("populated 0\n")
+        with patch.object(sandy.os, "rmdir", side_effect=FileNotFoundError):
+            sandy._end_attach_leaf(unit_fd, ATTACH_LEAF)
+        with patch.object(sandy.os, "rmdir", side_effect=OSError(errno.EBUSY, "x")):
+            with self.assertRaises(OSError):
+                sandy._end_attach_leaf(unit_fd, ATTACH_LEAF)
+        with self.assertRaises(ValueError):
+            sandy._end_attach_leaf(unit_fd, "payload")
+
+    def test_remove_attach_leaf_skips_missing_scope(self):
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=FileNotFoundError
+        ), patch.object(sandy, "_end_attach_leaf") as end:
+            sandy._remove_attach_leaf("ai-dev", ATTACH_LEAF)
+        end.assert_not_called()
+
+        unit_fd = self.open_unit()
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", return_value=unit_fd
+        ), patch.object(
+            sandy, "_end_attach_leaf", side_effect=TimeoutError("busy")
+        ) as end, patch.object(
+            sandy.os, "close", wraps=os.close
+        ) as close:
+            with self.assertRaises(TimeoutError):
+                sandy._remove_attach_leaf("ai-dev", ATTACH_LEAF)
+        end.assert_called_once_with(unit_fd, ATTACH_LEAF)
+        close.assert_called_once_with(unit_fd)
+
+    def test_new_attach_leaf_is_random_and_valid(self):
+        first = sandy._new_attach_leaf()
+        second = sandy._new_attach_leaf()
+        self.assertRegex(first, sandy.ATTACH_LEAF_PATTERN)
+        self.assertNotEqual(first, second)
+
+
+class AttachLifecycleTests(unittest.TestCase):
+    """The -d record, attach counting, hangups, and the last-attach rule.
+
+    Tests mock systemctl, the lifecycle lock, the cgroup directory, signal
+    handling, and the stop. E2E tests must prove the rule with real attaches.
+    """
+
+    def test_supervisor_detached_reads_exact_descriptions(self):
+        for value, expected in (
+            ("Sandy container ai-dev (detached)", True),
+            ("Sandy container ai-dev (attached)", False),
+            ("sandy-ai-dev.scope", None),
+            ("Sandy container other (attached)", None),
+            ("Sandy container ai-dev (attached) ", None),
+            ("", None),
+        ):
+            with self.subTest(value=value):
+                with patch.object(
+                    sandy, "_systemctl_show_value", return_value=value
+                ) as show:
+                    self.assertIs(sandy._supervisor_detached("ai-dev"), expected)
+                show.assert_called_once_with("sandy-ai-dev.scope", "Description")
+
+    def test_count_populated_attaches_counts_and_prunes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            unit = Path(temp_dir)
+            leaves = {
+                "attach-" + "a" * 32: "populated 1\n",
+                "attach-" + "b" * 32: "populated 0\n",
+                "attach-" + "c" * 32: "populated 1\n",
+                "payload": "populated 1\n",
+                "supervisor": "populated 1\n",
+                "attach-short": "populated 1\n",
+            }
+            for name, events in leaves.items():
+                (unit / name).mkdir()
+                (unit / name / "cgroup.events").write_text(events)
+            unit_fd = os.open(unit, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(sandy.os, "rmdir") as rmdir:
+                    self.assertEqual(sandy._count_populated_attaches(unit_fd), 2)
+                rmdir.assert_called_once_with("attach-" + "b" * 32, dir_fd=unit_fd)
+                with patch.object(
+                    sandy.os, "rmdir", side_effect=OSError(errno.EBUSY, "x")
+                ):
+                    self.assertEqual(sandy._count_populated_attaches(unit_fd), 2)
+                (unit / ("attach-" + "a" * 32) / "cgroup.events").write_text("bad\n")
+                with self.assertRaises(ValueError):
+                    sandy._count_populated_attaches(unit_fd)
+            finally:
+                os.close(unit_fd)
+
+    def test_count_populated_attaches_skips_leaf_removed_meanwhile(self):
+        real_open = os.open
+
+        def open_fd(path, flags, mode=0o777, *, dir_fd=None):
+            if path.startswith("attach-"):
+                raise FileNotFoundError(path)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / ("attach-" + "a" * 32)).mkdir()
+            unit_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(sandy.os, "open", side_effect=open_fd):
+                    self.assertEqual(sandy._count_populated_attaches(unit_fd), 0)
+            finally:
+                os.close(unit_fd)
+
+    def test_hangup_handlers_turn_signals_into_exception(self):
+        previous = {
+            signum: sandy.signal.getsignal(signum)
+            for signum in sandy.ATTACH_HANGUP_SIGNALS
+        }
+        with patch.object(sandy.signal, "signal") as install:
+            installed = {}
+            install.side_effect = (
+                lambda signum, handler: installed.setdefault(signum, handler)
+                and previous[signum]
+            )
+            with self.assertRaises(sandy._AttachHangup) as raised:
+                with sandy._attach_hangup_handlers():
+                    installed[sandy.signal.SIGHUP](sandy.signal.SIGHUP, None)
+        self.assertEqual(raised.exception.signum, sandy.signal.SIGHUP)
+        # After a hangup both signals are ignored and stay ignored.
+        self.assertIn(
+            call(sandy.signal.SIGTERM, sandy.signal.SIG_IGN), install.call_args_list
+        )
+        self.assertEqual(install.call_args_list[-1].args[1], sandy.signal.SIG_IGN)
+
+    def test_hangup_handlers_restore_previous_handlers(self):
+        with patch.object(sandy.signal, "signal", return_value="old") as install:
+            with sandy._attach_hangup_handlers():
+                pass
+        self.assertEqual(
+            install.call_args_list[2:],
+            [call(sandy.signal.SIGHUP, "old"), call(sandy.signal.SIGTERM, "old")],
+        )
+        with patch.object(sandy.signal, "signal", return_value="old") as install:
+            with self.assertRaises(RuntimeError):
+                with sandy._attach_hangup_handlers():
+                    raise RuntimeError("attach failed")
+        self.assertEqual(install.call_count, 4)
+
+    def test_hangup_handlers_do_nothing_outside_main_thread(self):
+        with patch.object(sandy.signal, "signal") as install:
+            thread = threading.Thread(
+                target=lambda: sandy._attach_hangup_handlers().__enter__()
+            )
+            thread.start()
+            thread.join()
+        install.assert_not_called()
+
+    @contextmanager
+    def rule_mocks(
+        self, detached: object = False, remaining: object = 0, unit_error=None
+    ):
+        manager = MagicMock()
+
+        @contextmanager
+        def lock():
+            manager.lock_enter()
+            try:
+                yield
+            finally:
+                manager.lock_exit()
+
+        manager.detached.return_value = detached
+        manager.open_unit.return_value = 70
+        if unit_error is not None:
+            manager.open_unit.side_effect = unit_error
+        manager.count.return_value = remaining
+        instance = make_sandy()
+        with patch.object(sandy, "_lifecycle_lock", lock), patch.object(
+            sandy, "_supervisor_detached", manager.detached
+        ), patch.object(
+            sandy, "_open_supervisor_cgroup", manager.open_unit
+        ), patch.object(
+            sandy, "_count_populated_attaches", manager.count
+        ), patch.object(
+            sandy.os, "close", manager.close
+        ), patch.object(
+            sandy.signal, "pthread_sigmask", manager.sigmask
+        ), patch.object(
+            instance, "_machine_poweroff", manager.poweroff
+        ):
+            yield instance, manager
+
+    def test_last_attach_stops_container_under_lock(self):
+        with self.rule_mocks() as (instance, manager):
+            with captured_output() as (stdout, _):
+                instance._stop_if_last_attach()
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                call.sigmask(sandy.signal.SIG_BLOCK, sandy.ATTACH_HANGUP_SIGNALS),
+                call.lock_enter(),
+                call.detached("ai-dev"),
+                call.open_unit("ai-dev"),
+                call.count(70),
+                call.close(70),
+                call.poweroff(),
+                call.lock_exit(),
+                call.sigmask(sandy.signal.SIG_UNBLOCK, sandy.ATTACH_HANGUP_SIGNALS),
+            ],
+        )
+        self.assertIn("no session is attached", stdout.getvalue())
+
+    def test_last_attach_rule_keeps_container_running(self):
+        cases = (
+            ({"detached": True}, "open_unit"),
+            ({"detached": None}, "open_unit"),
+            ({"unit_error": FileNotFoundError()}, "count"),
+            ({"remaining": 1}, "poweroff"),
+        )
+        for overrides, not_called in cases:
+            with self.subTest(overrides=overrides):
+                with self.rule_mocks(**overrides) as (instance, manager):
+                    instance._stop_if_last_attach()
+                getattr(manager, not_called).assert_not_called()
+                manager.poweroff.assert_not_called()
+                manager.lock_exit.assert_called_once_with()
+                self.assertEqual(
+                    manager.sigmask.call_args_list[-1],
+                    call(sandy.signal.SIG_UNBLOCK, sandy.ATTACH_HANGUP_SIGNALS),
+                )
+
+    def test_last_attach_rule_warns_on_errors(self):
+        for target, error in (
+            ("open_unit", PermissionError("Unexpected cgroup directory")),
+            ("detached", subprocess.CalledProcessError(1, ["systemctl"])),
+            ("count", ValueError("Malformed cgroup.events\x1b")),
+        ):
+            with self.subTest(target=target):
+                with self.rule_mocks() as (instance, manager):
+                    getattr(manager, target).side_effect = error
+                    with captured_output() as (stdout, _):
+                        instance._stop_if_last_attach()
+                manager.poweroff.assert_not_called()
+                manager.lock_exit.assert_called_once_with()
+                self.assertIn("W: Could not check the sessions", stdout.getvalue())
+                self.assertNotIn("\x1b", stdout.getvalue())
+
+    def test_last_attach_rule_lock_timeout_warns(self):
+        instance = make_sandy()
+        with patch.object(
+            sandy, "_lifecycle_lock", side_effect=TimeoutError("busy")
+        ), patch.object(sandy.signal, "pthread_sigmask") as sigmask, patch.object(
+            instance, "_machine_poweroff"
+        ) as poweroff:
+            with captured_output() as (stdout, _):
+                instance._stop_if_last_attach()
+        poweroff.assert_not_called()
+        self.assertIn("busy", stdout.getvalue())
+        self.assertEqual(sigmask.call_count, 2)
+
+    def test_exec_applies_rule_after_normal_exit_only(self):
+        instance = make_sandy()
+        instance.workspace = None
+
+        @contextmanager
+        def helper_command(request):
+            yield ["helper"], 5
+
+        with patch.object(
+            instance, "_is_container_running", return_value="123"
+        ), patch.object(
+            instance, "_entry_helper_command", side_effect=helper_command
+        ), patch.object(
+            instance, "_run_container_interactive", return_value=3
+        ), patch.object(
+            instance, "_stop_if_last_attach"
+        ) as rule:
+            self.assertEqual(instance._exec("true"), 3)
+        rule.assert_called_once_with()
+
+        with patch.object(
+            instance, "_is_container_running", return_value="123"
+        ), patch.object(
+            instance, "_entry_helper_command", side_effect=helper_command
+        ), patch.object(
+            instance,
+            "_run_container_interactive",
+            side_effect=sandy._AttachHangup(sandy.signal.SIGHUP),
+        ), patch.object(
+            instance, "_stop_if_last_attach"
+        ) as rule:
+            with self.assertRaises(SystemExit) as exited:
+                instance._exec("true")
+        self.assertEqual(exited.exception.code, 128 + sandy.signal.SIGHUP)
+        rule.assert_not_called()
 
 
 if __name__ == "__main__":

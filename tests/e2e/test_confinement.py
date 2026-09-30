@@ -201,7 +201,11 @@ class _Session:
                 cmdline = Path(f"/proc/{helper}/cmdline").read_bytes()
                 if b"__sandy-entry-helper" in cmdline:
                     sessions = _children(helper)
-                    if len(sessions) == 1:
+                    # Before its execve, the session is a fork of the helper
+                    # that has not installed the filters yet.
+                    if len(sessions) == 1 and b"__sandy-entry-helper" not in (
+                        Path(f"/proc/{sessions[0]}/cmdline").read_bytes()
+                    ):
                         return sessions[0]
             time.sleep(0.1)
         raise E2EFailure("The entry helper session did not start")
@@ -243,18 +247,23 @@ def test_main(context: E2EContext) -> None:
     with context.case("exec, bash, and -u root match the payload's status fields"):
         if payload_status["Seccomp"] != "2" or payload_status["Seccomp_filters"] == "0":
             raise E2EFailure(f"The payload is not filtered: {payload_status!r}")
+        # The payload is the keepalive, which runs as container root.
+        if payload_status["CapEff"] != payload_status["CapBnd"]:
+            raise E2EFailure(f"The payload is not container root: {payload_status!r}")
+        user_expected = dict(payload_status, CapEff="0000000000000000")
         paths = {
             "exec": _status_via(context, ["exec", "--", grep_status], "developer"),
             "bash": _status_via(context, ["bash", "-c", grep_status], "developer"),
         }
         for path, status in paths.items():
-            if status != payload_status:
-                raise E2EFailure(f"{path}: {status!r} != payload {payload_status!r}")
+            if status != user_expected:
+                raise E2EFailure(f"{path}: {status!r} != {user_expected!r}")
         for arguments in (["exec", "--", grep_status], ["bash", "-c", grep_status]):
             root = _status_via(context, arguments, "root")
-            expected = dict(payload_status, CapEff=payload_status["CapBnd"])
-            if root != expected:
-                raise E2EFailure(f"-u root {arguments[0]}: {root!r} != {expected!r}")
+            if root != payload_status:
+                raise E2EFailure(
+                    f"-u root {arguments[0]}: {root!r} != payload {payload_status!r}"
+                )
 
     with context.case(
         "the session's seccomp programs are the payload's, byte for byte"
@@ -275,8 +284,8 @@ def test_main(context: E2EContext) -> None:
             )
         if leader_filters != payload_filters:
             raise E2EFailure("The Leader and payload filters differ")
-        if session_status != payload_status:
-            raise E2EFailure(f"{session_status!r} != payload {payload_status!r}")
+        if session_status != user_expected:
+            raise E2EFailure(f"{session_status!r} != {user_expected!r}")
         if returncode != 0:
             raise E2EFailure(f"The background exec failed with {returncode}")
 
