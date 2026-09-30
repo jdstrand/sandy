@@ -265,7 +265,10 @@ same way, but the container keeps running.
 
 A container that stopped without `sandy` (for example, container root ended
 the main process) can leave port forwarding rules and state. The next `up` of
-the same name removes them.
+the same name removes them. With the nftables backend, each port forwarding
+rule carries the comment `sandy:<name>:<proto>:<host port>`, and `sandy`
+removes exactly the rules with that comment. Rules that earlier versions added
+have no comment; `rm --network` removes them.
 
 Containers started by earlier versions of `sandy` are not in a
 `sandy-<name>.scope`. `bash` and `exec` refuse to attach to them; stop them
