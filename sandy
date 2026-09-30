@@ -2417,6 +2417,13 @@ def _extract_leader_confinement(
 ) -> LeaderConfinement:
     """Pin the Leader, read its filters and CapBnd, and join the attach leaf.
 
+    The Leader is the container's PID 1 as the host sees it: nspawn's stub
+    init, (sd-stubinit), because nspawn runs with --as-pid2. The payload
+    (PID 2) inherits its filters and bounding set, and the kernel only lets
+    both become stricter, so they are the confinement to copy. See
+    specs/security-parity.md, item 1; item 5 there covers an attach during
+    the container start.
+
     Hold the lifecycle lock for the whole extraction and for the creation of
     the leaf, so that a stop decision cannot interleave with a new attach.
     Every read uses the host /proc, before any setns, so the container cannot

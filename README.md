@@ -221,10 +221,12 @@ not reduce the effective privilege granted to members of that group.
 `bash`, `exec`, and the network setup script (`/init.sh`) enter a running
 container through an internal helper mode of `sandy` itself, not through
 `nsenter`. The helper reads the seccomp filters and the capability bounding
-set of the container's init process from the host, joins the container's
-namespaces, and applies both before it runs the command. As a result, an
-attached session has the same confinement as the container's main process,
-for the default user and for `-u root`. If the helper cannot read or apply the
+set from the host, from the container's init process: the Leader that
+`machinectl` reports, which is PID 1 in the container, nspawn's stub init
+`(sd-stubinit)`. The container's main process (PID 2) inherits both from it.
+The helper then joins the container's namespaces and applies both before it
+runs the command. As a result, an attached session has the same confinement
+as the container's main process, for the default user and for `-u root`. If the helper cannot read or apply the
 confinement, it refuses to run the command; there is no unconfined fallback.
 
 Differences from earlier versions:

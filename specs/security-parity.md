@@ -2,7 +2,7 @@
 
 Confinement properties that Sandy lacked compared with Docker, and that the
 separate security audits (not in this repository) do not cover, because no
-audit finding touches these code paths. Item 1 is fixed; items 2 to 4 are
+audit finding touches these code paths. Item 1 is fixed; items 2 to 5 are
 open.
 
 The comparison target is Docker with default options. Docker is not a
@@ -181,6 +181,19 @@ Every helper error before `execve` exits with status 125. Errors that sandy
 finds before it starts the helper exit with status 1. There is no fallback to
 the unconfined path.
 
+Why the Leader is the right source: the Leader is the container's PID 1 as the
+host sees it, nspawn's stub init `(sd-stubinit)`, because sandy starts nspawn
+with `--as-pid2`. The stub init starts the payload (PID 2, `sandy-keepalive`),
+which inherits the Leader's filters and bounding set unchanged: both survive
+`fork` and `execve`. The kernel only lets a bounding set shrink and a filter
+list grow, so the Leader's confinement is never looser than what nspawn set.
+The Leader is also the one container process that sandy can identify without
+container data: machined reports it, a pidfd pins it, and its host cgroup must
+be below the scope's `payload`. Measured: the Leader's filters equal the
+payload's byte for byte, and every attach matches the payload's `CapBnd`
+(E2E, systemd 249, 255, and 257). Item 5 covers the one case that this does
+not: an attach while the container is still starting.
+
 Account data follows nspawn, as measured: `root` gets no supplementary groups;
 other users get exactly the groups that list them as members. The files are
 read at attach time, as `su` did, and only after the filters are in place.
@@ -270,14 +283,17 @@ with and without group memberships (24 cases).
   the `up` path. `--no-new-privileges=yes` on all paths can be a later change.
 * **CapBnd source.** The earlier text read `CapBnd` from `/proc/1/status`
   inside the container. After `setns(mnt)`, that `/proc` is the container's
-  mount. The fix reads it on the host, before any `setns`.
+  mount, which container root controls. The fix reads it on the host, before
+  any `setns`, from the status file of the pinned Leader: the container's
+  PID 1, nspawn's stub init `(sd-stubinit)`. The filters come from the same
+  process. See "Why the Leader is the right source" above.
 * **CapBnd value.** The earlier text measured `0x00000000fdecabff` (25
   capabilities), without a private network namespace. With a private network
   namespace (`--private-network` or sandy's bridge), the measured value is
   `0x00000000fdecbfff` (27), which adds `CAP_NET_BIND_SERVICE` and
-  `CAP_NET_ADMIN`. The
-  helper copies whatever the Leader has, so the attach matches in every
-  network mode.
+  `CAP_NET_ADMIN`. With `--network host`, systemd 249 keeps
+  `CAP_NET_BIND_SERVICE` too (`0x00000000fdecafff`, 26). The helper copies
+  whatever the Leader has, so the attach matches in every network mode.
 * **Payload PID.** The payload is not always PID 2. With
   `--user=developer`, nspawn runs `getent passwd` and `getent initgroups` as
   container PIDs 2 and 3, and the payload is PID 4. With `--user=root` the
@@ -650,6 +666,50 @@ the proposed `--allow-inner-sandboxing` flag.
   private network namespace): `CapBnd` on the `exec` path drops from
   `0x000001ffffffffff` to `0x00000000fdecabff`, which matches the `up` path
   exactly.
+
+
+## 5. An attach during the container start can read the Leader too early
+
+### Status
+
+Open. Found in the review of the scope work. The recommended fix below was
+measured; it is not implemented.
+
+### Observation
+
+The entry helper copies the confinement of the Leader (item 1). It refuses a
+Leader with no seccomp filter, but it does not check that the container start
+is complete. The readiness probe of `up` is an attach, and it starts while the
+container is still starting. Another attach can do the same.
+
+### Docker comparison
+
+`docker exec` applies the container's configured profile. It does not copy
+the profile from a running process, so the time of the attach does not matter.
+
+### Recommended fix: wait for the payload
+
+Before the helper reads the confinement, require that the Leader has the
+payload (PID 2, `sandy-keepalive`) as its child, and that the payload's
+filters and `CapBnd` equal the Leader's. Otherwise fail closed; the readiness
+probe tries again, as it does now. The check belongs in
+`_extract_leader_confinement`, under the lifecycle lock. Identify the payload
+by its container PID or its name, not only by "the Leader has a child":
+orphans of attaches also become children of the Leader.
+
+Measured in the test VMs (systemd 249, 255, and 257), 30 starts each with the
+bridge network and with the host network. A sampler read the Leader's
+`Seccomp_filters`, `CapBnd`, and children from the moment machined registered
+the machine until the start was complete:
+
+| Check | Result |
+| --- | --- |
+| Starts in which the payload appeared | 180 of 180 |
+| Samples (about 4.1 million in all) with the payload present, but the Leader's filters or `CapBnd` not yet final | 0 |
+| Starts in which the payload's filters and `CapBnd` equal the Leader's final values | 180 of 180 |
+
+Some samples before the payload existed were not yet final, so the check is
+needed. In these measurements it was also sufficient.
 
 
 ## Reference: the InfluxDB 3 Core systemd unit
@@ -1239,7 +1299,7 @@ because Landlock needs no namespace at all.
 
 ## Going Further: a Sandy-provided inner boundary
 
-Items 1 to 4 close gaps against Docker. This section goes past parity. It is a
+Items 1 to 5 close gaps against Docker. This section goes past parity. It is a
 proposal, not a finding, and it is not required by any item above.
 
 ### The gap it addresses
@@ -1326,15 +1386,15 @@ That configuration surface is the main argument for leaving this to the vendors
 if their sandboxes can be made to start.
 
 - [ ] **Decide whether to build a Sandy-provided inner boundary.** Not urgent
-      and not required by items 1 to 4. Item 1 has landed; its confining step
+      and not required by items 1 to 5. Item 1 has landed; its confining step
       (`_confine_and_exec`) is the only place it can hook. Weigh it against simply
       making the vendor sandboxes work through `--allow-inner-sandboxing`.
 
 ## Candidate Additions
 
-These are proposals, not part of the four agreed items.
+These are proposals, not part of items 1 to 5.
 
-### 5. No test asserts any of these properties
+### 6. No test asserts any of these properties
 
 Item 1 now has E2E and unit coverage (`tests/e2e/test_confinement.py`, and the
 entry helper tests in `tests/test_sandy.py`). For item 2, the E2E suite checks
@@ -1370,7 +1430,7 @@ item above).
 Without this, a later systemd version or a refactor can silently remove the
 confinement, as the `nsenter` path did before item 1's fix.
 
-### 6. The README does not state the confinement model
+### 7. The README does not state the confinement model
 
 `README.md` now states the entry-path parity ("Attached sessions"),
 `TasksMax=16384`, and that there is no memory or CPU limit ("Container scope
@@ -1379,7 +1439,7 @@ properties: no LSM profile, `NoNewPrivs` 0, and the landlock allowance.
 
 Proposed: add a short table to the Security section that lists each property,
 its state, and whether it differs between entry paths. Update it when items 2 to
-4 land. If any item is deliberately out of scope, record that decision there.
+5 land. If any item is deliberately out of scope, record that decision there.
 
 
 ## Residual Risk After All Items
