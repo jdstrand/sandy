@@ -626,6 +626,19 @@ def test_main(context: E2EContext) -> None:
         assert_contains_text(attach_output, "no session is attached")
         _wait_stopped(context, second)
 
+    with context.case("an entry setup failure stops up with an error"):
+        # The readiness probe cannot prepare the entry helper. The started
+        # container must stop, and up must report the cause.
+        refused = context.sandy(
+            ["up", "--detach", "--persistent", "--network", "host"],
+            name=second,
+            expected=1,
+            executable=context.group_writable_sandy(),
+        )
+        assert_contains(refused, "E: Could not prepare the container entry")
+        assert_not_contains(refused, "Traceback")
+        _wait_stopped(context, second)
+
     with context.case("up -d is never stopped by an attach exit"):
         context.sandy(
             ["up", "--detach", "--persistent", "--network", "host"], name=second

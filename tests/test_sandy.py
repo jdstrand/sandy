@@ -7936,6 +7936,93 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(script.closed, [script.fd])
         script.remove_leaf.assert_called_once_with("ai-dev", ATTACH_LEAF)
 
+    def test_entry_helper_command_reports_setup_errors(self):
+        # Mocks: the cache directory check, the script open, and the leaf
+        # removal. A setup error starts no attach, so no leaf is removed.
+        instance = make_sandy()
+        request = sandy.EntryRequest(
+            machine="ai-dev",
+            leader_pid=123,
+            parent_pid=4100,
+            attach_leaf=ATTACH_LEAF,
+            user="root",
+            home="/root",
+            workdir="/",
+            kind="sh",
+            command="true",
+        )
+        script_error = PermissionError(
+            "Sandy script must be a regular file that only its owner can write"
+        )
+        cases = (
+            ("cache", PermissionError("Directory 'sandy.__cache' has unsafe mode")),
+            ("cache", ValueError("Managed path must begin with a Sandy directory")),
+            ("script", script_error),
+            ("script", FileNotFoundError(errno.ENOENT, "No such file")),
+        )
+        for target, error in cases:
+            with self.subTest(target=target, error=type(error).__name__):
+                with ExitStack() as stack:
+                    ensure = stack.enter_context(
+                        patch.object(
+                            instance,
+                            "_ensure_cache_dir",
+                            side_effect=error if target == "cache" else None,
+                        )
+                    )
+                    open_script = stack.enter_context(
+                        patch.object(
+                            sandy,
+                            "_open_entry_script",
+                            side_effect=error if target == "script" else None,
+                        )
+                    )
+                    remove = stack.enter_context(
+                        patch.object(sandy, "_remove_attach_leaf")
+                    )
+                    with self.assertRaises(sandy._EntrySetupError) as raised:
+                        with instance._entry_helper_command(request):
+                            self.fail("The helper command must not start")
+                self.assertIs(raised.exception.__cause__, error)
+                self.assertEqual(str(raised.exception), str(error))
+                ensure.assert_called_once_with()
+                if target == "cache":
+                    open_script.assert_not_called()
+                remove.assert_not_called()
+
+    def test_exec_as_root_reports_entry_setup_errors(self):
+        # Regression test for entry setup errors that escaped as a traceback.
+        # Mocks: the running check, the cache directory, the script open (it
+        # fails as for a group-writable script), and the subprocess wrapper.
+        instance = make_sandy()
+        error = PermissionError("Sandy script is writable\x1b[31m")
+        with patch.object(
+            instance, "_is_container_running", return_value="123"
+        ), patch.object(instance, "_ensure_cache_dir"), patch.object(
+            sandy, "_open_entry_script", side_effect=error
+        ), patch.object(
+            sandy, "_run_secure_subprocess"
+        ) as run:
+            with captured_output() as (stdout, _):
+                with self.assertRaises(SystemExit) as exited:
+                    instance._exec_as_root("/bin/sh /init.sh")
+        self.assertEqual(exited.exception.code, 1)
+        self.assertIn("E: Could not prepare the container entry", stdout.getvalue())
+        self.assertNotIn("\x1b", stdout.getvalue())
+        run.assert_not_called()
+
+    def test_wait_for_container_ready_does_not_retry_setup_errors(self):
+        # Mocks: the probe and the sleep. A setup error does not go away by
+        # itself, so the probe fails at once.
+        instance = make_sandy()
+        error = sandy._EntrySetupError("script is writable")
+        with patch.object(instance, "_run_as_root", side_effect=error) as run:
+            with patch("time.sleep") as sleep:
+                with self.assertRaises(sandy._EntrySetupError):
+                    instance._wait_for_container_ready()
+        run.assert_called_once_with("true", capture_output=True, timeout=5)
+        sleep.assert_not_called()
+
     def test_entry_helper_command_warns_when_leaf_removal_fails(self):
         instance = make_sandy()
         for error in (
@@ -9206,6 +9293,46 @@ class RunUpTests(unittest.TestCase):
                 init.assert_not_called()
                 self.exec.assert_not_called()
                 self.assertIn("E: Container 'ai-dev'", stdout.getvalue())
+
+    def test_entry_setup_failure_stops_the_started_container(self):
+        # Regression test for a setup error in the readiness probe, which
+        # escaped as a traceback. Mocks: as in the not-ready test.
+        for detach in (True, False):
+            with self.subTest(detach=detach):
+                instance = make_sandy()
+                instance.workspace = None
+                self.wait_for_container_ready.side_effect = sandy._EntrySetupError(
+                    "Sandy script must be a regular file that only its owner can write"
+                )
+                self.exec.reset_mock()
+                with tempfile.TemporaryDirectory() as machine, ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(
+                            instance, "_is_container_running", return_value=None
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(instance, "_get_machine_dir", return_value=machine)
+                    )
+                    popen = stack.enter_context(
+                        patch.object(sandy, "_run_secure_subprocess_popen")
+                    )
+                    stop = stack.enter_context(
+                        patch.object(instance, "_stop_failed_start")
+                    )
+                    init = stack.enter_context(
+                        patch.object(instance, "_run_init_script")
+                    )
+                    stdout, _ = stack.enter_context(captured_output())
+                    with self.assertRaises(SystemExit) as exited:
+                        instance.run_up(self.arguments(detach=detach))
+                self.assertEqual(exited.exception.code, 1)
+                stop.assert_called_once_with(popen.return_value)
+                init.assert_not_called()
+                self.exec.assert_not_called()
+                self.assertIn(
+                    "E: Could not prepare the container entry", stdout.getvalue()
+                )
 
     def test_console_pending_failure_stops_the_started_container(self):
         for error, expected in (
@@ -10921,6 +11048,42 @@ class AttachLifecycleTests(unittest.TestCase):
                 instance._exec("true")
         self.assertEqual(exited.exception.code, 128 + sandy.signal.SIGHUP)
         rule.assert_not_called()
+
+    def test_exec_reports_entry_setup_errors(self):
+        # Regression test for entry setup errors that escaped as a traceback.
+        # Mocks: the running check, the cache directory, the script open (it
+        # fails as for a group-writable script), the session, and the
+        # last-attach rule.
+        error = PermissionError(
+            "Sandy script must be a regular file that only its owner can write\x1b"
+        )
+        for console in (False, True):
+            with self.subTest(console=console):
+                instance = make_sandy()
+                instance.workspace = None
+                with patch.object(
+                    instance, "_is_container_running", return_value="123"
+                ), patch.object(instance, "_ensure_cache_dir"), patch.object(
+                    sandy, "_open_entry_script", side_effect=error
+                ), patch.object(
+                    instance, "_run_container_interactive"
+                ) as session, patch.object(
+                    instance, "_stop_if_last_attach"
+                ) as rule:
+                    with captured_output() as (stdout, _):
+                        with self.assertRaises(SystemExit) as exited:
+                            instance._exec(None, login_shell=True, console=console)
+                self.assertEqual(exited.exception.code, 1)
+                self.assertIn(
+                    "E: Could not prepare the container entry", stdout.getvalue()
+                )
+                self.assertNotIn("\x1b", stdout.getvalue())
+                session.assert_not_called()
+                # A console that did not start is handled as a console exit.
+                if console:
+                    rule.assert_called_once_with(console=True)
+                else:
+                    rule.assert_not_called()
 
 
 if __name__ == "__main__":

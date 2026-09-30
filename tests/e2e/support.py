@@ -24,6 +24,14 @@ from typing import Iterator, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SANDY = REPO_ROOT / "sandy"
+# sandy and the helper scripts that it requires next to itself.
+SANDY_SCRIPT_NAMES = (
+    "sandy",
+    "debootstrap.sh",
+    "oci.sh",
+    "sandy-keepalive.sh",
+    "setup-container.sh",
+)
 MINIMAL_SETUP = Path(__file__).with_name("setup-container-minimal.sh")
 INSTALL_DIR = Path("/usr/local/lib/sandy")
 SYSTEMD_MACHINES = Path("/var/lib/machines")
@@ -271,10 +279,15 @@ class E2EContext:
         timeout: int = DEFAULT_TIMEOUT,
         environment: Mapping[str, str] | None = None,
         input_text: str | None = None,
+        executable: Path | None = None,
     ) -> CommandResult:
-        """Invoke sandy with the E2E workspace and optional owned container."""
+        """Invoke sandy with the E2E workspace and optional owned container.
+
+        executable selects another copy of sandy, such as the one from
+        group_writable_sandy().
+        """
         command = [
-            str(SANDY),
+            str(executable or SANDY),
             "--workspace",
             self.workspace.name,
             "--shared",
@@ -300,6 +313,20 @@ class E2EContext:
             environment=sandy_environment,
             input_text=input_text,
         )
+
+    def group_writable_sandy(self) -> Path:
+        """Return a copy of sandy that its group can write, with its scripts.
+
+        The copy is in this run's root directory, which cleanup removes. The
+        checkout does not change.
+        """
+        directory = self.root / "sandy-group-writable"
+        directory.mkdir(mode=0o755, exist_ok=True)
+        for name in SANDY_SCRIPT_NAMES:
+            shutil.copy2(REPO_ROOT / name, directory / name)
+        copy = directory / "sandy"
+        copy.chmod(0o775)
+        return copy
 
     def without_iptables(self, command: Sequence[str]) -> list[str]:
         """Return command wrapped so that it sees no iptables binary."""

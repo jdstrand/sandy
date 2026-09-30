@@ -24,6 +24,7 @@ from tests.e2e.support import (
     E2EContext,
     E2EFailure,
     assert_contains,
+    assert_not_contains,
 )
 
 STATUS_FIELDS = ("Seccomp", "Seccomp_filters", "CapBnd", "CapEff", "NoNewPrivs")
@@ -387,6 +388,17 @@ def test_main(context: E2EContext) -> None:
                 f"exec with an inherited descriptor failed with "
                 f"{inherited.returncode}: {output}"
             )
+
+    with context.case("a group-writable sandy refuses an attach with an error"):
+        refused = context.sandy(
+            ["exec", "--", "true"],
+            name=context.main_name,
+            user=context.main_user,
+            expected=1,
+            executable=context.group_writable_sandy(),
+        )
+        assert_contains(refused, "E: Could not prepare the container entry")
+        assert_not_contains(refused, "Traceback")
 
     with context.case("the attach environment is the allow-list"):
         environment = sandy._container_environment("developer", "/home/developer")

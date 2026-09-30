@@ -17,6 +17,9 @@ from tests.e2e.support import (
     ACL_PROMPT_ANSWERS,
     CONTAINER_USER_ID,
     DEFAULT_TIMEOUT,
+    REPO_ROOT,
+    SANDY,
+    SANDY_SCRIPT_NAMES,
     CommandResult,
     E2EContext,
     E2EFailure,
@@ -76,8 +79,9 @@ class RetryContext(E2EContext):
         timeout: int = DEFAULT_TIMEOUT,
         environment: Mapping[str, str] | None = None,
         input_text: str | None = None,
+        executable: Path | None = None,
     ) -> CommandResult:
-        del arguments, name, user, timeout, environment, input_text
+        del arguments, name, user, timeout, environment, input_text, executable
         self.expected_exit_codes.append(expected)
         if not self.results:
             raise AssertionError("HTTPS retry made too many attempts")
@@ -444,6 +448,36 @@ class SandyInvocationTests(unittest.TestCase):
             run.call_args_list[1].kwargs["environment"],
             {"PATH": "/usr/bin", "SANDY_X": "1", "SUDO_UID": str(CONTAINER_USER_ID)},
         )
+
+    def test_sandy_runs_the_selected_executable(self):
+        context = self.make_context()
+        copy = Path("/tmp/sandy-e2e-test/sandy-group-writable/sandy")
+        with patch.object(E2EContext, "run") as run:
+            context.sandy(["status"])
+            context.sandy(["status"], executable=copy)
+        self.assertEqual(run.call_args_list[0].args[0][0], str(SANDY))
+        self.assertEqual(run.call_args_list[1].args[0][0], str(copy))
+        self.assertEqual(
+            run.call_args_list[0].args[0][1:], run.call_args_list[1].args[0][1:]
+        )
+
+    def test_group_writable_sandy_copies_the_scripts_into_the_run_root(self):
+        # No mocks: the copy is made in a temporary run root.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context = self.make_context()
+            context.root = Path(temp_dir)
+            copy = context.group_writable_sandy()
+            self.assertEqual(copy, context.root / "sandy-group-writable" / "sandy")
+            self.assertEqual(stat.S_IMODE(copy.stat().st_mode), 0o775)
+            for name in SANDY_SCRIPT_NAMES:
+                source = REPO_ROOT / name
+                target = copy.parent / name
+                self.assertEqual(target.read_bytes(), source.read_bytes())
+                if name != "sandy":
+                    self.assertEqual(target.stat().st_mode, source.stat().st_mode)
+            # A second call reuses the directory.
+            self.assertEqual(context.group_writable_sandy(), copy)
+        self.assertEqual(stat.S_IMODE(SANDY.stat().st_mode) & 0o022, 0)
 
     def test_builds_answer_only_the_two_acl_prompts(self):
         self.assertEqual(ACL_PROMPT_ANSWERS, "y\ny\n")

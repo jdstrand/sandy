@@ -420,6 +420,14 @@ def _validate_command_args(cmd: list):
         raise ValueError("Invalid command arguments")
 
 
+class _EntrySetupError(Exception):
+    """The entry helper could not be prepared, so no attach started.
+
+    Examples: an unsafe cache directory, or a sandy script that others can
+    write. The cause does not go away by itself, so callers do not retry.
+    """
+
+
 class _AttachHangup(Exception):
     """The terminal of an attach went away (SIGHUP) or sandy got SIGTERM."""
 
@@ -6019,11 +6027,16 @@ class Sandy:
         """Yield the entry helper argv and the script descriptor to pass to it.
 
         After the helper exits, kill what is left in its attach leaf, such as
-        background jobs of the session, and remove the leaf.
+        background jobs of the session, and remove the leaf. Raise
+        _EntrySetupError when the helper cannot be prepared.
         """
-        # The helper takes the lifecycle lock, which lives in the cache directory.
-        self._ensure_cache_dir()
-        script_fd = _open_entry_script()
+        try:
+            # The helper takes the lifecycle lock, which lives in the cache
+            # directory.
+            self._ensure_cache_dir()
+            script_fd = _open_entry_script()
+        except (OSError, ValueError) as exc:
+            raise _EntrySetupError(str(exc)) from exc
         try:
             yield _entry_helper_argv(script_fd, request), script_fd
         finally:
@@ -6098,6 +6111,15 @@ class Sandy:
             if console:
                 self._end_console_pending()
             sys.exit(128 + hangup.signum)
+        except _EntrySetupError as exc:
+            print(
+                "E: Could not prepare the container entry: "
+                f"{_terminal_safe_repr(str(exc))}"
+            )
+            if console:
+                # The console did not start; handle it as a console exit.
+                self._stop_if_last_attach(console=True)
+            sys.exit(1)
         self._stop_if_last_attach(console=console)
         return status
 
@@ -6190,6 +6212,12 @@ class Sandy:
         except ValueError as exc:
             print(f"E: Invalid container entry: {_terminal_safe_repr(str(exc))}")
             sys.exit(1)
+        except _EntrySetupError as exc:
+            print(
+                "E: Could not prepare the container entry: "
+                f"{_terminal_safe_repr(str(exc))}"
+            )
+            sys.exit(1)
         if result is None:
             print(f"E: Container '{self.container}' not found or not running")
             sys.exit(1)
@@ -6246,7 +6274,8 @@ class Sandy:
                 return False
             # Ready means that the entry helper can confine and run a command.
             # Until nspawn has installed the payload's filters, extraction
-            # fails, so an early probe fails closed and is retried.
+            # fails, so an early probe fails closed and is retried. An
+            # _EntrySetupError does not go away by itself; it propagates.
             try:
                 result = self._run_as_root("true", capture_output=True, timeout=5)
                 if result is not None and result.returncode == 0:
@@ -7313,6 +7342,14 @@ class Sandy:
                     sys.exit(1)
                 _finish_spinner_line(spinner_line_event, suffix=" done")
                 self._run_init_script(network_mode=args.network)
+            except _EntrySetupError as exc:
+                _finish_spinner_line(spinner_line_event)
+                print(
+                    "E: Could not prepare the container entry: "
+                    f"{_terminal_safe_repr(str(exc))}"
+                )
+                self._stop_failed_start(supervisor)
+                sys.exit(1)
             except BaseException:
                 self._stop_failed_start(supervisor)
                 raise
