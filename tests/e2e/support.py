@@ -134,6 +134,7 @@ class E2EContext:
         self.filesystem_name = f"e2e-filesystem-{suffix}"
         self.main_name = f"e2e-main-{suffix}"
         self.full_name = f"e2e-full-{suffix}"
+        self.scope_name = f"e2e-scope-{suffix}"
         self.cache_user = "developer"
         self.cache_miss_user = "e2emiss"
         self.main_user = "developer"
@@ -176,6 +177,7 @@ class E2EContext:
             self.filesystem_name,
             self.main_name,
             self.full_name,
+            self.scope_name,
         ):
             if not NAME_PATTERN.fullmatch(name):
                 raise E2EFailure(f"Generated unsafe container name: {name!r}")
