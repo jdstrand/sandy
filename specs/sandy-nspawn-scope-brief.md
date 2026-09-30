@@ -538,11 +538,11 @@ systemd-run --scope --quiet --unit=sandy-<name>.scope --slice=system.slice \
   `populated 1`. It removes the empty leaves, for `-d` containers too. It
   counts populated leaves, not directories, because a sandy process killed
   with SIGKILL can leave an empty leaf. sandy runs `_machine_poweroff` only
-  when the count is zero, no console-pending marker exists, and the scope's
+  when the count is zero, no up-console marker exists, and the scope's
   description says "(attached)". `_machine_poweroff` also removes the port
   mappings. So the port-forwarding cleanup stays in one function, with a new
   trigger.
-- The console-pending marker closes a start race. Without `-d`, `up` holds
+- The up-console marker closes a start race. Without `-d`, `up` holds
   the lifecycle lock while it starts the scope and creates the marker in the
   scope's cgroup. So no attach can exit, and stop the container, before the
   console starts. The console's own exit removes the marker before the count,
@@ -796,7 +796,7 @@ measured in the test VMs):
   exclusive, with a bounded wait of 10 seconds. Step 2's attach counting and
   leaf creation reuse it. Most holders are short. Two hold it longer: a stop
   through `_machine_poweroff` (up to two 5 s waits), and `up` without `-d`
-  until the console-pending marker exists (up to 5 s). A waiter gives up
+  until the up-console marker exists (up to 5 s). A waiter gives up
   after 10 s.
 - Container PIDs: with `--user=developer`, PIDs 2 and 3 are `getent passwd` and
   `getent initgroups`, and the payload is PID 4. With `--user=root` the
@@ -853,18 +853,18 @@ Step 2 decisions that differ from the plan above:
   runs `terminate` and waits again.
 
 Step 2 follow-up: nftables port rules carry a comment and are removed by
-comment and handle; a console-pending marker closes the start race of `up`;
+comment and handle; an up-console marker closes the start race of `up`;
 E2E tests cover stale rules for both firewall backends, with iptables hidden
 in a private mount namespace for the nftables backend.
 
 Remaining accepted gaps: SIGKILL of both sandy and its helper leaves the
 attach running until the container stops; Ctrl-C during `up`'s start stops
 the container (user accepted); SIGKILL of `up` after its start leaves the
-console-pending marker, so no attach exit stops that container.
+up-console marker, so no attach exit stops that container.
 
 Also known, not yet decided: before the console attach, `up` has no SIGHUP
 or SIGTERM handler (only the attach installs one). If the terminal closes
-during the start, sandy ends without its cleanup: the console-pending marker
+during the start, sandy ends without its cleanup: the up-console marker
 stays, and so do the temporary keepalive and `init.sh` directories. Only
 SIGINT (Ctrl-C) runs the stop of a failed start.
 

@@ -145,7 +145,7 @@ already runs it as root, so the helper gets the same trust.
 1. Host side, under the global lifecycle lock (`sandy.__cache/lifecycle.lock`,
    held briefly by the helper, with a bounded wait of 10 seconds; a helper
    that waits longer exits with status 125. Other holders keep the lock for
-   seconds: `up` without `-d` until its console-pending marker exists, and
+   seconds: `up` without `-d` until its up-console marker exists, and
    the stop after the last attach):
    * Pin the Leader (the container's PID 1, `(sd-stubinit)`) with a pidfd, and
      confirm with `machinectl` that it is still the machine's Leader.

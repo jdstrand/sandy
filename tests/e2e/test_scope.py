@@ -555,8 +555,8 @@ def test_main(context: E2EContext) -> None:
         ):
             raise E2EFailure("The scope does not record an attached up")
         # While the console runs, no attach exit may stop the container.
-        if not (_unit_dir(second) / "console-pending").is_dir():
-            raise E2EFailure("The console-pending marker is missing")
+        if not (_unit_dir(second) / "up-console").is_dir():
+            raise E2EFailure("The up-console marker is missing")
         console_inside = context.sandy(
             ["exec", "--", "cat /proc/self/cgroup"], name=second
         )
@@ -618,8 +618,8 @@ def test_main(context: E2EContext) -> None:
             )
         if not context.machine_running(second):
             raise E2EFailure("A console hangup stopped the container")
-        if (_unit_dir(second) / "console-pending").exists():
-            raise E2EFailure("The console-pending marker remains after the hangup")
+        if (_unit_dir(second) / "up-console").exists():
+            raise E2EFailure("The up-console marker remains after the hangup")
         attach_returncode, attach_output = attach.finish()
         if attach_returncode != 0:
             raise E2EFailure(f"Attach exited {attach_returncode}: {attach_output}")

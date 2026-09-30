@@ -1173,19 +1173,18 @@ def _systemctl_show_value(unit: str, prop: str) -> str:
     return output
 
 
-def _supervisor_detached(machine_name: str) -> Optional[bool]:
-    """Return whether up started the container with -d, from its scope.
+def _supervisor_started_attached(machine_name: str) -> bool:
+    """Return whether up started the container without -d, from its scope.
 
-    Return None when the scope does not exist or has another description.
-    Only root can set the description of a system unit.
+    Only the exact description that up sets without -d counts. Any other value
+    (up -d, another description, or no scope) gives False, and then no attach
+    exit stops the container. Only root can set the description of a system
+    unit.
     """
     description = _systemctl_show_value(
         _supervisor_unit_name(machine_name), "Description"
     )
-    for detached in (True, False):
-        if description == _supervisor_description(machine_name, detached):
-            return detached
-    return None
+    return description == _supervisor_description(machine_name, detached=False)
 
 
 def _supervisor_unit_loaded(machine_name: str) -> bool:
@@ -1719,35 +1718,45 @@ def _open_existing_managed_text_file(path: str) -> Optional[Any]:
 # and glibc declares ptrace and prctl as variadic, so every call goes through
 # syscall(2) with a fixed argument count. Only 64-bit x86_64 and aarch64 are
 # supported; any other architecture fails closed.
+# Syscall numbers from the Linux sources: x86_64 from
+# arch/x86/entry/syscalls/syscall_64.tbl, and aarch64 from
+# include/uapi/asm-generic/unistd.h.
 ENTRY_SYSCALL_NUMBERS: Final[Mapping[str, Mapping[str, int]]] = {
     "x86_64": {"ptrace": 101, "prctl": 157, "setns": 308, "seccomp": 317},
     "aarch64": {"ptrace": 117, "prctl": 167, "setns": 268, "seccomp": 277},
 }
+# syscall(2) passes at most six arguments.
 SYSCALL_ARGUMENT_COUNT: Final = 6
+# The values below come from the Linux UAPI headers named in each comment.
+# They are part of the kernel ABI and are the same on x86_64 and aarch64.
+# <linux/ptrace.h>: ptrace requests.
 PTRACE_DETACH: Final = 17
 PTRACE_SEIZE: Final = 0x4206
 PTRACE_INTERRUPT: Final = 0x4207
-# __WALL: wait for a tracee that is not a child of the caller.
-WAIT_ALL: Final = 0x40000000
-SIGNAL_MAX: Final = 64
 PTRACE_SECCOMP_GET_FILTER: Final = 0x420C
+# <linux/wait.h>: __WALL, wait for a tracee that is not a child of the caller.
+WAIT_ALL: Final = 0x40000000
+# _NSIG in the kernel: signal numbers are 1 to 64.
+SIGNAL_MAX: Final = 64
+# <linux/prctl.h>: prctl options.
+PR_SET_PDEATHSIG: Final = 1
 PR_CAPBSET_READ: Final = 23
 PR_CAPBSET_DROP: Final = 24
 PR_SET_CHILD_SUBREAPER: Final = 36
-PR_SET_PDEATHSIG: Final = 1
+# <linux/seccomp.h>: the seccomp() operation that installs a filter.
 SECCOMP_SET_MODE_FILTER: Final = 1
-# The kernel limits one classic BPF program to BPF_MAXINSNS instructions.
+# <linux/bpf_common.h>: the kernel limits one classic BPF program to
+# BPF_MAXINSNS instructions.
 BPF_MAXINSNS: Final = 4096
 # MAX_INSNS_PER_PATH in kernel/seccomp.c bounds the instructions of all
 # filters of a task, so it also bounds the filter index.
 SECCOMP_MAX_INSNS_PER_PATH: Final = 32768
-# PID_MAX_LIMIT on 64-bit kernels; a valid PID is always below it.
+# PID_MAX_LIMIT in include/linux/threads.h on 64-bit kernels; a valid PID is
+# always below it.
 PID_MAX_LIMIT: Final = 4194304
 # Capability numbers are bits in the 64-bit CapBnd mask.
 CAPABILITY_MAX: Final = 63
-# Namespace types in the only order that works for entry: the user namespace
-# is last, because joining it drops the host capabilities that the other
-# setns calls need.
+# <linux/sched.h>: the namespace type flags (CLONE_NEW*) that setns takes.
 CLONE_NEWNS: Final = 0x00020000
 CLONE_NEWCGROUP: Final = 0x02000000
 CLONE_NEWUTS: Final = 0x04000000
@@ -1755,6 +1764,9 @@ CLONE_NEWIPC: Final = 0x08000000
 CLONE_NEWUSER: Final = 0x10000000
 CLONE_NEWPID: Final = 0x20000000
 CLONE_NEWNET: Final = 0x40000000
+# Namespace types in the only order that works for entry: the user namespace
+# is last, because joining it drops the host capabilities that the other
+# setns calls need.
 NAMESPACE_ENTRY_ORDER: Final[Tuple[Tuple[str, int], ...]] = (
     ("cgroup", CLONE_NEWCGROUP),
     ("ipc", CLONE_NEWIPC),
@@ -1830,7 +1842,12 @@ def _require_int_in_range(value: Any, label: str, minimum: int, maximum: int) ->
 
 
 def _entry_syscall(name: str, *args: int) -> int:
-    """Call one container entry syscall and raise OSError on failure."""
+    """Call one container entry syscall; return its non-negative result.
+
+    Every failure raises OSError, so a caller never needs to check the result
+    for an error. A caller that uses the result (a length or a flag) checks
+    its range itself.
+    """
     number = _entry_syscall_number(name)
     if len(args) > SYSCALL_ARGUMENT_COUNT:
         raise ValueError(f"Too many arguments for {name}")
@@ -1840,8 +1857,12 @@ def _entry_syscall(name: str, *args: int) -> int:
     padded = tuple(args) + (0,) * (SYSCALL_ARGUMENT_COUNT - len(args))
     result = _libc().syscall(number, *padded)
     if result == -1:
+        # syscall(2) reports every error as -1 and sets errno.
         err = ctypes.get_errno() or errno.EIO
         raise OSError(err, f"{name} failed: {os.strerror(err)}")
+    if result < 0:
+        # No syscall used here returns another negative value. Fail closed.
+        raise OSError(errno.EIO, f"{name} returned an unexpected value")
     return result
 
 
@@ -1929,10 +1950,14 @@ def _setns(fd: int, nstype: int) -> None:
 def _seccomp_set_mode_filter(program: bytes) -> None:
     """Install one classic BPF seccomp program on the calling thread.
 
-    No flags are passed, so the filter applies to this thread only. The caller
-    must be single-threaded and hold CAP_SYS_ADMIN in its user namespace, or
-    have set no_new_privs.
+    No flags are passed, so the filter applies to this thread only, and the
+    process must be single-threaded. A fork of the single-threaded entry
+    helper is; this function checks it again. The kernel also requires
+    CAP_SYS_ADMIN in the caller's user namespace or no_new_privs; without
+    either, it refuses the call with EACCES, and this function raises.
     """
+    if threading.active_count() != 1:
+        raise RuntimeError("Seccomp filters need a single-threaded process")
     if not isinstance(program, bytes):
         raise ValueError("Seccomp program must be bytes")
     count, remainder = divmod(len(program), SOCK_FILTER_SIZE)
@@ -1982,21 +2007,24 @@ def _lifecycle_lock(timeout: float = LIFECYCLE_LOCK_TIMEOUT) -> Iterator[None]:
 
 
 LEADER_PID_PATTERN: Final = re.compile(r"[1-9][0-9]{0,6}")
-# Each attach runs in its own leaf cgroup in the container's scope, next to
-# nspawn's payload and supervisor cgroups.
+# systemd-run --scope creates the container's scope cgroup,
+# /sys/fs/cgroup/system.slice/sandy-<name>.scope, when up starts the scope
+# (see _supervisor_scope_argv), and systemd removes it when the scope stops.
+# nspawn --keep-unit creates its payload and supervisor cgroups in it. Each
+# attach runs in its own leaf cgroup there, next to them.
 CGROUP_ROOT: Final = "/sys/fs/cgroup"
 ATTACH_LEAF_PREFIX: Final = "attach-"
 ATTACH_LEAF_PATTERN: Final = re.compile(r"attach-[0-9a-f]{32}")
 ATTACH_LEAF_KILL_TIMEOUT: Final = 5
 ATTACH_LEAF_POLL_INTERVAL: Final = 0.02
 CGROUP_EVENTS_MAX_BYTES: Final = 4096
-# While this empty cgroup exists in the scope of a container that up started
-# without -d, the console has not exited yet, and no attach exit stops the
-# container. up creates it under the lifecycle lock before any attach can
-# exist; the console's own exit removes it.
-CONSOLE_PENDING_CGROUP: Final = "console-pending"
-CONSOLE_PENDING_TIMEOUT: Final = 5
-CONSOLE_PENDING_POLL_INTERVAL: Final = 0.01
+# The up-console marker: an empty cgroup in the scope of a container that up
+# started without -d. It exists from the start of up until the console of that
+# up exits or hangs up. While it exists, no attach exit stops the container.
+# up creates it under the lifecycle lock before any attach can exist.
+UP_CONSOLE_CGROUP: Final = "up-console"
+UP_CONSOLE_TIMEOUT: Final = 5
+UP_CONSOLE_POLL_INTERVAL: Final = 0.01
 PROC_CGROUP_MAX_BYTES: Final = 4096
 PROC_CGROUP_PATTERN: Final = re.compile(r"0::(/[^\n]*)\n")
 CAPBND_LINE_PATTERN: Final = re.compile(r"CapBnd:\t([0-9a-f]{16})")
@@ -2100,8 +2128,10 @@ def _read_process_cgroup(proc_fd: int) -> str:
 def _open_supervisor_cgroup(machine_name: str) -> int:
     """Open the cgroup directory of the container's scope.
 
-    The path comes from the validated container name, not from container
-    data. FileNotFoundError means that the scope does not exist.
+    systemd-run --scope creates this directory when up starts the scope, and
+    systemd removes it when the scope stops. The path comes from the validated
+    container name, not from container data. FileNotFoundError means that the
+    scope does not exist.
     """
     unit = _supervisor_unit_name(machine_name)
     fd = os.open(CGROUP_ROOT, DIRECTORY_OPEN_FLAGS)
@@ -2264,13 +2294,13 @@ def _count_populated_attaches(unit_fd: int) -> int:
     return count
 
 
-def _create_console_pending(machine_name: str) -> None:
-    """Create the console-pending marker as soon as the scope's cgroup exists.
+def _create_up_console_marker(machine_name: str) -> None:
+    """Create the up-console marker as soon as the scope's cgroup exists.
 
     The caller holds the lifecycle lock. Raise TimeoutError when the scope
     does not appear in time.
     """
-    deadline = time.monotonic() + CONSOLE_PENDING_TIMEOUT
+    deadline = time.monotonic() + UP_CONSOLE_TIMEOUT
     while True:
         try:
             unit_fd = _open_supervisor_cgroup(machine_name)
@@ -2278,27 +2308,27 @@ def _create_console_pending(machine_name: str) -> None:
         except FileNotFoundError:
             if time.monotonic() >= deadline:
                 raise TimeoutError("The container scope did not appear") from None
-            time.sleep(CONSOLE_PENDING_POLL_INTERVAL)
+            time.sleep(UP_CONSOLE_POLL_INTERVAL)
     try:
-        os.mkdir(CONSOLE_PENDING_CGROUP, 0o755, dir_fd=unit_fd)
+        os.mkdir(UP_CONSOLE_CGROUP, 0o755, dir_fd=unit_fd)
     except FileExistsError:
         pass
     finally:
         os.close(unit_fd)
 
 
-def _remove_console_pending(unit_fd: int) -> None:
-    """Remove the console-pending marker of an open scope cgroup."""
+def _remove_up_console_marker(unit_fd: int) -> None:
+    """Remove the up-console marker of an open scope cgroup."""
     try:
-        os.rmdir(CONSOLE_PENDING_CGROUP, dir_fd=unit_fd)
+        os.rmdir(UP_CONSOLE_CGROUP, dir_fd=unit_fd)
     except FileNotFoundError:
         pass
 
 
-def _console_pending(unit_fd: int) -> bool:
-    """Return whether the console-pending marker exists."""
+def _up_console_marker_exists(unit_fd: int) -> bool:
+    """Return whether the up-console marker exists."""
     try:
-        marker = os.stat(CONSOLE_PENDING_CGROUP, dir_fd=unit_fd, follow_symlinks=False)
+        marker = os.stat(UP_CONSOLE_CGROUP, dir_fd=unit_fd, follow_symlinks=False)
     except FileNotFoundError:
         return False
     return stat.S_ISDIR(marker.st_mode)
@@ -2819,6 +2849,11 @@ def _confine_and_exec(
     ids. The filters are installed oldest first. The account files are read
     at attach time, as su and nspawn do, and only after the filters are in
     place, because container root controls them.
+
+    No step returns an error code to check: the syscall wrappers raise
+    through _entry_syscall, the os functions raise OSError, and the bounding
+    set is read back. Any failure reaches the except clause, which ends this
+    process with ENTRY_HELPER_FAILURE before execve.
     """
     try:
         mask = confinement.capability_bounding_set
@@ -6109,7 +6144,7 @@ class Sandy:
             # Loss of the terminal ends only this attach; the attach leaf is
             # already removed. It never stops the container.
             if console:
-                self._end_console_pending()
+                self._end_up_console()
             sys.exit(128 + hangup.signum)
         except _EntrySetupError as exc:
             print(
@@ -6130,7 +6165,7 @@ class Sandy:
         start in between and two exits cannot both stop the container. Block
         SIGHUP and SIGTERM meanwhile, so that the stop is not cut short. The
         count also removes empty attach leaves, for -d containers too. While
-        the console-pending marker exists, the console has not exited, so no
+        the up-console marker exists, the console has not exited, so no
         stop; the console's own exit (console=True) removes the marker first.
         """
         blocked = threading.current_thread() is threading.main_thread()
@@ -6144,14 +6179,14 @@ class Sandy:
                     return
                 try:
                     if console:
-                        _remove_console_pending(unit_fd)
+                        _remove_up_console_marker(unit_fd)
                     remaining = _count_populated_attaches(unit_fd)
-                    pending = _console_pending(unit_fd)
+                    console_running = _up_console_marker_exists(unit_fd)
                 finally:
                     os.close(unit_fd)
-                if remaining or pending:
+                if remaining or console_running:
                     return
-                if _supervisor_detached(self.container) is not False:
+                if not _supervisor_started_attached(self.container):
                     return
                 print(f"I: Stopping '{self.container}': no session is attached")
                 self._machine_poweroff()
@@ -6164,13 +6199,13 @@ class Sandy:
             if blocked:
                 signal.pthread_sigmask(signal.SIG_UNBLOCK, ATTACH_HANGUP_SIGNALS)
 
-    def _end_console_pending(self) -> None:
+    def _end_up_console(self) -> None:
         """After a console hangup: remove the marker, but never stop."""
         try:
             with _lifecycle_lock():
                 unit_fd = _open_supervisor_cgroup(self.container)
                 try:
-                    _remove_console_pending(unit_fd)
+                    _remove_up_console_marker(unit_fd)
                 finally:
                     os.close(unit_fd)
         except FileNotFoundError:
@@ -7294,9 +7329,9 @@ class Sandy:
             mode = " in detached state" if args.detach else ""
             print(f"I: Starting '{self.container}'{mode} ", end="", flush=True)
             # The supervisor has no terminal and its own session, and runs in
-            # its own scope. So a closed terminal, or a stop or OOM kill of
-            # the terminal's scope, does not reach it.
-            # Without -d, hold the lifecycle lock until the console-pending
+            # its own scope. A closed terminal, or a stop or an OOM kill of the
+            # terminal's scope, therefore does not reach it.
+            # Without -d, hold the lifecycle lock until the up-console
             # marker exists. Every attach joins its leaf under this lock, so
             # no attach can end, and stop the container, before the console
             # starts.
@@ -7317,7 +7352,7 @@ class Sandy:
                     close_runtime_fds()
                 if not args.detach:
                     try:
-                        _create_console_pending(self.container)
+                        _create_up_console_marker(self.container)
                     except (OSError, ValueError) as exc:
                         _finish_spinner_line(spinner_line_event)
                         print(

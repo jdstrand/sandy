@@ -3338,6 +3338,20 @@ class EntryPrimitiveTests(unittest.TestCase):
                 sandy._capbset_drop(0)
         self.assertEqual(raised.exception.errno, errno.EIO)
 
+    def test_syscall_negative_result_other_than_minus_one_fails_closed(self):
+        # syscall(2) reports an error only as -1. A caller that ignores the
+        # result, such as setns, must not treat another negative value as
+        # success.
+        for result in (-2, -errno.EACCES, -(2**63)):
+            with self.subTest(result=result):
+                with mocked_entry_syscall(return_value=result, err=errno.EPERM):
+                    with self.assertRaises(OSError) as raised:
+                        sandy._setns(3, sandy.CLONE_NEWNET)
+                self.assertEqual(raised.exception.errno, errno.EIO)
+                self.assertIn(
+                    "setns returned an unexpected value", str(raised.exception)
+                )
+
     def test_ptrace_seize_interrupt_and_detach_exact_calls(self):
         for machine, number in (("x86_64", 101), ("aarch64", 117)):
             with self.subTest(machine=machine):
@@ -3549,6 +3563,16 @@ class EntryPrimitiveTests(unittest.TestCase):
             with self.assertRaises(OSError) as raised:
                 sandy._seccomp_set_mode_filter(bytes(8))
         self.assertEqual(raised.exception.errno, errno.EACCES)
+
+    def test_seccomp_refuses_a_multithreaded_process(self):
+        # Without flags, a filter covers only the calling thread. Mocks: the
+        # thread count and libc syscall(2).
+        with mocked_entry_syscall() as syscall, patch.object(
+            sandy.threading, "active_count", return_value=2
+        ):
+            with self.assertRaises(RuntimeError):
+                sandy._seccomp_set_mode_filter(bytes(8))
+        syscall.assert_not_called()
 
     def test_seccomp_rejects_invalid_programs(self):
         for program in (
@@ -9166,7 +9190,7 @@ class RunUpTests(unittest.TestCase):
         )
         self.exec = self.start_patch(sandy.Sandy, "_exec", 0)
         self.machine_poweroff = self.start_patch(sandy.Sandy, "_machine_poweroff", None)
-        # The lifecycle lock and the console-pending marker of up without -d.
+        # The lifecycle lock and the up-console marker of up without -d.
         self.lock_events = []
 
         @contextmanager
@@ -9178,9 +9202,9 @@ class RunUpTests(unittest.TestCase):
                 self.lock_events.append("exit")
 
         self.start_patch(sandy, "_lifecycle_lock", None).side_effect = lock
-        self.create_pending = self.start_patch(sandy, "_create_console_pending", None)
-        self.create_pending.side_effect = lambda name: self.lock_events.append(
-            f"pending {name}"
+        self.create_marker = self.start_patch(sandy, "_create_up_console_marker", None)
+        self.create_marker.side_effect = lambda name: self.lock_events.append(
+            f"marker {name}"
         )
         self.start_patch(sandy.Sandy, "_ensure_cache_dir", None)
         # The stale port rule cleanup at the start of up.
@@ -9360,7 +9384,7 @@ class RunUpTests(unittest.TestCase):
                     "E: Could not prepare the container entry", stdout.getvalue()
                 )
 
-    def test_console_pending_failure_stops_the_started_container(self):
+    def test_up_console_marker_failure_stops_the_started_container(self):
         for error, expected in (
             (TimeoutError("The container scope did not appear"), SystemExit),
             (KeyboardInterrupt(), KeyboardInterrupt),
@@ -9368,7 +9392,7 @@ class RunUpTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 instance = make_sandy()
                 instance.workspace = None
-                self.create_pending.side_effect = error
+                self.create_marker.side_effect = error
                 self.wait_for_container_ready.reset_mock()
                 with tempfile.TemporaryDirectory() as machine:
                     with patch.object(
@@ -9544,7 +9568,7 @@ class RunUpTests(unittest.TestCase):
         self.wait_for_container_ready.assert_called_once()
         self.exec.assert_not_called()
         self.machine_poweroff.assert_not_called()
-        # up -d takes no lock and creates no console-pending marker.
+        # up -d takes no lock and creates no up-console marker.
         self.assertEqual(self.lock_events, [])
         # Stale rules of this name go on every up, also without -p.
         self.stale_cleanup.assert_called_once_with("ai-dev")
@@ -9672,7 +9696,7 @@ class RunUpTests(unittest.TestCase):
         # the stop removes the port forwarding rules.
         self.exec.assert_called_once_with(None, login_shell=True, console=True)
         # The marker exists before the lock is released.
-        self.assertEqual(self.lock_events, ["enter", "pending ai-dev", "exit"])
+        self.assertEqual(self.lock_events, ["enter", "marker ai-dev", "exit"])
         self.machine_poweroff.assert_not_called()
         cleanup.assert_not_called()
         # up removes this name's stale rules and state once, at its start.
@@ -10760,26 +10784,26 @@ class AttachCgroupTests(unittest.TestCase):
         end.assert_called_once_with(unit_fd, ATTACH_LEAF)
         close.assert_called_once_with(unit_fd)
 
-    def test_console_pending_marker_lifecycle(self):
+    def test_up_console_marker_lifecycle(self):
         unit_fd = self.open_unit()
         self.addCleanup(os.close, unit_fd)
-        self.assertFalse(sandy._console_pending(unit_fd))
+        self.assertFalse(sandy._up_console_marker_exists(unit_fd))
         with patch.object(
             sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
         ):
-            sandy._create_console_pending("ai-dev")
+            sandy._create_up_console_marker("ai-dev")
             # Creating it twice is not an error.
-            sandy._create_console_pending("ai-dev")
-        self.assertTrue((self.unit / "console-pending").is_dir())
-        self.assertTrue(sandy._console_pending(unit_fd))
-        sandy._remove_console_pending(unit_fd)
-        sandy._remove_console_pending(unit_fd)
-        self.assertFalse(sandy._console_pending(unit_fd))
+            sandy._create_up_console_marker("ai-dev")
+        self.assertTrue((self.unit / "up-console").is_dir())
+        self.assertTrue(sandy._up_console_marker_exists(unit_fd))
+        sandy._remove_up_console_marker(unit_fd)
+        sandy._remove_up_console_marker(unit_fd)
+        self.assertFalse(sandy._up_console_marker_exists(unit_fd))
         # A file of that name is not the marker.
-        (self.unit / "console-pending").write_text("")
-        self.assertFalse(sandy._console_pending(unit_fd))
+        (self.unit / "up-console").write_text("")
+        self.assertFalse(sandy._up_console_marker_exists(unit_fd))
 
-    def test_create_console_pending_waits_for_the_scope(self):
+    def test_create_up_console_marker_waits_for_the_scope(self):
         opens = [FileNotFoundError(), FileNotFoundError(), None]
 
         def open_unit(_name):
@@ -10791,11 +10815,11 @@ class AttachCgroupTests(unittest.TestCase):
         with patch.object(
             sandy, "_open_supervisor_cgroup", side_effect=open_unit
         ), patch.object(sandy.time, "sleep") as sleep:
-            sandy._create_console_pending("ai-dev")
+            sandy._create_up_console_marker("ai-dev")
         self.assertEqual(
-            sleep.call_args_list, [call(sandy.CONSOLE_PENDING_POLL_INTERVAL)] * 2
+            sleep.call_args_list, [call(sandy.UP_CONSOLE_POLL_INTERVAL)] * 2
         )
-        self.assertTrue((self.unit / "console-pending").is_dir())
+        self.assertTrue((self.unit / "up-console").is_dir())
 
         with patch.object(
             sandy, "_open_supervisor_cgroup", side_effect=FileNotFoundError
@@ -10803,7 +10827,7 @@ class AttachCgroupTests(unittest.TestCase):
             sandy.time, "monotonic", side_effect=[0, 1, 10]
         ):
             with self.assertRaisesRegex(TimeoutError, "did not appear"):
-                sandy._create_console_pending("ai-dev")
+                sandy._create_up_console_marker("ai-dev")
 
     def test_new_attach_leaf_is_random_and_valid(self):
         first = sandy._new_attach_leaf()
@@ -10819,20 +10843,22 @@ class AttachLifecycleTests(unittest.TestCase):
     handling, and the stop. E2E tests must prove the rule with real attaches.
     """
 
-    def test_supervisor_detached_reads_exact_descriptions(self):
+    def test_supervisor_started_attached_reads_the_exact_description(self):
         for value, expected in (
-            ("Sandy container ai-dev (detached)", True),
-            ("Sandy container ai-dev (attached)", False),
-            ("sandy-ai-dev.scope", None),
-            ("Sandy container other (attached)", None),
-            ("Sandy container ai-dev (attached) ", None),
-            ("", None),
+            ("Sandy container ai-dev (attached)", True),
+            ("Sandy container ai-dev (detached)", False),
+            ("sandy-ai-dev.scope", False),
+            ("Sandy container other (attached)", False),
+            ("Sandy container ai-dev (attached) ", False),
+            ("", False),
         ):
             with self.subTest(value=value):
                 with patch.object(
                     sandy, "_systemctl_show_value", return_value=value
                 ) as show:
-                    self.assertIs(sandy._supervisor_detached("ai-dev"), expected)
+                    self.assertIs(
+                        sandy._supervisor_started_attached("ai-dev"), expected
+                    )
                 show.assert_called_once_with("sandy-ai-dev.scope", "Description")
 
     def test_count_populated_attaches_counts_and_prunes(self):
@@ -10928,10 +10954,10 @@ class AttachLifecycleTests(unittest.TestCase):
     @contextmanager
     def rule_mocks(
         self,
-        detached: object = False,
+        attached: object = True,
         remaining: object = 0,
         unit_error=None,
-        pending: object = False,
+        marker: object = False,
     ):
         manager = MagicMock()
 
@@ -10943,19 +10969,19 @@ class AttachLifecycleTests(unittest.TestCase):
             finally:
                 manager.lock_exit()
 
-        manager.detached.return_value = detached
+        manager.attached.return_value = attached
         manager.open_unit.return_value = 70
         if unit_error is not None:
             manager.open_unit.side_effect = unit_error
         manager.count.return_value = remaining
-        manager.pending.return_value = pending
+        manager.marker.return_value = marker
         instance = make_sandy()
         with patch.object(sandy, "_lifecycle_lock", lock), patch.object(
-            sandy, "_console_pending", manager.pending
+            sandy, "_up_console_marker_exists", manager.marker
         ), patch.object(
-            sandy, "_remove_console_pending", manager.remove_pending
+            sandy, "_remove_up_console_marker", manager.remove_marker
         ), patch.object(
-            sandy, "_supervisor_detached", manager.detached
+            sandy, "_supervisor_started_attached", manager.attached
         ), patch.object(
             sandy, "_open_supervisor_cgroup", manager.open_unit
         ), patch.object(
@@ -10980,9 +11006,9 @@ class AttachLifecycleTests(unittest.TestCase):
                 call.lock_enter(),
                 call.open_unit("ai-dev"),
                 call.count(70),
-                call.pending(70),
+                call.marker(70),
                 call.close(70),
-                call.detached("ai-dev"),
+                call.attached("ai-dev"),
                 call.poweroff(),
                 call.lock_exit(),
                 call.sigmask(sandy.signal.SIG_UNBLOCK, sandy.ATTACH_HANGUP_SIGNALS),
@@ -10992,12 +11018,12 @@ class AttachLifecycleTests(unittest.TestCase):
 
     def test_last_attach_rule_keeps_container_running(self):
         cases = (
-            ({"detached": True}, "poweroff"),
-            ({"detached": None}, "poweroff"),
+            # up -d, another description, or no scope.
+            ({"attached": False}, "poweroff"),
             ({"unit_error": FileNotFoundError()}, "count"),
-            ({"remaining": 1}, "detached"),
+            ({"remaining": 1}, "attached"),
             # The console has not exited yet (for example, up is starting).
-            ({"pending": True}, "detached"),
+            ({"marker": True}, "attached"),
         )
         for overrides, not_called in cases:
             with self.subTest(overrides=overrides):
@@ -11014,24 +11040,24 @@ class AttachLifecycleTests(unittest.TestCase):
     def test_last_attach_rule_counts_on_detached_containers(self):
         # Regression: empty leaves after SIGKILL stayed on -d containers,
         # because the rule returned before the count (measured).
-        with self.rule_mocks(detached=True) as (instance, manager):
+        with self.rule_mocks(attached=False) as (instance, manager):
             instance._stop_if_last_attach()
         manager.count.assert_called_once_with(70)
-        manager.remove_pending.assert_not_called()
+        manager.remove_marker.assert_not_called()
 
     def test_console_exit_removes_marker_before_count(self):
         with self.rule_mocks() as (instance, manager):
             with captured_output():
                 instance._stop_if_last_attach(console=True)
         names = [entry[0] for entry in manager.mock_calls]
-        self.assertLess(names.index("remove_pending"), names.index("count"))
-        manager.remove_pending.assert_called_once_with(70)
+        self.assertLess(names.index("remove_marker"), names.index("count"))
+        manager.remove_marker.assert_called_once_with(70)
         manager.poweroff.assert_called_once_with()
 
     def test_console_hangup_removes_marker_without_stop(self):
         with self.rule_mocks() as (instance, manager):
-            instance._end_console_pending()
-        manager.remove_pending.assert_called_once_with(70)
+            instance._end_up_console()
+        manager.remove_marker.assert_called_once_with(70)
         manager.close.assert_called_once_with(70)
         manager.count.assert_not_called()
         manager.poweroff.assert_not_called()
@@ -11042,14 +11068,14 @@ class AttachLifecycleTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 with self.rule_mocks(unit_error=error) as (instance, manager):
                     with captured_output() as (stdout, _):
-                        instance._end_console_pending()
-                manager.remove_pending.assert_not_called()
+                        instance._end_up_console()
+                manager.remove_marker.assert_not_called()
                 self.assertEqual("W: Could not update" in stdout.getvalue(), warned)
 
     def test_last_attach_rule_warns_on_errors(self):
         for target, error in (
             ("open_unit", PermissionError("Unexpected cgroup directory")),
-            ("detached", subprocess.CalledProcessError(1, ["systemctl"])),
+            ("attached", subprocess.CalledProcessError(1, ["systemctl"])),
             ("count", ValueError("Malformed cgroup.events\x1b")),
         ):
             with self.subTest(target=target):
