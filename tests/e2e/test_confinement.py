@@ -1,8 +1,9 @@
-"""Entry-path confinement parity (specs/security-parity.md item 1).
+"""Entry-path confinement parity (specs/security-parity.md items 1 and 5).
 
 Every attach (`exec`, `bash`, and `-u root`) must run with the container
-payload's seccomp filters and capability bounding set. These properties need
-the real kernel, systemd-nspawn, and sandy, so unit mocks cannot prove them.
+payload's seccomp filters and capability bounding set, also while `up` starts
+the container. These properties need the real kernel, systemd-nspawn, and
+sandy, so unit mocks cannot prove them.
 """
 
 from __future__ import annotations
@@ -13,13 +14,17 @@ import importlib.util
 import json
 import os
 import platform
+import select
 import shlex
+import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import ModuleType
 
 from tests.e2e.support import (
+    CONTAINER_USER_ID,
     SANDY,
     E2EContext,
     E2EFailure,
@@ -31,6 +36,16 @@ STATUS_FIELDS = ("Seccomp", "Seccomp_filters", "CapBnd", "CapEff", "NoNewPrivs")
 EPERM = 1
 ENTRY_FAILURE = 125
 STABILITY_RUNS = 150
+# Attaches in a loop while up -d starts the container (item 5). The start
+# window is short, so this is a regression check, not a proof.
+START_SAMPLERS = 3
+START_ATTACHES_AFTER_UP = 2
+START_TIMEOUT = 300
+# Starts in which the Leader is stopped as soon as machined reports it. A
+# start in which the payload already exists at the stop is repeated.
+HOLD_ATTEMPTS = 3
+HOLD_STOP_TIMEOUT = 10
+MACHINES_STATE = Path("/run/systemd/machines")
 # aarch64 has 7 of the 10 denied syscalls, and 5.15 hides bpf.
 MIN_OBSERVABLE_DENIED = 6
 # Denied by Docker's default profile and by nspawn's filter; the nsenter path
@@ -236,6 +251,131 @@ class _Session:
             if self.process.poll() is None:
                 self.process.kill()
                 self.process.wait(timeout=10)
+
+
+class _StartSampler(threading.Thread):
+    """Run one attach after the other until up has returned, and keep results.
+
+    Each result is (started after up returned, exit status, output). The
+    sampler stops after START_ATTACHES_AFTER_UP attaches that started after
+    up returned.
+    """
+
+    def __init__(
+        self,
+        arguments: list[str],
+        environment: dict[str, str],
+        cwd: Path,
+        up_done: threading.Event,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.arguments = arguments
+        self.environment = environment
+        self.cwd = cwd
+        self.up_done = up_done
+        self.results: list[tuple[bool, int, str]] = []
+        self.error: BaseException | None = None
+
+    def run(self) -> None:
+        after_up = 0
+        try:
+            while after_up < START_ATTACHES_AFTER_UP:
+                started_after_up = self.up_done.is_set()
+                if started_after_up:
+                    after_up += 1
+                completed = subprocess.run(
+                    self.arguments,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=120,
+                    shell=False,
+                    cwd=self.cwd,
+                    env=self.environment,
+                )
+                self.results.append(
+                    (
+                        started_after_up,
+                        completed.returncode,
+                        completed.stdout + completed.stderr,
+                    )
+                )
+        except BaseException as exc:  # reported by the main thread
+            self.error = exc
+
+
+def _machined_leader(name: str) -> int:
+    """Return the Leader from machined's state file, or 0 when there is none.
+
+    Reading the file is faster than starting machinectl for each poll.
+    """
+    try:
+        text = (MACHINES_STATE / name).read_text(encoding="ascii", errors="replace")
+    except FileNotFoundError:
+        return 0
+    for line in text.splitlines():
+        key, _, value = line.partition("=")
+        if key == "LEADER" and value.isdigit():
+            return int(value)
+    return 0
+
+
+def _open_scope_process(pid: int, unit: str) -> int:
+    """Return a pidfd for pid after a check that pid runs in unit's cgroup.
+
+    The check reads /proc/<pid>/cgroup. The process is alive after the read,
+    so the read and the pidfd refer to the same process.
+    """
+    pidfd = os.pidfd_open(pid)
+    try:
+        cgroup = Path(f"/proc/{pid}/cgroup").read_text(encoding="ascii").strip()
+        scope = f"0::/system.slice/{unit}"
+        if cgroup != scope and not cgroup.startswith(scope + "/"):
+            raise E2EFailure(f"PID {pid} is not in {unit}: {cgroup!r}")
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN)
+        if poller.poll(0):
+            raise E2EFailure(f"PID {pid} exited during the check")
+    except BaseException:
+        os.close(pidfd)
+        raise
+    return pidfd
+
+
+def _process_state(pid: int) -> str:
+    """Return the state letter of pid from /proc/<pid>/stat."""
+    text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    return text.rsplit(")", 1)[1].split()[0]
+
+
+def _has_payload(leader: int) -> bool:
+    """Return whether the Leader has a child with container PID 2."""
+    for child in _children(leader):
+        try:
+            text = Path(f"/proc/{child}/status").read_text(
+                encoding="ascii", errors="replace"
+            )
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        fields = {}
+        for line in text.splitlines():
+            key, _, value = line.partition(":")
+            fields[key] = value.split()
+        if fields.get("PPid") == [str(leader)] and fields.get("NSpid") == [
+            str(child),
+            "2",
+        ]:
+            return True
+    return False
+
+
+def _entry_failure_reason(output: str) -> str:
+    """Return the helper's error message from an attach output."""
+    for line in output.replace("\r", "").splitlines():
+        if "Container entry failed" in line:
+            return line.strip()
+    return "(no helper message)"
 
 
 def _exec(context: E2EContext, command: str, *, user: str | None = None, **kwargs):
@@ -482,3 +622,177 @@ def test_main(context: E2EContext) -> None:
         root_identity = _exec(context, "id -u; id -G", user="root")
         if root_identity.stdout.split() != ["0", "0"]:
             raise E2EFailure(f"-u root identity: {root_identity.stdout!r}")
+
+    # Item 5: before the payload exists, the Leader's confinement may not be
+    # final, so the helper refuses an attach. The main container restarts in
+    # these cases, and the scope tests use it next.
+    common = [
+        str(SANDY),
+        "--workspace",
+        context.workspace.name,
+        "--shared",
+        context.shared.name,
+        "--user",
+        context.main_user,
+        "--container",
+        context.main_name,
+    ]
+    up_arguments = common + ["up", "--detach", "--persistent", "--network", "lenient"]
+    start_environment = context.safe_environment()
+    start_environment["SUDO_UID"] = str(CONTAINER_USER_ID)
+
+    with context.case("attaches while up -d starts the container are refused or final"):
+        # Every attach that runs must have the final confinement.
+        context.stop_container(context.main_name, context.main_user)
+        attach = common + ["exec", "--", grep_status]
+        environment = start_environment
+        up_done = threading.Event()
+        samplers = [
+            _StartSampler(attach, environment, context.root, up_done)
+            for _ in range(START_SAMPLERS)
+        ]
+        print(f"    $ {shlex.join(attach)}  # {START_SAMPLERS} loops", flush=True)
+        for sampler in samplers:
+            sampler.start()
+        up_log = context.root / "start-window-up.log"
+        print(f"    $ {shlex.join(up_arguments)}", flush=True)
+        up_returncode: int | None = None
+        try:
+            with up_log.open("w", encoding="utf-8") as stream:
+                up = subprocess.Popen(
+                    up_arguments,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=context.root,
+                    env=environment,
+                )
+                try:
+                    up_returncode = up.wait(timeout=START_TIMEOUT)
+                finally:
+                    if up.poll() is None:
+                        up.kill()
+                        up.wait(timeout=10)
+        finally:
+            up_done.set()
+            for sampler in samplers:
+                sampler.join(timeout=START_TIMEOUT)
+        if any(sampler.is_alive() for sampler in samplers):
+            raise E2EFailure("An attach sampler did not finish")
+        if up_returncode != 0:
+            output = up_log.read_text(encoding="utf-8", errors="replace")
+            raise E2EFailure(f"up -d exited {up_returncode}: {output[-2000:]}")
+        context.wait_for_machine(context.main_name, running=True)
+        new_leader = context.machine_leader(context.main_name)
+        if new_leader is None:
+            raise E2EFailure("The restarted container has no Leader")
+        final = dict(
+            _host_status(_payload_pid(int(new_leader))), CapEff="0000000000000000"
+        )
+        counts = {"confined": 0, "not running": 0, "refused": 0}
+        refusals: dict[str, int] = {}
+        for sampler in samplers:
+            if sampler.error is not None:
+                raise E2EFailure(f"An attach sampler failed: {sampler.error!r}")
+            for after_up, returncode, output in sampler.results:
+                if returncode == 0:
+                    status = _parse_status(output)
+                    if status != final:
+                        raise E2EFailure(
+                            f"An attach ran with {status!r}, not the final "
+                            f"confinement {final!r}"
+                        )
+                    counts["confined"] += 1
+                elif after_up:
+                    raise E2EFailure(
+                        f"An attach after up returned failed with {returncode}: "
+                        f"{output[-2000:]}"
+                    )
+                elif returncode == 1 and "not found or not running" in output:
+                    counts["not running"] += 1
+                elif returncode == ENTRY_FAILURE:
+                    counts["refused"] += 1
+                    reason = _entry_failure_reason(output)
+                    refusals[reason] = refusals.get(reason, 0) + 1
+                else:
+                    raise E2EFailure(
+                        f"Unexpected attach result {returncode}: {output[-2000:]}"
+                    )
+        print(f"    attaches: {counts}; refusals: {refusals}", flush=True)
+        if counts["confined"] < START_SAMPLERS * START_ATTACHES_AFTER_UP:
+            raise E2EFailure(f"Too few attaches ran: {counts}")
+
+    with context.case("an attach before the payload exists is refused"):
+        # Stop the Leader as soon as machined reports it. While it is
+        # stopped, it cannot start its payload, so an attach must fail
+        # closed and must not run its command.
+        marker = context.workspace / "start-refused-marker"
+        unit = f"sandy-{context.main_name}.scope"
+        held_in = 0
+        for attempt in range(1, HOLD_ATTEMPTS + 1):
+            context.stop_container(context.main_name, context.main_user)
+            print(f"    $ {shlex.join(up_arguments)}", flush=True)
+            hold_log = context.root / f"start-hold-up-{attempt}.log"
+            with hold_log.open("w", encoding="utf-8") as stream:
+                up = subprocess.Popen(
+                    up_arguments,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=context.root,
+                    env=start_environment,
+                )
+            try:
+                leader = 0
+                deadline = time.monotonic() + START_TIMEOUT
+                while not leader and up.poll() is None:
+                    if time.monotonic() > deadline:
+                        raise E2EFailure("The container did not register")
+                    leader = _machined_leader(context.main_name)
+                if not leader:
+                    raise E2EFailure(f"up exited {up.returncode} before registration")
+                pidfd = _open_scope_process(leader, unit)
+                try:
+                    signal.pidfd_send_signal(pidfd, signal.SIGSTOP)
+                    try:
+                        deadline = time.monotonic() + HOLD_STOP_TIMEOUT
+                        while _process_state(leader) != "T":
+                            if time.monotonic() > deadline:
+                                raise E2EFailure("The Leader did not stop")
+                            time.sleep(0.01)
+                        if not _has_payload(leader):
+                            held_in = attempt
+                            refused = _exec(
+                                context,
+                                f"touch /home/developer/workspace/{marker.name}",
+                                expected=ENTRY_FAILURE,
+                            )
+                            assert_contains(refused, "Container is still starting")
+                            if marker.exists():
+                                raise E2EFailure("The command ran before the payload")
+                    finally:
+                        try:
+                            signal.pidfd_send_signal(pidfd, signal.SIGCONT)
+                        except ProcessLookupError:
+                            pass
+                finally:
+                    os.close(pidfd)
+                returncode = up.wait(timeout=START_TIMEOUT)
+            finally:
+                if up.poll() is None:
+                    up.kill()
+                    up.wait(timeout=10)
+            if returncode != 0:
+                output = hold_log.read_text(encoding="utf-8", errors="replace")
+                raise E2EFailure(
+                    f"up -d exited {returncode} after the hold: {output[-2000:]}"
+                )
+            if held_in:
+                break
+        if not held_in:
+            raise E2EFailure(
+                f"The payload existed at the stop in all {HOLD_ATTEMPTS} starts"
+            )
+        print(f"    held before the payload in start {held_in}", flush=True)
+        context.wait_for_machine(context.main_name, running=True)
+        _exec(context, "true")

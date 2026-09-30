@@ -228,6 +228,10 @@ The helper then joins the container's namespaces and applies both before it
 runs the command. As a result, an attached session has the same confinement
 as the container's main process, for the default user and for `-u root`. If the helper cannot read or apply the
 confinement, it refuses to run the command; there is no unconfined fallback.
+nspawn completes the Leader's confinement during the start, before it starts
+the main process. So the helper reads the Leader only after the main process
+exists. An attach before that fails with "Container is still starting; try
+again" (exit status 125); `up` waits until an attach works.
 
 Differences from earlier versions:
 
@@ -293,7 +297,7 @@ sequenceDiagram
     Note over U,H: Attach (the up console, sandy bash, or sandy exec)
     U->>S: start a session
     S->>H: start the helper (pinned sandy, validated arguments)
-    H->>K: read the Leader's seccomp filters and CapBnd from the host
+    H->>K: require PID 2, then read the Leader's seccomp filters and CapBnd
     H->>C: create and join attach-RANDOM, under the lifecycle lock
     H->>K: setns, drop to CapBnd, install the filters, execve the session
 

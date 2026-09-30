@@ -93,6 +93,17 @@ def _payload(leader: int) -> int:
     return min(candidates)[1]
 
 
+def _has_new_only_child(pid: int, old_child: int) -> bool:
+    """Return whether pid has exactly one child, and it is not old_child.
+
+    Read the children once: the list can change between two reads, for
+    example when the keepalive reaps the killed sleep before it starts the
+    next one.
+    """
+    children = _children(pid)
+    return len(children) == 1 and children[0] != old_child
+
+
 def _comm(pid: int) -> str:
     return Path(f"/proc/{pid}/comm").read_text(encoding="ascii").strip()
 
@@ -352,7 +363,7 @@ def test_main(context: E2EContext) -> None:
         os.kill(sleeps[0], signal.SIGKILL)
         _wait_for(
             "the keepalive restarts sleep",
-            lambda: len(_children(payload)) == 1 and _children(payload)[0] != sleeps[0],
+            lambda: _has_new_only_child(payload, sleeps[0]),
         )
         leftovers = sorted(Path("/tmp").glob("sandy-keepalive-*"))
         if leftovers:

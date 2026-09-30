@@ -414,6 +414,10 @@ systemd-run --scope --quiet --unit=sandy-<name>.scope --slice=system.slice \
 - After the start, `up` treats "the scope ended before the container was
   ready" as an error and reports nspawn's exit status. This covers images
   that cannot run the keepalive.
+- Ready means that the readiness probe, an attach as container root, runs.
+  The entry helper refuses an attach until the payload exists
+  (`security-parity.md` item 5), and the probe tries again every 0.5 s, for
+  up to 60 s.
 - Rejected: a transient service (loses the fd; needs `-G`), `machinectl start`
   or `systemd-nspawn@.service` (fixed `--boot` in `ExecStart=`, per-run
   options would need persistent `.nspawn` files and drop-ins, no fd passing),
@@ -702,15 +706,20 @@ Helper flow as built (steps 1 and 2):
    any other inherited descriptor.
 2. Helper, on the host, before any `setns`: set the parent-death signal and
    check `getppid()`; take the lifecycle lock; open the Leader pidfd; check
-   with `machinectl show -p Leader` that the PID is still the Leader; open the
-   `/proc/<leader>/ns/*` fds; `PTRACE_SEIZE` and `PTRACE_INTERRUPT` the Leader
-   (the stub PID 1) and `waitpid(__WALL)`; read the filters with
-   `PTRACE_SECCOMP_GET_FILTER` for index 0, 1, and so on until `ENOENT` (any
-   other errno fails, and a Leader with no filter fails); `PTRACE_DETACH` on
-   every path, with any signal that the stop took off the queue; read
-   `CapBnd` from the host's `/proc/<leader>/status`; confirm through the pidfd
-   that the Leader is still alive; check that the Leader's cgroup is below the
-   scope's `payload`; join the attach leaf; release the lock.
+   with `machinectl show -p Leader` that the PID is still the Leader; check
+   that the Leader's cgroup is below the scope's `payload` (a Leader still in
+   the scope's own cgroup means that the container is still starting);
+   require the payload (container PID 2) among the Leader's children, or
+   fail closed because the container is still starting (`security-parity.md`
+   item 5); open the `/proc/<leader>/ns/*` fds; `PTRACE_SEIZE` and
+   `PTRACE_INTERRUPT` the Leader (the stub PID 1) and `waitpid(__WALL)`; read
+   the filters with `PTRACE_SECCOMP_GET_FILTER` for index 0, 1, and so on
+   until `ENOENT` (any other errno fails, and a Leader with no filter fails);
+   `PTRACE_DETACH` on every path, with any signal that the stop took off the
+   queue; read `CapBnd` from the host's `/proc/<leader>/status`; confirm
+   through the pidfd that the Leader is still alive; require the payload's
+   filter count and `CapBnd` to equal the Leader's; join the attach leaf;
+   release the lock.
 3. The helper becomes a child subreaper and forks the middle process. The
    middle process calls `setns` on each pinned fd in the order `cgroup, ipc,
    uts, net, pid, mnt, user` (user last), becomes container root, forks the
