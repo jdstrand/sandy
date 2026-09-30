@@ -2,8 +2,8 @@
 
 Confinement properties that Sandy lacked compared with Docker, and that the
 separate security audits (not in this repository) do not cover, because no
-audit finding touches these code paths. Item 1 is fixed; items 2 to 5 are
-open.
+audit finding touches these code paths. Items 1 and 5 are fixed; items 2 to
+4 are open.
 
 The comparison target is Docker with default options. Docker is not a
 production sandbox for hostile code either. It is used here only as a widely
@@ -149,8 +149,13 @@ already runs it as root, so the helper gets the same trust.
    the stop after the last attach):
    * Pin the Leader (the container's PID 1, `(sd-stubinit)`) with a pidfd, and
      confirm with `machinectl` that it is still the machine's Leader.
-   * Open `/proc/<pid>/ns/{cgroup,ipc,uts,net,pid,mnt,user}` through a
-     `/proc/<pid>` directory descriptor.
+   * Read the Leader's host cgroup through a `/proc/<pid>` directory
+     descriptor, and require it below
+     `/system.slice/sandy-<name>.scope/payload` (step 2 of the scope brief).
+   * Require the payload (container PID 2) among the Leader's children
+     (item 5).
+   * Open `/proc/<pid>/ns/{cgroup,ipc,uts,net,pid,mnt,user}` through the same
+     directory descriptor.
    * `PTRACE_SEIZE` and `PTRACE_INTERRUPT` (not `PTRACE_ATTACH`, which queues
      a SIGSTOP), `waitpid(__WALL)`, then `PTRACE_SECCOMP_GET_FILTER` for index
      0, 1, and so on until `ENOENT`; any other errno fails. `PTRACE_DETACH`
@@ -159,9 +164,9 @@ already runs it as root, so the helper gets the same trust.
      After `setns(mnt)`, `/proc` is the container's mount, which container
      root controls.
    * Check through the pidfd that the Leader did not exit.
-   * Read the Leader's host cgroup and require it below
-     `/system.slice/sandy-<name>.scope/payload`, then create and join the
-     attach leaf `attach-<random>` (step 2 of the scope brief).
+   * Require the payload's filter count and `CapBnd` to equal the Leader's
+     (item 5), then create and join the attach leaf `attach-<random>` (step 2
+     of the scope brief).
 2. The helper becomes a child subreaper and forks the middle process. The
    middle process empties `sys.meta_path` and `sys.path`, joins the namespaces
    (user last; see below), calls `setgroups([])`, `setresgid(0, 0, 0)`, and
@@ -192,7 +197,8 @@ container data: machined reports it, a pidfd pins it, and its host cgroup must
 be below the scope's `payload`. Measured: the Leader's filters equal the
 payload's byte for byte, and every attach matches the payload's `CapBnd`
 (E2E, systemd 249, 255, and 257). Item 5 covers the one case that this does
-not: an attach while the container is still starting.
+not: an attach while the container is still starting. The helper now refuses
+that attach.
 
 Account data follows nspawn, as measured: `root` gets no supplementary groups;
 other users get exactly the groups that list them as members. The files are
@@ -672,44 +678,99 @@ the proposed `--allow-inner-sandboxing` flag.
 
 ### Status
 
-Open. Found in the review of the scope work. The recommended fix below was
-measured; it is not implemented.
+Fixed. Found in the review of the scope work. The entry helper now requires
+the container's payload before it reads the Leader (see "Implemented fix"
+below). Measured on systemd 249, 255, and 257 (kernels 5.15, 6.8, and 6.12).
 
-### Observation
+### Observation (before the fix)
 
-The entry helper copies the confinement of the Leader (item 1). It refuses a
-Leader with no seccomp filter, but it does not check that the container start
-is complete. The readiness probe of `up` is an attach, and it starts while the
-container is still starting. Another attach can do the same.
+The entry helper copies the confinement of the Leader (item 1). It refused a
+Leader with no seccomp filter, but it did not check that the container start
+was complete. The readiness probe of `up` is an attach, and it starts while
+the container is still starting. Another attach could do the same.
 
 ### Docker comparison
 
 `docker exec` applies the container's configured profile. It does not copy
 the profile from a running process, so the time of the attach does not matter.
 
-### Recommended fix: wait for the payload
-
-Before the helper reads the confinement, require that the Leader has the
-payload (PID 2, `sandy-keepalive`) as its child, and that the payload's
-filters and `CapBnd` equal the Leader's. Otherwise fail closed; the readiness
-probe tries again, as it does now. The check belongs in
-`_extract_leader_confinement`, under the lifecycle lock. Identify the payload
-by its container PID or its name, not only by "the Leader has a child":
-orphans of attaches also become children of the Leader.
+### Measurement before the fix
 
 Measured in the test VMs (systemd 249, 255, and 257), 30 starts each with the
 bridge network and with the host network. A sampler read the Leader's
-`Seccomp_filters`, `CapBnd`, and children from the moment machined registered
-the machine until the start was complete:
+`Seccomp_filters` count, `CapBnd`, and children from the moment machined
+registered the machine until the start was complete:
 
 | Check | Result |
 | --- | --- |
 | Starts in which the payload appeared | 180 of 180 |
-| Samples (about 4.1 million in all) with the payload present, but the Leader's filters or `CapBnd` not yet final | 0 |
-| Starts in which the payload's filters and `CapBnd` equal the Leader's final values | 180 of 180 |
+| Samples (about 4.1 million in all) with the payload present, but the Leader's `Seccomp_filters` count or `CapBnd` not yet final | 0 |
+| Starts in which the payload's `Seccomp_filters` count and `CapBnd` equal the Leader's final values | 180 of 180 |
 
-Some samples before the payload existed were not yet final, so the check is
-needed. In these measurements it was also sufficient.
+The sampler compared the filter count, not the filter bytes. Some samples
+before the payload existed were not yet final, so a check is necessary.
+
+### Implemented fix: require the payload
+
+machined reports the Leader before nspawn has completed the Leader's setup,
+and nspawn starts the payload (PID 2, `sandy-keepalive`) only after that
+setup. `_extract_leader_confinement` therefore does these steps in this
+order, under the lifecycle lock:
+
+1. Pin the Leader and confirm it with `machinectl` (item 1).
+2. Require the Leader's host cgroup below the scope's `payload`. This check
+   comes before the payload check: a container that an earlier Sandy started
+   has no payload at PID 2, and it needs a restart, not a retry. nspawn
+   moves the Leader from the scope's own cgroup to `payload` during the
+   start, so a Leader in the scope's own cgroup also gives "still starting".
+3. Find the payload among the Leader's children. The helper reads
+   `task/<leader>/children` through the pinned host `/proc/<leader>`
+   descriptor, and the status of each child from the host `/proc`. The
+   payload is the child whose `PPid` is the Leader and whose `NSpid` has
+   exactly two entries: its host PID and 2. The Leader also adopts orphans
+   of attaches, but they have other container PIDs. Host PID 2 (`kthreadd`)
+   has one `NSpid` entry, and a process of a PID namespace inside the
+   container has more than two. Only one process can be PID 2 of the
+   container, so the search stops at the first match. Without the payload,
+   the attach fails closed with "Container is still starting; try again"
+   (status 125).
+4. Only then open the Leader's namespace descriptors, read its filters with
+   ptrace, and read its `CapBnd`. The Leader's cgroup namespace also changes
+   during the start: it changed after machined reported the Leader in 77 of
+   90 measured starts. No other namespace changed.
+5. After the pidfd check, require the payload's `Seccomp_filters` count and
+   `CapBnd`, from its host `/proc/<pid>/status`, to equal the Leader's filter
+   count and `CapBnd`. Otherwise the attach fails closed. This compares the
+   filter count, not the filter bytes: a byte comparison needs a second
+   ptrace stop, of the payload.
+
+The readiness probe of `up` retries every failure every 0.5 s, for up to 60
+s, so `up` waits until an attach works. A `bash` or `exec` during the start
+fails with the message above and status 125.
+
+### Measured result (with the fix)
+
+Measured on systemd 249, 255, and 257 with the Debian trixie image. The
+samplers are test scripts outside the repository; they read the host
+`/proc` in a loop from the moment machined reported the Leader until the
+start was complete. "Final" means the value after `up` returned.
+
+| Check | Result |
+| --- | --- |
+| `make e2e` (68 cases, 2 of them new for this item) | Passed on all three VMs |
+| E2E: stop the Leader with SIGSTOP when machined reports it, then attach before the payload exists | Refused with status 125 and "Container is still starting"; the command did not run (all three VMs) |
+| E2E: three loops of attaches while `up -d` starts the container | Every attach that ran (12 on each VM) had the final confinement. No attach was refused, so the loops did not reach the start window; a regression check only |
+| The sampler of "Measurement before the fix", 180 starts (2.85 million samples) | Payload equal to the Leader's final values: 180 of 180. Samples with the keepalive present but a value not final: 0. With any child present: 1 (see below) |
+| Read order, 180 starts (617,306 samples); each sample reads the values, the children, and the values again | Samples with PID 2 present but a value not final: 0 when the children are read first, as the helper does; 1 when the values are read first |
+| Namespaces, 90 starts (525,723 samples) | Samples with PID 2 present but a namespace, `Seccomp_filters` count, or `CapBnd` not final: 0. Starts with a cgroup namespace change before PID 2 existed: 77 |
+| Leader cgroup, same 90 starts | Starts with samples in which the Leader was still in the scope's own cgroup, not below `payload`: 66. The helper reports "still starting" for this case too |
+| An orphan with 65535 supplementary groups, adopted by the Leader (made by container root) | Its host status file has 525,739 to 722,449 bytes, above the 64 KiB read limit. It comes after the payload in the Leader's child list, so the search does not read it, and an attach works |
+
+The one sample with a child present but a value not final came from a
+sampler that reads the Leader's values before its children. The read order
+check explains it (inference): the Leader completed its setup and started
+the payload between the two reads. When the children are read first, as the
+helper does, no sample had PID 2 present with a value that was not final.
 
 
 ## Reference: the InfluxDB 3 Core systemd unit

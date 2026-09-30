@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
+import os
 import signal
 import stat
+import subprocess
 import tempfile
+import threading
 import unittest
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -25,8 +28,17 @@ from tests.e2e.support import (
     E2EFailure,
     FilesystemFixtureIdentity,
 )
-from tests.e2e.test_confinement import _Session
+from tests.e2e.test_confinement import (
+    START_ATTACHES_AFTER_UP,
+    _entry_failure_reason,
+    _has_payload,
+    _machined_leader,
+    _open_scope_process,
+    _Session,
+    _StartSampler,
+)
 from tests.e2e.test_network import _wait_for_public_https
+from tests.e2e.test_scope import _has_new_only_child
 
 
 class CleanupProbeContext(E2EContext):
@@ -483,6 +495,180 @@ class ConfinementSessionTests(unittest.TestCase):
             self.assertEqual(attach.session_pid(), 500)
         self.assertEqual(poll, len(snapshots) - 1)
         self.assertEqual(sleep.call_count, len(snapshots) - 1)
+
+
+class StartSamplerTests(unittest.TestCase):
+    """The start-window case samples attaches until up has returned.
+
+    Mocks: subprocess.run in the sampler module. No attach runs.
+    """
+
+    def test_sampler_stops_after_the_attaches_that_follow_up(self):
+        up_done = threading.Event()
+        outputs = iter(("before", "during", "after 1", "after 2"))
+
+        def run(arguments, **kwargs):
+            output = next(outputs)
+            if output == "during":
+                up_done.set()
+            return subprocess.CompletedProcess(arguments, 0, output, "!")
+
+        sampler = _StartSampler(["sandy", "exec"], {"A": "b"}, Path("/w"), up_done)
+        with patch("tests.e2e.test_confinement.subprocess.run", side_effect=run) as ran:
+            sampler.run()
+        self.assertEqual(START_ATTACHES_AFTER_UP, 2)
+        self.assertEqual(
+            sampler.results,
+            [
+                (False, 0, "before!"),
+                (False, 0, "during!"),
+                (True, 0, "after 1!"),
+                (True, 0, "after 2!"),
+            ],
+        )
+        self.assertIsNone(sampler.error)
+        ran.assert_called_with(
+            ["sandy", "exec"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+            shell=False,
+            cwd=Path("/w"),
+            env={"A": "b"},
+        )
+
+    def test_sampler_keeps_an_error_for_the_main_thread(self):
+        error = subprocess.TimeoutExpired(["sandy"], 120)
+        sampler = _StartSampler(["sandy"], {}, Path("/w"), threading.Event())
+        with patch("tests.e2e.test_confinement.subprocess.run", side_effect=error):
+            sampler.run()
+        self.assertIs(sampler.error, error)
+        self.assertEqual(sampler.results, [])
+
+    def test_entry_failure_reason(self):
+        output = "I: x\r\nE: Container entry failed: 'Container is still starting'\r\n"
+        self.assertEqual(
+            _entry_failure_reason(output),
+            "E: Container entry failed: 'Container is still starting'",
+        )
+        self.assertEqual(_entry_failure_reason("E: other\n"), "(no helper message)")
+
+
+class LeaderHoldTests(unittest.TestCase):
+    """The hold case stops only a process of this run's container scope.
+
+    Mocks: os.pidfd_open (a pipe stands in for the pidfd), the /proc text
+    that the helpers read, and the machined state directory (a temporary
+    directory).
+    """
+
+    def open_with_cgroup(self, cgroup: str, exited: bool = False) -> tuple[int, int]:
+        read_fd, write_fd = os.pipe()
+        try:
+            if exited:
+                # A readable pidfd means that the process exited.
+                os.write(write_fd, b"x")
+            with patch(
+                "tests.e2e.test_confinement.os.pidfd_open", return_value=read_fd
+            ), patch.object(Path, "read_text", return_value=cgroup):
+                try:
+                    return _open_scope_process(42, "sandy-e2e-main-1.scope"), read_fd
+                except BaseException:
+                    # The pidfd is closed on every failure.
+                    with self.assertRaises(OSError):
+                        os.fstat(read_fd)
+                    raise
+        finally:
+            os.close(write_fd)
+
+    def test_open_scope_process_accepts_only_the_scope(self):
+        for cgroup in (
+            "0::/system.slice/sandy-e2e-main-1.scope\n",
+            "0::/system.slice/sandy-e2e-main-1.scope/payload\n",
+        ):
+            with self.subTest(cgroup=cgroup):
+                pidfd, read_fd = self.open_with_cgroup(cgroup)
+                self.assertEqual(pidfd, read_fd)
+                os.close(pidfd)
+        for cgroup in (
+            "0::/system.slice/sandy-e2e-main-10.scope/payload\n",
+            "0::/system.slice/ssh.service\n",
+            "0::/\n",
+        ):
+            with self.subTest(cgroup=cgroup):
+                with self.assertRaises(E2EFailure):
+                    self.open_with_cgroup(cgroup)
+
+    def test_open_scope_process_rejects_an_exited_process(self):
+        with self.assertRaisesRegex(E2EFailure, "exited"):
+            self.open_with_cgroup(
+                "0::/system.slice/sandy-e2e-main-1.scope/payload\n", exited=True
+            )
+
+    def test_machined_leader_parses_the_state_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = Path(temp_dir)
+            with patch("tests.e2e.test_confinement.MACHINES_STATE", state):
+                self.assertEqual(_machined_leader("e2e-main-1"), 0)
+                (state / "e2e-main-1").write_text("NAME=e2e-main-1\nLEADER=4242\n")
+                self.assertEqual(_machined_leader("e2e-main-1"), 4242)
+                (state / "e2e-main-1").write_text("LEADER=\nLEADER=x\n")
+                self.assertEqual(_machined_leader("e2e-main-1"), 0)
+
+    def test_has_payload_requires_the_leader_and_container_pid_2(self):
+        statuses = {
+            "/proc/77/status": "PPid:\t42\nNSpid:\t77\t2\n",
+            "/proc/78/status": "PPid:\t42\nNSpid:\t78\t9\n",
+            "/proc/79/status": "PPid:\t41\nNSpid:\t79\t2\n",
+            "/proc/80/status": "PPid:\t42\nNSpid:\t80\t5\t2\n",
+        }
+
+        def read_text(path: Path, **kwargs) -> str:
+            if str(path) not in statuses:
+                raise FileNotFoundError(str(path))
+            return statuses[str(path)]
+
+        for children, expected in (
+            ([77], True),
+            ([81, 78, 77], True),
+            ([78, 79, 80, 81], False),
+            ([], False),
+        ):
+            with self.subTest(children=children):
+                with patch(
+                    "tests.e2e.test_confinement._children", return_value=children
+                ), patch.object(
+                    Path, "read_text", autospec=True, side_effect=read_text
+                ):
+                    self.assertEqual(_has_payload(42), expected)
+
+
+class KeepaliveRestartTests(unittest.TestCase):
+    """The keepalive restart wait reads the child list once per poll.
+
+    Mocks: the child list of the keepalive.
+    """
+
+    def test_a_list_that_empties_between_reads_is_not_an_error(self):
+        # Regression test: the predicate read the list twice. The first read
+        # held the killed sleep and the second read was empty (IndexError on
+        # systemd 257).
+        lists = iter(([10], []))
+        with patch(
+            "tests.e2e.test_scope._children", side_effect=lambda pid: next(lists)
+        ) as children:
+            self.assertFalse(_has_new_only_child(5, 10))
+        children.assert_called_once_with(5)
+
+    def test_only_one_new_child_counts(self):
+        for current, expected in (([], False), ([10], False), ([11], True)):
+            with self.subTest(current=current):
+                with patch("tests.e2e.test_scope._children", return_value=current):
+                    self.assertEqual(_has_new_only_child(5, 10), expected)
+        with patch("tests.e2e.test_scope._children", return_value=[11, 12]):
+            self.assertFalse(_has_new_only_child(5, 10))
 
 
 class SandyInvocationTests(unittest.TestCase):

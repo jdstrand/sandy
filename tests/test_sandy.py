@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -3789,6 +3790,272 @@ class LeaderExtractionTests(unittest.TestCase):
             finally:
                 os.close(proc_fd)
 
+    def test_read_proc_file_reads_every_chunk_and_bounds_the_size(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data = b"x" * (sandy.PROC_READ_CHUNK_BYTES * 2 + 5)
+            Path(temp_dir, "status").write_bytes(data)
+            dir_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                self.assertEqual(
+                    sandy._read_proc_file(dir_fd, "status", len(data)), data
+                )
+                with self.assertRaisesRegex(ValueError, "too large"):
+                    sandy._read_proc_file(dir_fd, "status", len(data) - 1)
+                # The name is below the directory, and a link is not followed.
+                Path(temp_dir, "link").symlink_to("status")
+                with self.assertRaises(OSError):
+                    sandy._read_proc_file(dir_fd, "link", len(data))
+            finally:
+                os.close(dir_fd)
+
+    def test_open_process_dir_validates_the_pid(self):
+        with patch.object(sandy.os, "open", return_value=7) as open_:
+            self.assertEqual(sandy._open_process_dir(42), 7)
+        open_.assert_called_once_with("/proc/42", sandy.DIRECTORY_OPEN_FLAGS)
+        for pid in (0, -1, True, "42", 4194304):
+            with self.subTest(pid=pid):
+                with patch.object(sandy.os, "open") as open_:
+                    with self.assertRaises(ValueError):
+                        sandy._open_process_dir(pid)
+                open_.assert_not_called()
+
+    def test_parse_status_value_requires_one_well_formed_line(self):
+        pattern = sandy.PPID_LINE_PATTERN
+        self.assertEqual(
+            sandy._parse_status_value("Name:\tx\nPPid:\t42\n", "PPid", pattern), "42"
+        )
+        for text in (
+            "Name:\tx\n",
+            "PPid:\t42\nPPid:\t42\n",
+            "PPid: 42\n",
+            "PPid:\t042\n",
+            "PPid:\t42 \n",
+            "PPid:\t12345678\n",
+            "PPid:\t-1\n",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    sandy._parse_status_value(text, "PPid", pattern)
+
+    def payload_status(
+        self,
+        ppid: "str | None" = "42",
+        nspid: "str | None" = "77\t2",
+        filters: "str | None" = "2",
+        capbnd: str = "00000000fdecbfff",
+        name: str = "sandy-keepalive",
+    ) -> str:
+        """Return /proc/<pid>/status text with the fields that Sandy reads."""
+        lines = [f"Name:\t{name}", "State:\tS (sleeping)"]
+        if ppid is not None:
+            lines.append(f"PPid:\t{ppid}")
+        if nspid is not None:
+            lines.append(f"NSpid:\t{nspid}")
+        lines.append(f"CapBnd:\t{capbnd}")
+        lines.append("Seccomp:\t2")
+        if filters is not None:
+            lines.append(f"Seccomp_filters:\t{filters}")
+        return "\n".join(lines) + "\n"
+
+    def test_parse_payload_status_accepts_only_the_containers_pid_2(self):
+        self.assertEqual(
+            sandy._parse_payload_status(self.payload_status(), 77, 42),
+            sandy.ProcessConfinement(2, 0xFDECBFFF),
+        )
+        for label, text, pid in (
+            # An orphan that the Leader adopted.
+            ("orphan", self.payload_status(nspid="77\t9"), 77),
+            ("wrong parent", self.payload_status(ppid="43"), 77),
+            ("no parent", self.payload_status(ppid="0"), 77),
+            # Host PID 2 (kthreadd) has one NSpid entry.
+            ("kthreadd", self.payload_status(ppid="0", nspid="2"), 2),
+            ("host PID 2 with the Leader as parent", self.payload_status(nspid="2"), 2),
+            ("host process", self.payload_status(nspid="77"), 77),
+            # PID 2 of a PID namespace that the container created.
+            ("nested namespace", self.payload_status(nspid="77\t9\t2"), 77),
+            ("other host PID", self.payload_status(nspid="78\t2"), 77),
+        ):
+            with self.subTest(label=label):
+                self.assertIsNone(sandy._parse_payload_status(text, pid, 42))
+
+    def test_parse_payload_status_fails_closed_on_malformed_fields(self):
+        for label, text in (
+            ("no PPid", self.payload_status(ppid=None)),
+            ("bad PPid", self.payload_status(ppid="x")),
+            ("no NSpid", self.payload_status(nspid=None)),
+            ("bad NSpid", self.payload_status(nspid="77 2")),
+            ("NSpid zero", self.payload_status(nspid="77\t0")),
+            ("no filter count", self.payload_status(filters=None)),
+            ("bad filter count", self.payload_status(filters="-1")),
+            ("bad CapBnd", self.payload_status(capbnd="fdecbfff")),
+            ("two PPid lines", self.payload_status() + "PPid:\t42\n"),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    sandy._parse_payload_status(text, 77, 42)
+
+    def test_parse_payload_status_reads_only_identity_of_other_children(self):
+        # A child that is not the payload needs only PPid and NSpid.
+        text = self.payload_status(nspid="77\t9", filters=None, capbnd="bad")
+        self.assertIsNone(sandy._parse_payload_status(text, 77, 42))
+
+    @contextmanager
+    def fake_proc(
+        self, children: bytes, statuses: "Mapping[int, str | None]"
+    ) -> Iterator[tuple[int, MagicMock]]:
+        """Build a fake host /proc with Leader 42; yield its descriptor.
+
+        _open_process_dir is the only mock: it opens <pid> below the fake
+        tree, as the real function opens /proc/<pid>.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            leader = Path(root, "42")
+            (leader / "task" / "42").mkdir(parents=True)
+            (leader / "task" / "42" / "children").write_bytes(children)
+            for pid, text in statuses.items():
+                Path(root, str(pid)).mkdir()
+                if text is not None:
+                    Path(root, str(pid), "status").write_text(text)
+
+            def open_process_dir(pid):
+                return os.open(os.path.join(root, str(pid)), sandy.DIRECTORY_OPEN_FLAGS)
+
+            leader_fd = os.open(leader, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(
+                    sandy, "_open_process_dir", side_effect=open_process_dir
+                ) as opened:
+                    yield leader_fd, opened
+            finally:
+                os.close(leader_fd)
+
+    def test_find_payload_confinement_finds_pid_2_among_orphans(self):
+        statuses = {
+            90: self.payload_status(nspid="90\t14", filters="9"),
+            77: self.payload_status(),
+            91: self.payload_status(nspid="91\t15", capbnd="0000000000000000"),
+        }
+        with self.fake_proc(b"90 77 91 ", statuses) as (leader_fd, opened):
+            self.assertEqual(
+                sandy._find_payload_confinement(leader_fd, 42),
+                sandy.ProcessConfinement(2, 0xFDECBFFF),
+            )
+        # The search stops at the payload; it reads no later child.
+        self.assertEqual(opened.call_args_list, [call(90), call(77)])
+
+    def test_find_payload_confinement_reads_no_child_after_the_payload(self):
+        # Container root can give an adopted orphan a status that is too
+        # large to read (many supplementary groups). The orphan comes after
+        # the payload, so it cannot make the attach fail.
+        statuses = {
+            77: self.payload_status(),
+            90: self.payload_status(nspid="90\t14") + "x" * 70000,
+        }
+        with self.fake_proc(b"77 90 ", statuses) as (leader_fd, opened):
+            self.assertEqual(
+                sandy._find_payload_confinement(leader_fd, 42),
+                sandy.ProcessConfinement(2, 0xFDECBFFF),
+            )
+        self.assertEqual(opened.call_args_list, [call(77)])
+        with self.fake_proc(b"90 77 ", statuses) as (leader_fd, _):
+            with self.assertRaisesRegex(ValueError, "too large"):
+                sandy._find_payload_confinement(leader_fd, 42)
+
+    def test_find_payload_confinement_fails_closed_while_starting(self):
+        cases = (
+            ("no children", b"", {}),
+            ("only an orphan", b"90 ", {90: self.payload_status(nspid="90\t3")}),
+            (
+                "kthreadd",
+                b"2 ",
+                {2: self.payload_status(ppid="0", nspid="2")},
+            ),
+            ("wrong parent", b"77 ", {77: self.payload_status(ppid="41")}),
+            (
+                "nested namespace",
+                b"77 ",
+                {77: self.payload_status(nspid="77\t5\t2")},
+            ),
+            # The payload exited after the list was read.
+            ("gone", b"77 ", {}),
+            ("gone before status", b"77 ", {77: None}),
+        )
+        for label, children, statuses in cases:
+            with self.subTest(label=label):
+                with self.fake_proc(children, statuses) as (leader_fd, _):
+                    with self.assertRaisesRegex(ProcessLookupError, "still starting"):
+                        sandy._find_payload_confinement(leader_fd, 42)
+
+    def test_find_payload_confinement_skips_a_child_that_exits(self):
+        statuses = {90: self.payload_status(nspid="90\t3"), 77: self.payload_status()}
+        real_read = sandy._read_process_status
+        # The first child exits between its directory open and its status read.
+        results = [ProcessLookupError("gone")]
+
+        def read_status(proc_fd):
+            if results:
+                raise results.pop()
+            return real_read(proc_fd)
+
+        with self.fake_proc(b"90 77 ", statuses) as (leader_fd, _):
+            with patch.object(sandy, "_read_process_status", side_effect=read_status):
+                self.assertEqual(
+                    sandy._find_payload_confinement(leader_fd, 42),
+                    sandy.ProcessConfinement(2, 0xFDECBFFF),
+                )
+
+    def test_find_payload_confinement_leaks_no_descriptor(self):
+        statuses = {
+            90: self.payload_status(nspid="90\t3"),
+            77: self.payload_status(),
+            91: None,
+        }
+        for children in (b"90 77 ", b"90 91 ", b"91 77 90 "):
+            with self.subTest(children=children):
+                with self.fake_proc(children, statuses) as (leader_fd, _):
+                    before = sandy._open_fds()
+                    try:
+                        sandy._find_payload_confinement(leader_fd, 42)
+                    except ProcessLookupError:
+                        pass
+                    self.assertEqual(sandy._open_fds(), before)
+
+    def test_find_payload_confinement_fails_closed_on_bad_data(self):
+        payload = {77: self.payload_status()}
+        malformed = {77: self.payload_status(filters="x")}
+        with self.fake_proc(b"77 ", malformed) as (leader_fd, _):
+            with self.assertRaises(ValueError):
+                sandy._find_payload_confinement(leader_fd, 42)
+        with self.fake_proc(b"77", payload) as (leader_fd, _):
+            with self.assertRaisesRegex(ValueError, "children list"):
+                sandy._find_payload_confinement(leader_fd, 42)
+
+    def test_require_scope_payload_cgroup(self):
+        unit = "sandy-ai-dev.scope"
+        for cgroup in (
+            "/system.slice/sandy-ai-dev.scope/payload",
+            "/system.slice/sandy-ai-dev.scope/payload/init.scope",
+        ):
+            with self.subTest(cgroup=cgroup):
+                sandy._require_scope_payload_cgroup(cgroup, unit)
+        for cgroup in (
+            "/system.slice/sandy-ai-dev.scope/payloadx",
+            "/system.slice/sandy-ai-dev.scope/attach-0",
+            "/system.slice/sandy-ai-dev.scope/",
+            "/system.slice/sandy-ai-dev.scopex",
+            "/machine.slice/machine-ai-dev.scope/payload",
+            "/",
+        ):
+            with self.subTest(cgroup=cgroup):
+                with self.assertRaisesRegex(PermissionError, "restart it"):
+                    sandy._require_scope_payload_cgroup(cgroup, unit)
+        # During the start, nspawn moves the Leader from the scope's own
+        # cgroup to payload (measured on systemd 249, 255, and 257).
+        with self.assertRaisesRegex(ProcessLookupError, "still starting"):
+            sandy._require_scope_payload_cgroup(
+                "/system.slice/sandy-ai-dev.scope", unit
+            )
+
     def test_pidfd_process_alive_uses_readability(self):
         # A pipe stands in for a pidfd: readable means that the process exited.
         read_fd, write_fd = os.pipe()
@@ -3970,9 +4237,14 @@ class LeaderExtractionTests(unittest.TestCase):
         )
         manager.join.return_value = 30
         manager.alive.return_value = overrides.get("alive", True)
-        for name in ("filters", "capbnd", "pidfd_open", "join"):
+        manager.payload.return_value = overrides.get(
+            "payload_confinement", sandy.ProcessConfinement(2, 0xFDECBFFF)
+        )
+        for name in ("filters", "capbnd", "pidfd_open", "join", "payload"):
             if name in overrides:
                 getattr(manager, name).side_effect = overrides[name]
+        if "cgroup_error" in overrides:
+            manager.cgroup.side_effect = overrides["cgroup_error"]
         with ExitStack() as stack:
             stack.enter_context(patch.object(sandy, "_lifecycle_lock", lock))
             stack.enter_context(
@@ -3991,6 +4263,9 @@ class LeaderExtractionTests(unittest.TestCase):
             )
             stack.enter_context(
                 patch.object(sandy, "_read_process_cgroup", manager.cgroup)
+            )
+            stack.enter_context(
+                patch.object(sandy, "_find_payload_confinement", manager.payload)
             )
             stack.enter_context(
                 patch.object(sandy, "_pidfd_process_alive", manager.alive)
@@ -4019,6 +4294,10 @@ class LeaderExtractionTests(unittest.TestCase):
                 call.pidfd_open(42),
                 call.query("ai-dev"),
                 call.open("/proc/42", sandy.DIRECTORY_OPEN_FLAGS, dir_fd=None),
+                call.cgroup(20),
+                # The payload exists before the Leader's namespaces and
+                # filters are opened or read (specs/security-parity.md item 5).
+                call.payload(20, 42),
                 call.open("ns/cgroup", ns_flags, dir_fd=20),
                 call.open("ns/ipc", ns_flags, dir_fd=20),
                 call.open("ns/uts", ns_flags, dir_fd=20),
@@ -4028,7 +4307,6 @@ class LeaderExtractionTests(unittest.TestCase):
                 call.open("ns/user", ns_flags, dir_fd=20),
                 call.filters(42),
                 call.capbnd(20),
-                call.cgroup(20),
                 call.close(20),
                 call.alive(10),
                 call.join("ai-dev", ATTACH_LEAF),
@@ -4044,22 +4322,40 @@ class LeaderExtractionTests(unittest.TestCase):
         manager.join.assert_called_once_with("ai-dev", ATTACH_LEAF)
 
     def test_extract_leader_confinement_rejects_leader_outside_scope(self):
-        for cgroup in (
-            "/machine.slice/machine-ai-dev.scope/payload",
-            "/system.slice/sandy-ai-dev.scope/supervisor",
-            "/system.slice/sandy-ai-dev.scope/payloadx",
-            "/system.slice/sandy-ai-dev.scope",
-            "/system.slice/sandy-other.scope/payload",
+        for cgroup, error, message in (
+            (
+                "/machine.slice/machine-ai-dev.scope/payload",
+                PermissionError,
+                "restart it",
+            ),
+            (
+                "/system.slice/sandy-ai-dev.scope/supervisor",
+                PermissionError,
+                "restart it",
+            ),
+            (
+                "/system.slice/sandy-ai-dev.scope/payloadx",
+                PermissionError,
+                "restart it",
+            ),
+            (
+                "/system.slice/sandy-other.scope/payload",
+                PermissionError,
+                "restart it",
+            ),
+            # nspawn has not yet moved the Leader below payload.
+            ("/system.slice/sandy-ai-dev.scope", ProcessLookupError, "still starting"),
         ):
             with self.subTest(cgroup=cgroup):
                 with self.extraction_mocks(cgroup=cgroup) as manager:
-                    with self.assertRaisesRegex(PermissionError, "restart it"):
+                    with self.assertRaisesRegex(error, message):
                         sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
+                # A container of an earlier Sandy has no payload at PID 2, so
+                # the scope check comes first and asks for a restart.
+                manager.payload.assert_not_called()
+                manager.filters.assert_not_called()
                 manager.join.assert_not_called()
-                self.assertEqual(
-                    manager.close.call_args_list[1:],
-                    [call(fd) for fd in (10, 21, 22, 23, 24, 25, 26, 27)],
-                )
+                self.assertEqual(manager.close.call_args_list, [call(20), call(10)])
                 manager.lock_exit.assert_called_once_with()
 
     def test_extract_leader_confinement_closes_fds_when_join_fails(self):
@@ -4126,15 +4422,54 @@ class LeaderExtractionTests(unittest.TestCase):
             ("filters", OSError(errno.EACCES, "x")),
             ("capbnd", ValueError("bad")),
             ("pidfd_open", ProcessLookupError("gone")),
+            ("cgroup_error", ValueError("bad")),
+            ("payload", ValueError("bad")),
         ):
             with self.subTest(name=name):
                 with self.extraction_mocks(**{name: error}) as manager:
                     with self.assertRaises(type(error)):
                         sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
                 manager.alive.assert_not_called()
+                manager.join.assert_not_called()
                 manager.lock_exit.assert_called_once_with()
                 if name != "pidfd_open":
                     self.assertIn(call(10), manager.close.call_args_list)
+
+    def test_extract_leader_confinement_fails_closed_while_starting(self):
+        # No payload yet: nothing of the Leader is opened, stopped, or read.
+        starting = ProcessLookupError("Container is still starting; try again")
+        with self.extraction_mocks(payload=starting) as manager:
+            with self.assertRaisesRegex(ProcessLookupError, "still starting"):
+                sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
+        self.assertEqual(
+            [entry for entry in manager.mock_calls if entry[0] == "open"],
+            [call.open("/proc/42", sandy.DIRECTORY_OPEN_FLAGS, dir_fd=None)],
+        )
+        manager.filters.assert_not_called()
+        manager.capbnd.assert_not_called()
+        manager.alive.assert_not_called()
+        manager.join.assert_not_called()
+        self.assertEqual(manager.close.call_args_list, [call(20), call(10)])
+        manager.lock_exit.assert_called_once_with()
+
+    def test_extract_leader_confinement_rejects_a_payload_mismatch(self):
+        for payload in (
+            sandy.ProcessConfinement(1, 0xFDECBFFF),
+            sandy.ProcessConfinement(3, 0xFDECBFFF),
+            sandy.ProcessConfinement(2, 0xFDECABFF),
+            sandy.ProcessConfinement(2, 0x1FFFFFFFFFF),
+        ):
+            with self.subTest(payload=payload):
+                with self.extraction_mocks(payload_confinement=payload) as manager:
+                    with self.assertRaisesRegex(PermissionError, "differs"):
+                        sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
+                manager.alive.assert_called_once_with(10)
+                manager.join.assert_not_called()
+                self.assertEqual(
+                    manager.close.call_args_list,
+                    [call(fd) for fd in (20, 10, 21, 22, 23, 24, 25, 26, 27)],
+                )
+                manager.lock_exit.assert_called_once_with()
 
     def test_extract_leader_confinement_validates_pid_before_lock(self):
         for pid in (0, True, "42"):
@@ -4448,7 +4783,7 @@ class EntryHelperTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         sandy._read_cap_last_cap()
 
-    def test_read_child_pids_lists_running_and_unreaped_children(self):
+    def test_read_own_child_pids_lists_running_and_unreaped_children(self):
         # No mocks: the helper finds the session in this list, and a session
         # that exits at once must still be listed until it is reaped.
         child = subprocess.Popen(
@@ -4456,37 +4791,86 @@ class EntryHelperTests(unittest.TestCase):
             stdin=subprocess.PIPE,
         )
         try:
-            self.assertIn(child.pid, sandy._read_child_pids())
+            self.assertIn(child.pid, sandy._read_own_child_pids())
             assert child.stdin is not None
             child.stdin.close()
             os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
-            self.assertIn(child.pid, sandy._read_child_pids())
+            self.assertIn(child.pid, sandy._read_own_child_pids())
         finally:
             child.wait(timeout=30)
-        self.assertNotIn(child.pid, sandy._read_child_pids())
+        self.assertNotIn(child.pid, sandy._read_own_child_pids())
+
+    def test_read_own_child_pids_opens_this_process_and_closes_it(self):
+        with patch.object(sandy.os, "getpid", return_value=55), patch.object(
+            sandy, "_open_process_dir", return_value=99
+        ) as open_dir, patch.object(
+            sandy, "_read_child_pids", return_value=(88,)
+        ) as read, patch.object(
+            sandy.os, "close"
+        ) as close:
+            self.assertEqual(sandy._read_own_child_pids(), (88,))
+        open_dir.assert_called_once_with(55)
+        read.assert_called_once_with(99, 55)
+        close.assert_called_once_with(99)
+        with patch.object(sandy.os, "getpid", return_value=55), patch.object(
+            sandy, "_open_process_dir", return_value=99
+        ), patch.object(
+            sandy, "_read_child_pids", side_effect=ValueError("bad")
+        ), patch.object(
+            sandy.os, "close"
+        ) as close:
+            with self.assertRaises(ValueError):
+                sandy._read_own_child_pids()
+        close.assert_called_once_with(99)
+
+    def write_children(self, root: str, pid: int, data: bytes) -> None:
+        task = Path(root) / "task" / str(pid)
+        task.mkdir(parents=True, exist_ok=True)
+        (task / "children").write_bytes(data)
 
     def test_read_child_pids_parses_strictly(self):
+        # A temporary directory stands in for the host /proc/<pid>.
         cases = ((b"", ()), (b"88 ", (88,)), (b"88 89 ", (88, 89)))
-        for data, expected in cases:
-            with self.subTest(data=data):
-                with patch.object(sandy.os, "open", return_value=99), patch.object(
-                    sandy.os, "read", return_value=data
-                ), patch.object(sandy.os, "close"), patch.object(
-                    sandy.os, "getpid", return_value=55
-                ):
-                    self.assertEqual(sandy._read_child_pids(), expected)
-                    sandy.os.open.assert_called_once_with(
-                        "/proc/55/task/55/children", sandy.READ_FILE_OPEN_FLAGS
-                    )
-        for data in (b"88", b"x ", b"088 ", b"88  ", b"-1 ", b"4194304 ", b"8" * 4096):
-            with self.subTest(data=data[:12]):
-                with patch.object(sandy.os, "open", return_value=99), patch.object(
-                    sandy.os, "read", return_value=data
-                ), patch.object(sandy.os, "close"), patch.object(
-                    sandy.os, "getpid", return_value=55
-                ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                for data, expected in cases:
+                    with self.subTest(data=data):
+                        self.write_children(temp_dir, 55, data)
+                        self.assertEqual(sandy._read_child_pids(proc_fd, 55), expected)
+                for data in (b"88", b"x ", b"088 ", b"88  ", b"-1 ", b"4194304 "):
+                    with self.subTest(data=data):
+                        self.write_children(temp_dir, 55, data)
+                        with self.assertRaises(ValueError):
+                            sandy._read_child_pids(proc_fd, 55)
+                with self.assertRaises(FileNotFoundError):
+                    sandy._read_child_pids(proc_fd, 56)
+                for pid in (0, True, "55"):
+                    with self.subTest(pid=pid):
+                        with self.assertRaises(ValueError):
+                            sandy._read_child_pids(proc_fd, pid)
+            finally:
+                os.close(proc_fd)
+
+    def test_read_child_pids_reads_past_one_chunk_and_bounds_the_size(self):
+        # More than one read: the kernel returns at most a page per read.
+        many = b"".join(b"%d " % pid for pid in range(1000000, 1001000))
+        self.assertGreater(len(many), sandy.PROC_READ_CHUNK_BYTES)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                self.write_children(temp_dir, 55, many)
+                self.assertEqual(
+                    sandy._read_child_pids(proc_fd, 55),
+                    tuple(range(1000000, 1001000)),
+                )
+                with patch.object(sandy, "CHILD_PIDS_MAX_BYTES", len(many) - 1):
                     with self.assertRaises(ValueError):
-                        sandy._read_child_pids()
+                        sandy._read_child_pids(proc_fd, 55)
+                with patch.object(sandy, "CHILD_PIDS_MAX_BYTES", len(many)):
+                    self.assertEqual(len(sandy._read_child_pids(proc_fd, 55)), 1000)
+            finally:
+                os.close(proc_fd)
 
     def test_entry_error_removes_control_characters(self):
         with captured_output() as (_, stderr):
@@ -4851,7 +5235,7 @@ class EntryHelperTests(unittest.TestCase):
         ), patch.object(
             sandy.os, "waitpid", manager.waitpid
         ), patch.object(
-            sandy, "_read_child_pids", manager.children
+            sandy, "_read_own_child_pids", manager.children
         ), patch.object(
             sandy.os, "kill", manager.kill
         ), patch.object(
@@ -5062,6 +5446,7 @@ class EntryHelperTests(unittest.TestCase):
             TimeoutError("busy"),
             ValueError("CapBnd"),
             subprocess.CalledProcessError(1, ["machinectl"]),
+            ProcessLookupError("Container is still starting; try again"),
         ):
             with self.subTest(error=type(error).__name__):
                 with self.helper_mocks(extract=error) as manager:
@@ -8159,6 +8544,22 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(
             run_as_root.call_args_list,
             [call("true", capture_output=True, timeout=5)] * 2,
+        )
+
+    def test_wait_for_container_ready_retries_while_the_container_starts(self):
+        # The entry helper refuses an attach before the payload exists
+        # (status 125); the probe must retry, not fail the start.
+        instance = make_sandy()
+        refused = SimpleNamespace(returncode=sandy.ENTRY_HELPER_FAILURE)
+        ready = SimpleNamespace(returncode=0)
+        with patch.object(
+            instance, "_run_as_root", side_effect=[refused, refused, ready]
+        ) as run_as_root:
+            with patch("time.sleep") as sleep:
+                self.assertTrue(instance._wait_for_container_ready())
+        self.assertEqual(run_as_root.call_count, 3)
+        self.assertEqual(
+            sleep.call_args_list, [call(sandy.CONTAINER_READY_INTERVAL)] * 2
         )
 
     def test_wait_for_container_ready_times_out_without_running_machine(self):

@@ -2028,7 +2028,15 @@ UP_CONSOLE_POLL_INTERVAL: Final = 0.01
 PROC_CGROUP_MAX_BYTES: Final = 4096
 PROC_CGROUP_PATTERN: Final = re.compile(r"0::(/[^\n]*)\n")
 CAPBND_LINE_PATTERN: Final = re.compile(r"CapBnd:\t([0-9a-f]{16})")
+PPID_LINE_PATTERN: Final = re.compile(r"PPid:\t(0|[1-9][0-9]{0,6})")
+NSPID_LINE_PATTERN: Final = re.compile(r"NSpid:((?:\t[1-9][0-9]{0,6})+)")
+SECCOMP_FILTERS_LINE_PATTERN: Final = re.compile(
+    r"Seccomp_filters:\t(0|[1-9][0-9]{0,4})"
+)
 PROC_STATUS_MAX_BYTES: Final = 65536
+PROC_READ_CHUNK_BYTES: Final = 4096
+# nspawn --as-pid2 --user=root starts the payload as PID 2 of the container.
+CONTAINER_PAYLOAD_PID: Final = 2
 
 
 class LeaderConfinement(NamedTuple):
@@ -2042,6 +2050,13 @@ class LeaderConfinement(NamedTuple):
     capability_bounding_set: int
     # cgroup.kill of the attach leaf that this process joined.
     attach_kill_fd: int
+
+
+class ProcessConfinement(NamedTuple):
+    """The seccomp filter count and CapBnd of a process, from its host status."""
+
+    seccomp_filter_count: int
+    capability_bounding_set: int
 
 
 def _parse_leader_pid(value: str) -> int:
@@ -2071,36 +2086,112 @@ def _query_machine_leader(machine_name: str) -> int:
     return _parse_leader_pid(output)
 
 
+def _parse_status_value(status_text: str, name: str, pattern: re.Pattern[str]) -> str:
+    """Return the value of the one name line of /proc/<pid>/status text.
+
+    pattern matches the whole line and captures the value. Fail closed when
+    the line is missing, repeated, or malformed.
+    """
+    values = [line for line in status_text.split("\n") if line.startswith(f"{name}:")]
+    if len(values) != 1:
+        raise ValueError(f"Expected exactly one {name} line")
+    match = pattern.fullmatch(values[0])
+    if match is None:
+        raise ValueError(f"Malformed {name} line")
+    return match.group(1)
+
+
 def _parse_capability_bounding_set(status_text: str) -> int:
     """Return the CapBnd mask from /proc/<pid>/status text, or fail closed."""
-    values = [line for line in status_text.split("\n") if line.startswith("CapBnd:")]
-    if len(values) != 1:
-        raise ValueError("Expected exactly one CapBnd line")
-    match = CAPBND_LINE_PATTERN.fullmatch(values[0])
-    if match is None:
-        raise ValueError("Malformed CapBnd line")
-    return int(match.group(1), 16)
+    return int(_parse_status_value(status_text, "CapBnd", CAPBND_LINE_PATTERN), 16)
 
 
-def _read_capability_bounding_set(proc_fd: int) -> int:
-    """Read CapBnd from the status file of an open host /proc/<pid> directory."""
-    status_fd = os.open("status", READ_FILE_OPEN_FLAGS, dir_fd=proc_fd)
+def _read_proc_file(dir_fd: int, name: str, max_bytes: int) -> bytes:
+    """Read a whole file below an open host /proc directory, up to max_bytes."""
+    fd = os.open(name, READ_FILE_OPEN_FLAGS, dir_fd=dir_fd)
     try:
         chunks = []
         size = 0
         while True:
-            chunk = os.read(status_fd, 4096)
+            chunk = os.read(fd, PROC_READ_CHUNK_BYTES)
             if not chunk:
                 break
             size += len(chunk)
-            if size > PROC_STATUS_MAX_BYTES:
-                raise ValueError("Process status is too large")
+            if size > max_bytes:
+                raise ValueError(f"Process file {name} is too large")
             chunks.append(chunk)
     finally:
-        os.close(status_fd)
-    return _parse_capability_bounding_set(
-        b"".join(chunks).decode("ascii", errors="replace")
+        os.close(fd)
+    return b"".join(chunks)
+
+
+def _read_process_status(proc_fd: int) -> str:
+    """Return the status text of an open host /proc/<pid> directory."""
+    data = _read_proc_file(proc_fd, "status", PROC_STATUS_MAX_BYTES)
+    return data.decode("ascii", errors="replace")
+
+
+def _read_capability_bounding_set(proc_fd: int) -> int:
+    """Read CapBnd from the status file of an open host /proc/<pid> directory."""
+    return _parse_capability_bounding_set(_read_process_status(proc_fd))
+
+
+def _open_process_dir(pid: int) -> int:
+    """Open the host /proc/<pid> directory of pid."""
+    return os.open(f"/proc/{_require_pid(pid)}", DIRECTORY_OPEN_FLAGS)
+
+
+def _parse_payload_status(
+    status_text: str, pid: int, leader_pid: int
+) -> Optional[ProcessConfinement]:
+    """Return the confinement in status_text if pid is the container payload.
+
+    The payload is PID 2 of the Leader's PID namespace. Require the Leader as
+    the parent, and exactly two NSpid entries: pid in the host namespace and
+    2 in the container's. Return None for any other process, such as an
+    orphan that the Leader adopted. Host PID 2 (kthreadd) has one entry, and
+    a process of a PID namespace inside the container has more than two.
+    """
+    parent = int(_parse_status_value(status_text, "PPid", PPID_LINE_PATTERN))
+    nspid = _parse_status_value(status_text, "NSpid", NSPID_LINE_PATTERN)
+    namespace_pids = [int(value) for value in nspid.split("\t")[1:]]
+    if parent != leader_pid or namespace_pids != [pid, CONTAINER_PAYLOAD_PID]:
+        return None
+    filters = _parse_status_value(
+        status_text, "Seccomp_filters", SECCOMP_FILTERS_LINE_PATTERN
     )
+    return ProcessConfinement(
+        seccomp_filter_count=int(filters),
+        capability_bounding_set=_parse_capability_bounding_set(status_text),
+    )
+
+
+def _find_payload_confinement(proc_fd: int, leader_pid: int) -> ProcessConfinement:
+    """Return the confinement of the container payload, a child of the Leader.
+
+    nspawn starts the payload only after it has installed the filters and set
+    the bounding set on the Leader. So while no payload exists, the container
+    is still starting, and the Leader's confinement may not be final. proc_fd
+    is the Leader's host /proc/<pid> directory. A child that exits meanwhile
+    is skipped. Only one process can be PID 2 of the container, so the search
+    stops at the first match; it does not read the status of later children,
+    such as orphans that the Leader adopted.
+    """
+    for child in _read_child_pids(proc_fd, leader_pid):
+        try:
+            child_fd = _open_process_dir(child)
+        except FileNotFoundError:
+            continue
+        try:
+            status_text = _read_process_status(child_fd)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        finally:
+            os.close(child_fd)
+        payload = _parse_payload_status(status_text, child, leader_pid)
+        if payload is not None:
+            return payload
+    raise ProcessLookupError("Container is still starting; try again")
 
 
 def _pidfd_process_alive(pidfd: int) -> bool:
@@ -2396,6 +2487,26 @@ def _read_seccomp_filters(pid: int) -> Tuple[bytes, ...]:
     return filters
 
 
+def _require_scope_payload_cgroup(leader_cgroup: str, unit: str) -> None:
+    """Require that the Leader's cgroup is below the payload cgroup of unit.
+
+    Only host root can create cgroups outside the container's delegated
+    payload subtree. So a Leader below the payload of the Sandy scope proves
+    that the scope runs this container. nspawn moves the Leader there from
+    the scope's own cgroup after machined reports it (measured), so a Leader
+    in the scope's own cgroup means that the container is still starting.
+    """
+    scope = f"/{SUPERVISOR_SLICE}/{unit}"
+    payload = f"{scope}/payload"
+    if leader_cgroup == payload or leader_cgroup.startswith(payload + "/"):
+        return
+    if leader_cgroup == scope:
+        raise ProcessLookupError("Container is still starting; try again")
+    raise PermissionError(
+        f"Container is not running in {unit}; restart it with this version of Sandy"
+    )
+
+
 def _close_fds(fds: Tuple[int, ...]) -> None:
     """Close each descriptor, and ignore descriptors that are already closed."""
     for fd in fds:
@@ -2421,8 +2532,14 @@ def _extract_leader_confinement(
     init, (sd-stubinit), because nspawn runs with --as-pid2. The payload
     (PID 2) inherits its filters and bounding set, and the kernel only lets
     both become stricter, so they are the confinement to copy. See
-    specs/security-parity.md, item 1; item 5 there covers an attach during
-    the container start.
+    specs/security-parity.md, item 1.
+
+    machined reports the Leader before nspawn has completed its setup, and
+    nspawn starts the payload only after that setup. So find the payload
+    before the Leader's namespaces and filters are opened or read, and
+    require the payload's filter count and CapBnd to equal the Leader's
+    (item 5). Until then the container is still starting, and the attach
+    fails closed.
 
     Hold the lifecycle lock for the whole extraction and for the creation of
     the leaf, so that a stop decision cannot interleave with a new attach.
@@ -2442,8 +2559,13 @@ def _extract_leader_confinement(
             # Leader of the machine now, not a later user of the same PID.
             if _query_machine_leader(machine_name) != pid:
                 raise PermissionError("Container Leader changed during extraction")
-            proc_fd = os.open(f"/proc/{pid}", DIRECTORY_OPEN_FLAGS)
+            proc_fd = _open_process_dir(pid)
             try:
+                # Check the scope before the payload: a container that an
+                # earlier Sandy started has no payload at PID 2, and it needs
+                # a restart, not a retry.
+                _require_scope_payload_cgroup(_read_process_cgroup(proc_fd), unit)
+                payload = _find_payload_confinement(proc_fd, pid)
                 namespace_fds = []
                 for name, _ in NAMESPACE_ENTRY_ORDER:
                     # ns/<name> are kernel magic links, anchored at the pinned
@@ -2455,21 +2577,18 @@ def _extract_leader_confinement(
                     namespace_fds.append(ns_fd)
                 seccomp_filters = _read_seccomp_filters(pid)
                 capability_bounding_set = _read_capability_bounding_set(proc_fd)
-                leader_cgroup = _read_process_cgroup(proc_fd)
             finally:
                 os.close(proc_fd)
             # The process was alive from pidfd_open to here, so the PID
             # referred to it for every read above.
             if not _pidfd_process_alive(pidfd):
                 raise ProcessLookupError("Container Leader exited during extraction")
-            # Only host root can create cgroups outside the container's
-            # delegated payload subtree. So a Leader below the payload of
-            # the Sandy scope proves that the scope runs this container.
-            payload = f"/{SUPERVISOR_SLICE}/{unit}/payload"
-            if leader_cgroup != payload and not leader_cgroup.startswith(payload + "/"):
+            if payload != ProcessConfinement(
+                seccomp_filter_count=len(seccomp_filters),
+                capability_bounding_set=capability_bounding_set,
+            ):
                 raise PermissionError(
-                    f"Container is not running in {unit}; restart it with this "
-                    "version of Sandy"
+                    "Container payload confinement differs from the Leader"
                 )
             attach_kill_fd = _join_attach_leaf(machine_name, attach_leaf)
         except BaseException:
@@ -2768,23 +2887,35 @@ def _read_cap_last_cap() -> int:
 
 
 CHILD_PIDS_PATTERN: Final = re.compile(r"(?:[1-9][0-9]{0,6} )*")
+# An entry takes at most 8 bytes, so this allows 131072 children, eight times
+# SUPERVISOR_TASKS_MAX.
+CHILD_PIDS_MAX_BYTES: Final = 1048576
 
 
-def _read_child_pids() -> Tuple[int, ...]:
-    """Return the children of this process from the host procfs.
+def _read_child_pids(proc_fd: int, pid: int) -> Tuple[int, ...]:
+    """Return the children of pid from its open host /proc/<pid> directory.
 
-    The list includes children that have exited but are not reaped yet.
+    pid must be single-threaded: the list holds the children of its main
+    thread. The list includes children that have exited but are not reaped
+    yet.
     """
-    pid = os.getpid()
-    fd = os.open(f"/proc/{pid}/task/{pid}/children", READ_FILE_OPEN_FLAGS)
-    try:
-        data = os.read(fd, 4096)
-    finally:
-        os.close(fd)
+    data = _read_proc_file(
+        proc_fd, f"task/{_require_pid(pid)}/children", CHILD_PIDS_MAX_BYTES
+    )
     text = data.decode("ascii", errors="replace")
-    if len(data) >= 4096 or not CHILD_PIDS_PATTERN.fullmatch(text):
+    if not CHILD_PIDS_PATTERN.fullmatch(text):
         raise ValueError("Malformed process children list")
     return tuple(_require_pid(int(value)) for value in text.split())
+
+
+def _read_own_child_pids() -> Tuple[int, ...]:
+    """Return the children of this process from the host procfs."""
+    pid = os.getpid()
+    proc_fd = _open_process_dir(pid)
+    try:
+        return _read_child_pids(proc_fd, pid)
+    finally:
+        os.close(proc_fd)
 
 
 def _entry_error(exc: BaseException) -> None:
@@ -2967,7 +3098,7 @@ def _run_confined_entry(
         # The middle process failed before or at its fork and reported why.
         return _propagate_wait_status(middle_status)
     try:
-        children = _read_child_pids()
+        children = _read_own_child_pids()
     except (OSError, ValueError) as exc:
         _entry_error(exc)
         return ENTRY_HELPER_FAILURE
@@ -6315,8 +6446,9 @@ class Sandy:
             if supervisor is not None and supervisor.poll() is not None:
                 return False
             # Ready means that the entry helper can confine and run a command.
-            # Until nspawn has installed the payload's filters, extraction
-            # fails, so an early probe fails closed and is retried. An
+            # Until the container's payload (PID 2) exists, the helper refuses
+            # the attach, because the Leader's confinement may not be final
+            # yet. So an early probe fails closed and is retried. An
             # _EntrySetupError does not go away by itself; it propagates.
             try:
                 result = self._run_as_root("true", capture_output=True, timeout=5)
