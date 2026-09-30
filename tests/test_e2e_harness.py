@@ -11,7 +11,7 @@ import unittest
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from tests.e2e.support import (
     ACL_PROMPT_ANSWERS,
@@ -25,6 +25,7 @@ from tests.e2e.support import (
     E2EFailure,
     FilesystemFixtureIdentity,
 )
+from tests.e2e.test_confinement import _Session
 from tests.e2e.test_network import _wait_for_public_https
 
 
@@ -45,13 +46,37 @@ class CleanupProbeContext(E2EContext):
         self.filesystem_image_root = root / "image"
         self.filesystem_host_target = root / "host"
         self._filesystem_mounts = []
+        self.bridge = False
+        self.firewall: list[str] = []
         self.bridge_checks = 0
+        self.firewall_checks = 0
         self.cache_purges = 0
         self.state_checks = 0
+        self.sandy_calls: list[list[str]] = []
 
     def bridge_exists(self) -> bool:
         self.bridge_checks += 1
-        return False
+        return self.bridge
+
+    def firewall_artifacts(self) -> list[str]:
+        self.firewall_checks += 1
+        return list(self.firewall)
+
+    def sandy(
+        self,
+        arguments: Sequence[str],
+        *,
+        name: str | None = None,
+        user: str = "developer",
+        expected: int | None = 0,
+        timeout: int = DEFAULT_TIMEOUT,
+        environment: Mapping[str, str] | None = None,
+        input_text: str | None = None,
+        executable: Path | None = None,
+    ) -> CommandResult:
+        del name, user, expected, timeout, environment, input_text, executable
+        self.sandy_calls.append(list(arguments))
+        return CommandResult(("sandy", *arguments), 0, "", "")
 
     def purge_cache(self) -> None:
         self.cache_purges += 1
@@ -114,6 +139,8 @@ class CleanupOwnershipTests(unittest.TestCase):
 
             self.assertFalse(root.exists())
             self.assertEqual(context.bridge_checks, 0)
+            self.assertEqual(context.firewall_checks, 0)
+            self.assertEqual(context.sandy_calls, [])
             self.assertEqual(context.cache_purges, 0)
             self.assertEqual(context.state_checks, 0)
 
@@ -129,6 +156,33 @@ class CleanupOwnershipTests(unittest.TestCase):
             self.assertEqual(context.bridge_checks, 1)
             self.assertEqual(context.cache_purges, 1)
             self.assertEqual(context.state_checks, 1)
+
+    def test_cleanup_removes_the_network_when_the_bridge_or_firewall_remains(self):
+        # Regression test: a failed case can delete the bridge and leave the
+        # Sandy firewall. Mocks: the bridge and firewall checks and sandy.
+        cases = (
+            # bridge, firewall artifacts, firewall checks, rm --network calls
+            (True, [], 0, 1),
+            (False, ["nftables ip/sandy"], 1, 1),
+            (False, [], 1, 0),
+        )
+        for bridge, firewall, firewall_checks, removals in cases:
+            with self.subTest(bridge=bridge, firewall=firewall):
+                with tempfile.TemporaryDirectory() as parent:
+                    root = Path(parent) / "run"
+                    root.mkdir()
+                    context = CleanupProbeContext(root, host_state_owned=True)
+                    context.bridge = bridge
+                    context.firewall = firewall
+
+                    self.assertEqual(context.cleanup(), [])
+
+                    self.assertEqual(context.firewall_checks, firewall_checks)
+                    self.assertEqual(
+                        context.sandy_calls, [["rm", "--network", "--force"]] * removals
+                    )
+                    self.assertEqual(context.cache_purges, 1)
+                    self.assertEqual(context.state_checks, 1)
 
     def test_cleanup_unmounts_tracked_files_before_removing_fixtures(self):
         with tempfile.TemporaryDirectory() as parent:
@@ -375,6 +429,62 @@ class PublicHttpsRetryTests(unittest.TestCase):
         self.assertEqual(context.results, [])
 
 
+class ConfinementSessionTests(unittest.TestCase):
+    """The confinement case must read the filters of the session only."""
+
+    def test_session_pid_waits_for_the_session_command(self):
+        # Regression test: during the extraction, machinectl is the only
+        # child of the entry helper. Mocks: the process tree and the command
+        # lines (one snapshot for each poll) and the poll sleep.
+        helper = (
+            b"python3\x00-I\x00/proc/self/fd/3\x00"
+            b"__sandy-entry-helper\x00sleep 10\x00"
+        )
+        session = b"script\x00-qec\x00sleep 10\x00/dev/null\x00"
+        snapshots = (
+            # machinectl, while the helper extracts the confinement.
+            ({100: [200], 200: [300]}, {200: helper, 300: b"machinectl\x00show\x00"}),
+            # The middle process, a fork of the helper.
+            ({100: [200], 200: [400]}, {200: helper, 400: helper}),
+            # The session is reparented; the exited middle has no command line.
+            ({100: [200], 200: [400, 500]}, {200: helper, 400: b"", 500: helper}),
+            # The session before its execve, a fork of the helper.
+            ({100: [200], 200: [500]}, {200: helper, 500: helper}),
+            # A child that is gone before its command line is read.
+            ({100: [200], 200: [600]}, {200: helper}),
+            # The session after its execve.
+            ({100: [200], 200: [500]}, {200: helper, 500: session}),
+        )
+        poll = -1
+
+        def children(pid: int) -> list[int]:
+            nonlocal poll
+            if pid == 100:
+                poll += 1
+            return snapshots[poll][0].get(pid, [])
+
+        def read_bytes(path: Path) -> bytes:
+            lines = snapshots[poll][1]
+            pid = int(path.parts[2])
+            if pid not in lines:
+                raise FileNotFoundError(str(path))
+            return lines[pid]
+
+        attach = _Session.__new__(_Session)
+        attach.process = MagicMock(pid=100)
+        attach.command = "sleep 10"
+        with patch(
+            "tests.e2e.test_confinement._children", side_effect=children
+        ), patch.object(
+            Path, "read_bytes", autospec=True, side_effect=read_bytes
+        ), patch(
+            "tests.e2e.test_confinement.time.sleep"
+        ) as sleep:
+            self.assertEqual(attach.session_pid(), 500)
+        self.assertEqual(poll, len(snapshots) - 1)
+        self.assertEqual(sleep.call_count, len(snapshots) - 1)
+
+
 class SandyInvocationTests(unittest.TestCase):
     """The harness runs sandy as a real `sudo` user would. It mocks run()."""
 
@@ -458,7 +568,11 @@ class SandyInvocationTests(unittest.TestCase):
         )
 
     def test_group_writable_sandy_copies_the_scripts_into_the_run_root(self):
-        # No mocks: the copy is made in a temporary run root.
+        # No mocks: the copy is made in a temporary run root. A checkout made
+        # with umask 002 already has sandy at mode 0775, so compare with the
+        # checkout before the call, not with a fixed mode.
+        checkout_mode = SANDY.stat().st_mode
+        checkout_bytes = SANDY.read_bytes()
         with tempfile.TemporaryDirectory() as temp_dir:
             context = self.make_context()
             context.root = Path(temp_dir)
@@ -473,7 +587,9 @@ class SandyInvocationTests(unittest.TestCase):
                     self.assertEqual(target.stat().st_mode, source.stat().st_mode)
             # A second call reuses the directory.
             self.assertEqual(context.group_writable_sandy(), copy)
-        self.assertEqual(stat.S_IMODE(SANDY.stat().st_mode) & 0o022, 0)
+        # The checkout does not change.
+        self.assertEqual(SANDY.stat().st_mode, checkout_mode)
+        self.assertEqual(SANDY.read_bytes(), checkout_bytes)
 
     def test_builds_answer_only_the_two_acl_prompts(self):
         self.assertEqual(ACL_PROMPT_ANSWERS, "y\ny\n")

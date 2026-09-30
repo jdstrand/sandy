@@ -4560,8 +4560,10 @@ class EntryHelperTests(unittest.TestCase):
         )
         for signum in (sandy.signal.SIGKILL, sandy.signal.SIGTERM, sandy.signal.SIGHUP):
             with self.subTest(signum=signum):
+                # Pass the number: on Python 3.10, str() of a Signals member
+                # is its name, such as "Signals.SIGHUP".
                 result = subprocess.run(
-                    [sys.executable, "-c", code, str(SANDY_PATH), str(signum)],
+                    [sys.executable, "-c", code, str(SANDY_PATH), str(int(signum))],
                     capture_output=True,
                     timeout=30,
                 )

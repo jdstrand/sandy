@@ -138,6 +138,14 @@ def _children(pid: int) -> list[int]:
     return [int(value) for value in text.split()]
 
 
+def _cmdline(pid: int) -> bytes:
+    """Return the command line of pid, or b"" when the process is gone."""
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return b""
+
+
 def _payload_pid(leader: int) -> int:
     """Return the payload: the Leader's child with the lowest container PID."""
     candidates = []
@@ -171,6 +179,7 @@ class _Session:
     """A background `sandy exec` whose entry helper and session can be found."""
 
     def __init__(self, context: E2EContext, command: str) -> None:
+        self.command = command
         arguments = [
             str(SANDY),
             "--workspace",
@@ -196,19 +205,27 @@ class _Session:
         )
 
     def session_pid(self, timeout: float = 20) -> int:
-        """Return the session: the only child of the entry helper."""
+        """Return the session: the only child of the entry helper.
+
+        The helper has other only children first: machinectl during the
+        extraction, then the middle process, and then the session before its
+        execve, a fork of the helper that has not installed the filters yet.
+        So accept only a child whose command line holds the session command
+        and is not the helper's.
+        """
+        command = self.command.encode()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for helper in _children(self.process.pid):
-                cmdline = Path(f"/proc/{helper}/cmdline").read_bytes()
-                if b"__sandy-entry-helper" in cmdline:
+                if b"__sandy-entry-helper" in _cmdline(helper):
                     sessions = _children(helper)
-                    # Before its execve, the session is a fork of the helper
-                    # that has not installed the filters yet.
-                    if len(sessions) == 1 and b"__sandy-entry-helper" not in (
-                        Path(f"/proc/{sessions[0]}/cmdline").read_bytes()
-                    ):
-                        return sessions[0]
+                    if len(sessions) == 1:
+                        cmdline = _cmdline(sessions[0])
+                        if (
+                            command in cmdline
+                            and b"__sandy-entry-helper" not in cmdline
+                        ):
+                            return sessions[0]
             time.sleep(0.1)
         raise E2EFailure("The entry helper session did not start")
 

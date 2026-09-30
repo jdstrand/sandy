@@ -1218,7 +1218,11 @@ class E2EContext:
 
         if self._host_state_owned:
             try:
-                if self.bridge_exists():
+                # A failed case can leave the Sandy firewall without the
+                # bridge (test_stale_rules deletes the bridge). rm --network
+                # removes that state too: it sets up a bridge first, removes
+                # it, and the ip_forward value is restored below.
+                if self.bridge_exists() or self._sandy_firewall_exists():
                     self.sandy(["rm", "--network", "--force"])
             except Exception as exc:
                 errors.append(f"network: {exc}")
