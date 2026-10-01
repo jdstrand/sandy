@@ -68,13 +68,70 @@ KEEPALIVE_COPY_NAME: Final = "keepalive.sh"
 KEEPALIVE_SHELL: Final = "/bin/bash"
 # The payload's path of the script copy, in the container's mount namespace.
 KEEPALIVE_SCRIPT_PATH: Final = f"{KEEPALIVE_MOUNT}/{KEEPALIVE_COPY_NAME}"
-# nspawn runs in the transient scope sandy-<name>.scope in system.slice, not
-# in the cgroup of the terminal that runs sandy.
+# nspawn runs in the transient scope sandy-<name>.scope, not in the cgroup of
+# the terminal that runs sandy. All these scopes are in sandy.slice, which
+# holds the limits that the containers share. A "-" in a slice name makes a
+# nested slice, so the name has none.
 SUPERVISOR_UNIT_PREFIX: Final = "sandy-"
-SUPERVISOR_SLICE: Final = "system.slice"
-SUPERVISOR_TASKS_MAX: Final = 16384
+SUPERVISOR_SLICE: Final = "sandy.slice"
+ONLINE_CPUS_PATH: Final = "/sys/devices/system/cpu/online"
+CPU_LIST_PATTERN: Final = re.compile(
+    r"[0-9]{1,4}(?:-[0-9]{1,4})?(?:,[0-9]{1,4}(?:-[0-9]{1,4})?)*"
+)
+CPU_LIST_MAX_BYTES: Final = 4096
+# NR_CPUS is at most 8192 in the kernel configuration.
+CPU_NUMBER_MAX: Final = 8191
+# The system task limit is the smaller of these two kernel values.
+THREADS_MAX_PATH: Final = "/proc/sys/kernel/threads-max"
+PID_MAX_PATH: Final = "/proc/sys/kernel/pid_max"
+KERNEL_NUMBER_PATTERN: Final = re.compile(r"[1-9][0-9]{0,9}")
+KERNEL_NUMBER_MAX_BYTES: Final = 32
+# Resource limits (specs/security-parity.md item 2). All containers share the
+# limits of sandy.slice. By default the host keeps some CPUs and a part of its
+# memory and tasks (see _default_group_limits), and no container gets swap.
+# Sizes use the units of docker run: b, k, m, and g, powers of 1024.
+MIB: Final = 1024 * 1024
+GIB: Final = 1024 * MIB
+SIZE_PATTERN: Final = re.compile(r"(0|[1-9][0-9]{0,15})([bkmgBKMG]?)")
+SIZE_UNITS: Final = {"": 1, "b": 1, "k": 1024, "m": MIB, "g": GIB}
+SIZE_MAX: Final = 1024 * 1024 * GIB
+PIDS_LIMIT_PATTERN: Final = re.compile(r"-1|[1-9][0-9]{0,6}")
+HOST_MEMORY_RESERVE_PERCENT: Final = 25
+HOST_MEMORY_RESERVE_MIN: Final = 4 * GIB
+PIDS_LIMIT_DEFAULT_PERCENT: Final = 25
+PIDS_LIMIT_DEFAULT_MIN: Final = 8192
+# A smaller memory limit is more likely a missing unit: -m 512 is 512 bytes.
+# With 64m, a container starts and runs attaches (measured).
+MEMORY_LIMIT_MIN: Final = 64 * MIB
+# Files in /tmp count against the shared memory (measured).
+TMP_SIZE_DEFAULT: Final = 512 * MIB
+TMP_SIZE_MIN: Final = MIB
+# The kernel never kills a process with -1000. Sandy does not allow it, so
+# that a shortage of the shared memory always finds a process to kill.
+OOM_SCORE_ADJ_MIN: Final = -999
+OOM_SCORE_ADJ_MAX: Final = 1000
+OOM_SCORE_ADJ_PATTERN: Final = re.compile(r"0|-?[1-9][0-9]{0,3}")
+OOM_SCORE_ADJ_MAX_BYTES: Final = 16
+OWN_OOM_SCORE_ADJ_PATH: Final = "/proc/self/oom_score_adj"
+# update --shared saves the shared limits in the cache directory. Like the
+# port mapping state, the file has a dedicated, permanent lock inode.
+SHARED_LIMITS_FILENAME: Final = "shared_limits.json"
+SHARED_LIMITS_LOCK_FILENAME: Final = "shared_limits.lock"
+SHARED_LIMITS_MAX_BYTES: Final = 8192
+SHARED_LIMITS_RESET_HINT: Final = "Reset them with: sandy update --shared --reset"
+UPDATE_NEEDS_OPTION: Final = (
+    "update needs --pids-limit, or --shared to change the limits that all "
+    "containers share"
+)
+UPDATE_SHARED_NEEDS_OPTION: Final = (
+    "update --shared needs at least one of --cpuset-cpus, --memory, "
+    "--pids-limit, and --reset"
+)
 SYSTEMCTL_VALUE_MAX_LENGTH: Final = 4096
 UNIT_STATE_PATTERN: Final = re.compile(r"[a-z][a-z-]{0,31}")
+# A limit as systemctl show prints it: a number, or infinity for no limit.
+SYSTEMD_LIMIT_PATTERN: Final = re.compile(r"0|[1-9][0-9]{0,19}")
+GROUP_LIMIT_PROPERTIES: Final = ("AllowedCPUs", "MemoryMax", "TasksMax")
 CONTAINER_READY_TIMEOUT: Final = 60
 CONTAINER_READY_INTERVAL: Final = 0.5
 # After the container is ready, the wait until the payload has opened the
@@ -1138,15 +1195,610 @@ def _supervisor_description(machine_name: str, detached: bool) -> str:
     return f"Sandy container {machine_name} ({mode})"
 
 
+class GroupLimits(NamedTuple):
+    """Limits of sandy.slice, which all Sandy containers share.
+
+    None means no limit.
+    """
+
+    # AllowedCPUs: the host keeps the other online CPUs.
+    cpus: Tuple[int, ...]
+    memory_max: Optional[int]
+    tasks_max: Optional[int]
+
+
+class SavedGroupLimits(NamedTuple):
+    """The shared limits that root saved with update --shared.
+
+    None means the default. A memory_max of 0 and a tasks_max of -1 mean no
+    limit, as on the command line.
+    """
+
+    cpus: Optional[Tuple[int, ...]] = None
+    memory_max: Optional[int] = None
+    tasks_max: Optional[int] = None
+
+
+class HostFacts(NamedTuple):
+    """The host values that the default limits come from."""
+
+    online_cpus: Tuple[int, ...]
+    memory: int
+    # The smallest of kernel.threads-max and kernel.pid_max.
+    task_limit: int
+
+
+class ResourceLimits(NamedTuple):
+    """Limits of one container, inside the limits of sandy.slice."""
+
+    # None means no process limit of its own.
+    tasks_max: Optional[int]
+    # None means the tmpfs default: half of the host memory.
+    tmp_size: Optional[int]
+    # None means that the container keeps the value of up.
+    oom_score_adj: Optional[int]
+
+
+def _parse_size_argument(value: str) -> int:
+    """Parse a size in the syntax of docker run, such as 512m or 2g, to bytes."""
+    match = SIZE_PATTERN.fullmatch(value)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid size {_terminal_safe_repr(value)}: use a number with an "
+            "optional unit b, k, m, or g"
+        )
+    size = int(match.group(1)) * SIZE_UNITS[match.group(2).lower()]
+    if size > SIZE_MAX:
+        raise argparse.ArgumentTypeError(
+            f"size {_terminal_safe_repr(value)} is too large"
+        )
+    return size
+
+
+def _parse_memory_argument(value: str) -> int:
+    """Parse --memory of update --shared: 0 (no limit) or at least 64m."""
+    size = _parse_size_argument(value)
+    if 0 < size < MEMORY_LIMIT_MIN:
+        raise argparse.ArgumentTypeError(
+            f"invalid memory limit {_terminal_safe_repr(value)}: the smallest "
+            "limit is 64m (0: no limit)"
+        )
+    return size
+
+
+def _parse_tmp_size_argument(value: str) -> int:
+    """Parse --tmp-size: 0 (the tmpfs default) or at least 1m."""
+    size = _parse_size_argument(value)
+    if 0 < size < TMP_SIZE_MIN:
+        raise argparse.ArgumentTypeError(
+            f"invalid /tmp size {_terminal_safe_repr(value)}: the smallest size "
+            "is 1m (0: the tmpfs default)"
+        )
+    return size
+
+
+def _parse_pids_limit_argument(value: str) -> int:
+    """Parse --pids-limit: -1 (no limit) or a positive number of tasks."""
+    if PIDS_LIMIT_PATTERN.fullmatch(value) is None or int(value) >= PID_MAX_LIMIT:
+        raise argparse.ArgumentTypeError(
+            f"invalid process limit {_terminal_safe_repr(value)}: use -1 or a "
+            f"number from 1 to {PID_MAX_LIMIT - 1}"
+        )
+    return int(value)
+
+
+def _parse_oom_score_adj_argument(value: str) -> int:
+    """Parse --oom-score-adj, from -999 to 1000.
+
+    The kernel never kills a process with -1000, so a memory shortage in
+    sandy.slice could then find no process to kill.
+    """
+    if OOM_SCORE_ADJ_PATTERN.fullmatch(value) is None or not (
+        OOM_SCORE_ADJ_MIN <= int(value) <= OOM_SCORE_ADJ_MAX
+    ):
+        raise argparse.ArgumentTypeError(
+            f"invalid OOM score adjustment {_terminal_safe_repr(value)}: use a "
+            f"number from {OOM_SCORE_ADJ_MIN} to {OOM_SCORE_ADJ_MAX}"
+        )
+    return int(value)
+
+
+def _parse_cpu_list(text: str) -> Tuple[int, ...]:
+    """Parse a kernel CPU list, such as 0-3,8, to sorted CPU numbers."""
+    if CPU_LIST_PATTERN.fullmatch(text) is None:
+        raise ValueError("Malformed CPU list")
+    cpus = set()
+    for part in text.split(","):
+        first, _, last = part.partition("-")
+        low, high = int(first), int(last or first)
+        if low > high or high > CPU_NUMBER_MAX:
+            raise ValueError("Malformed CPU list")
+        cpus.update(range(low, high + 1))
+    return tuple(sorted(cpus))
+
+
+def _parse_cpuset_argument(value: str) -> Tuple[int, ...]:
+    """Parse --cpuset-cpus, a CPU list in the syntax of docker run."""
+    if len(value) > CPU_LIST_MAX_BYTES:
+        raise argparse.ArgumentTypeError("CPU list is too long")
+    try:
+        return _parse_cpu_list(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid CPU list {_terminal_safe_repr(value)}: use CPU numbers and "
+            "ranges, such as 4-15 or 0,2,4-7"
+        ) from None
+
+
+def _format_cpu_list(cpus: Tuple[int, ...]) -> str:
+    """Return sorted CPU numbers as a kernel CPU list, such as 0-3,8."""
+    parts = []
+    start = previous = cpus[0]
+    for cpu in cpus[1:] + (-1,):
+        if cpu == previous + 1:
+            previous = cpu
+            continue
+        parts.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = cpu
+    return ",".join(parts)
+
+
+def _read_small_text_file(path: str, max_bytes: int) -> str:
+    """Read a whole kernel text file of at most max_bytes."""
+    fd = os.open(path, READ_FILE_OPEN_FLAGS)
+    try:
+        data = os.read(fd, max_bytes + 1)
+    finally:
+        os.close(fd)
+    if len(data) > max_bytes or not data.endswith(b"\n"):
+        raise ValueError(f"Malformed {path}")
+    return data[:-1].decode("ascii", errors="replace")
+
+
+def _host_online_cpus() -> Tuple[int, ...]:
+    """Return the online CPUs of the host."""
+    return _parse_cpu_list(_read_small_text_file(ONLINE_CPUS_PATH, CPU_LIST_MAX_BYTES))
+
+
+def _host_memory_bytes() -> int:
+    """Return the physical memory of the host."""
+    pages = os.sysconf("SC_PHYS_PAGES")
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    if pages <= 0 or page_size <= 0:
+        raise ValueError("Could not find the size of the host memory")
+    return pages * page_size
+
+
+def _host_task_limit() -> int:
+    """Return the system task limit: the smaller of threads-max and pid_max.
+
+    systemd computes its TasksMax percentages from the same limit.
+    """
+    limits = []
+    for path in (THREADS_MAX_PATH, PID_MAX_PATH):
+        text = _read_small_text_file(path, KERNEL_NUMBER_MAX_BYTES)
+        if KERNEL_NUMBER_PATTERN.fullmatch(text) is None:
+            raise ValueError(f"Malformed {path}")
+        limits.append(int(text))
+    return min(limits)
+
+
+def _read_host_facts() -> HostFacts:
+    """Return the host values for the limits, or exit with an error."""
+    try:
+        return HostFacts(_host_online_cpus(), _host_memory_bytes(), _host_task_limit())
+    except (OSError, ValueError) as exc:
+        print(
+            "E: Could not read the CPUs, the memory, or the task limit of the "
+            f"host: {_terminal_safe_repr(str(exc))}"
+        )
+        sys.exit(1)
+
+
+def _default_group_limits(facts: HostFacts) -> GroupLimits:
+    """Return the default limits that all Sandy containers share.
+
+    The host keeps its 4 lowest-numbered CPUs when it has 16 or more, 2 when
+    it has 8 or more, and 1 otherwise; the containers get at least 1 CPU.
+    The host keeps 25% of its memory, at least 4 GiB, but never more than
+    half. The containers get the same share of the system task limit, which
+    grows with the memory too.
+    """
+    count = len(facts.online_cpus)
+    if count >= 16:
+        reserved = 4
+    elif count >= 8:
+        reserved = 2
+    else:
+        reserved = 1
+    shared = max(1, count - reserved)
+    reserve = min(
+        max(facts.memory * HOST_MEMORY_RESERVE_PERCENT // 100, HOST_MEMORY_RESERVE_MIN),
+        facts.memory // 2,
+    )
+    memory = (facts.memory - reserve) // MIB * MIB
+    tasks = max(1, facts.task_limit * memory // facts.memory)
+    return GroupLimits(facts.online_cpus[count - shared :], memory, tasks)
+
+
+def _effective_group_limits(
+    defaults: GroupLimits, saved: SavedGroupLimits
+) -> GroupLimits:
+    """Return the shared limits: the saved values, otherwise the defaults."""
+    cpus = defaults.cpus if saved.cpus is None else saved.cpus
+    memory_max = defaults.memory_max
+    if saved.memory_max is not None:
+        memory_max = saved.memory_max or None
+    tasks_max = defaults.tasks_max
+    if saved.tasks_max is not None:
+        tasks_max = None if saved.tasks_max == -1 else saved.tasks_max
+    return GroupLimits(cpus, memory_max, tasks_max)
+
+
+def _parse_shared_limits(text: str, online_cpus: Tuple[int, ...]) -> SavedGroupLimits:
+    """Parse the saved shared limits. Unknown fields are discarded.
+
+    Raise ValueError for a malformed file or value: an up must not start a
+    container with limits that root did not choose.
+    """
+    if not text:
+        return SavedGroupLimits()
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        # ValueError includes JSONDecodeError and the limit on the digits of
+        # an int; deep nesting gives RecursionError.
+        raise ValueError("The saved shared limits are not valid JSON") from None
+    if not isinstance(data, dict):
+        raise ValueError("The saved shared limits are not a JSON object")
+    cpus = data.get("cpus")
+    if cpus is not None:
+        if not isinstance(cpus, str) or len(cpus) > CPU_LIST_MAX_BYTES:
+            raise ValueError("The saved shared CPUs are invalid")
+        try:
+            cpus = _parse_cpu_list(cpus)
+        except ValueError:
+            raise ValueError("The saved shared CPUs are invalid") from None
+        if not set(cpus) <= set(online_cpus):
+            raise ValueError(
+                f"The saved shared CPUs {_format_cpu_list(cpus)} are not all online"
+            )
+    memory = data.get("memory")
+    if memory is not None and (
+        type(memory) is not int
+        or not (memory == 0 or MEMORY_LIMIT_MIN <= memory <= SIZE_MAX)
+    ):
+        raise ValueError("The saved shared memory is invalid")
+    tasks = data.get("tasks")
+    if tasks is not None and (
+        type(tasks) is not int or not (tasks == -1 or 1 <= tasks < PID_MAX_LIMIT)
+    ):
+        raise ValueError("The saved shared process limit is invalid")
+    return SavedGroupLimits(cpus, memory, tasks)
+
+
+def _serialize_shared_limits(saved: SavedGroupLimits) -> str:
+    """Return the JSON text of saved shared limits, with only the set fields."""
+    data: Dict[str, Any] = {}
+    if saved.cpus is not None:
+        data["cpus"] = _format_cpu_list(saved.cpus)
+    if saved.memory_max is not None:
+        data["memory"] = saved.memory_max
+    if saved.tasks_max is not None:
+        data["tasks"] = saved.tasks_max
+    return json.dumps(data, separators=(",", ":")) + "\n"
+
+
+def _container_tasks_default(group: GroupLimits, task_limit: int) -> int:
+    """Return the default process limit of one container.
+
+    25% of the shared process limit, at least 8192, but never more than half
+    of it, so that one container cannot use all the shared tasks. Without a
+    shared limit, the base is the system task limit.
+    """
+    base = group.tasks_max or task_limit
+    share = max(base * PIDS_LIMIT_DEFAULT_PERCENT // 100, PIDS_LIMIT_DEFAULT_MIN)
+    return max(1, min(share, base // 2))
+
+
+def _resolve_resource_limits(
+    args: argparse.Namespace, group: GroupLimits, task_limit: int
+) -> ResourceLimits:
+    """Return the limits of one container from its options and the group.
+
+    The parser has checked each value.
+    """
+    if args.pids_limit is None:
+        tasks_max: Optional[int] = _container_tasks_default(group, task_limit)
+    elif args.pids_limit == -1:
+        tasks_max = None
+    else:
+        tasks_max = args.pids_limit
+    if args.tmp_size is None:
+        tmp_size: Optional[int] = TMP_SIZE_DEFAULT
+    else:
+        tmp_size = args.tmp_size or None
+    return ResourceLimits(tasks_max, tmp_size, args.oom_score_adj)
+
+
+def _pids_limit_warning(
+    tasks_max: Optional[int], group_tasks_max: Optional[int]
+) -> Optional[str]:
+    """Return a warning for a process limit above the shared one, or None."""
+    if tasks_max is None or group_tasks_max is None or tasks_max <= group_tasks_max:
+        return None
+    return (
+        f"W: --pids-limit {tasks_max} is above the process limit that all Sandy "
+        f"containers share ({group_tasks_max}), which applies too"
+    )
+
+
+def _limit_warnings(
+    group: GroupLimits, limits: ResourceLimits, host_memory: int
+) -> list:
+    """Return the warnings for container limits above the shared limits."""
+    warnings = []
+    pids_warning = _pids_limit_warning(limits.tasks_max, group.tasks_max)
+    if pids_warning is not None:
+        warnings.append(pids_warning)
+    tmp_size = host_memory // 2 if limits.tmp_size is None else limits.tmp_size
+    if group.memory_max is not None and tmp_size > group.memory_max:
+        # Measured: tmpfs pages count against the memory limit, and a write
+        # past it gets an OOM kill instead of ENOSPC.
+        warnings.append(
+            f"W: /tmp ({_format_size(tmp_size)}) is larger than the memory that "
+            f"all Sandy containers share ({_format_size(group.memory_max)}). "
+            "Files in /tmp count against it, so a full /tmp ends processes"
+        )
+    return warnings
+
+
+def _format_size(size: int) -> str:
+    """Return size in GiB or MiB, for messages."""
+    if size >= GIB:
+        return f"{size / GIB:.1f} GiB"
+    return f"{size / MIB:.1f} MiB"
+
+
+def _times_text(count: int) -> str:
+    """Return a number of times for messages."""
+    return "1 time" if count == 1 else f"{count} times"
+
+
+def _describe_group_limits(group: GroupLimits, saved: SavedGroupLimits) -> str:
+    """Return one line that states the shared limits; mark the saved ones."""
+
+    def mark(value: object) -> str:
+        return "" if value is None else " (saved)"
+
+    memory = (
+        "no memory limit"
+        if group.memory_max is None
+        else f"memory {_format_size(group.memory_max)}"
+    )
+    tasks = (
+        "no process limit" if group.tasks_max is None else f"{group.tasks_max} tasks"
+    )
+    return (
+        f"CPUs {_format_cpu_list(group.cpus)}{mark(saved.cpus)}, "
+        f"{memory}{mark(saved.memory_max)}, {tasks}{mark(saved.tasks_max)}"
+    )
+
+
+def _describe_resource_limits(limits: ResourceLimits, host_memory: int) -> str:
+    """Return one line that states the limits of one container."""
+    tasks = (
+        "no process limit of its own"
+        if limits.tasks_max is None
+        else f"{limits.tasks_max} tasks"
+    )
+    tmp_size = host_memory // 2 if limits.tmp_size is None else limits.tmp_size
+    text = f"{tasks}, /tmp {_format_size(tmp_size)}, no swap"
+    if limits.oom_score_adj is not None:
+        text += f", OOM score adjustment {limits.oom_score_adj}"
+    return text
+
+
+def _scope_limit_properties(limits: ResourceLimits) -> list:
+    """Return the systemd-run --property options of limits.
+
+    The container gets no swap. The memory and CPU limits are on
+    sandy.slice.
+    """
+    tasks = "infinity" if limits.tasks_max is None else str(limits.tasks_max)
+    return [f"--property=TasksMax={tasks}", "--property=MemorySwapMax=0"]
+
+
+def _group_limit_properties(group: GroupLimits) -> list:
+    """Return the systemctl set-property assignments of the shared limits."""
+
+    def value(limit: Optional[int]) -> str:
+        return "infinity" if limit is None else str(limit)
+
+    return [
+        f"AllowedCPUs={_format_cpu_list(group.cpus)}",
+        f"MemoryMax={value(group.memory_max)}",
+        f"TasksMax={value(group.tasks_max)}",
+    ]
+
+
+def _apply_group_limits(group: GroupLimits) -> None:
+    """Set the shared limits on sandy.slice, also before it exists (measured).
+
+    The values go to runtime drop-ins, which the next boot discards; Sandy
+    saves the values of update --shared itself. A change applies at once to
+    every running container too.
+    """
+    _run_secure_subprocess(
+        [
+            "systemctl",
+            "set-property",
+            "--runtime",
+            SUPERVISOR_SLICE,
+            *_group_limit_properties(group),
+        ],
+        check=True,
+    )
+
+
+def _parse_systemd_limit(text: str) -> Optional[int]:
+    """Parse a MemoryMax or TasksMax value of systemctl show; None for infinity."""
+    if text == "infinity":
+        return None
+    if SYSTEMD_LIMIT_PATTERN.fullmatch(text) is None:
+        raise ValueError(f"Malformed limit of {SUPERVISOR_SLICE}")
+    return int(text)
+
+
+def _parse_systemd_cpu_list(text: str) -> Tuple[int, ...]:
+    """Parse AllowedCPUs of systemctl show, such as 0-3 8; empty when unset.
+
+    systemctl separates the ranges with spaces, not commas (measured on
+    systemd 249, 255, and 257).
+    """
+    if not text:
+        return ()
+    if "," in text:
+        raise ValueError(f"Malformed AllowedCPUs of {SUPERVISOR_SLICE}")
+    return _parse_cpu_list(text.replace(" ", ","))
+
+
+def _read_live_group_limits() -> GroupLimits:
+    """Return the limits of sandy.slice now, from one systemctl show.
+
+    A slice that does not exist has no limits: no CPUs in AllowedCPUs, and
+    infinity for MemoryMax and TasksMax (measured).
+    """
+    command = ["systemctl", "show", SUPERVISOR_SLICE]
+    for name in GROUP_LIMIT_PROPERTIES:
+        command.extend(["-p", name])
+    output = _run_secure_subprocess(
+        command, capture_output=True, text=True, check=True
+    ).stdout
+    if len(output) > SYSTEMCTL_VALUE_MAX_LENGTH + CPU_LIST_MAX_BYTES:
+        raise ValueError(f"Malformed limits of {SUPERVISOR_SLICE}")
+    values: Dict[str, str] = {}
+    for line in output.split("\n"):
+        if not line:
+            continue
+        name, separator, value = line.partition("=")
+        if (
+            not separator
+            or name not in GROUP_LIMIT_PROPERTIES
+            or name in values
+            or _contains_control_character(value)
+        ):
+            raise ValueError(f"Malformed limits of {SUPERVISOR_SLICE}")
+        values[name] = value
+    if len(values) != len(GROUP_LIMIT_PROPERTIES):
+        raise ValueError(f"Malformed limits of {SUPERVISOR_SLICE}")
+    return GroupLimits(
+        _parse_systemd_cpu_list(values["AllowedCPUs"]),
+        _parse_systemd_limit(values["MemoryMax"]),
+        _parse_systemd_limit(values["TasksMax"]),
+    )
+
+
+def _sync_group_limits(group: GroupLimits) -> None:
+    """Set the shared limits on sandy.slice unless it has them already.
+
+    This also restores the limits after an outside change or a reboot, and
+    follows a change of the host.
+    """
+    if _read_live_group_limits() != group:
+        _apply_group_limits(group)
+
+
+def _read_saved_group_limits(
+    handle: Optional[Any], online_cpus: Tuple[int, ...]
+) -> SavedGroupLimits:
+    """Read the saved shared limits from an open file, or none without a file.
+
+    Raise ValueError for a malformed file.
+    """
+    if handle is None:
+        return SavedGroupLimits()
+    try:
+        text = handle.read(SHARED_LIMITS_MAX_BYTES + 1)
+    except UnicodeDecodeError:
+        raise ValueError("The saved shared limits are not valid text") from None
+    if len(text) > SHARED_LIMITS_MAX_BYTES:
+        raise ValueError("The saved shared limits are too large")
+    return _parse_shared_limits(text, online_cpus)
+
+
+def _tmp_tmpfs_argument(tmp_size: Optional[int]) -> str:
+    """Return the nspawn --tmpfs option of /tmp with its size."""
+    if tmp_size is None:
+        return "--tmpfs=/tmp:mode=1777"
+    return f"--tmpfs=/tmp:mode=1777,size={tmp_size}"
+
+
+def _parse_oom_score_adj(text: str) -> int:
+    """Parse the text of an oom_score_adj file, from -1000 to 1000."""
+    if not text.endswith("\n") or OOM_SCORE_ADJ_PATTERN.fullmatch(text[:-1]) is None:
+        raise ValueError("Malformed oom_score_adj")
+    value = int(text[:-1])
+    if not -1000 <= value <= OOM_SCORE_ADJ_MAX:
+        raise ValueError("Malformed oom_score_adj")
+    return value
+
+
+def _write_own_oom_score_adj(value: int) -> None:
+    """Set the OOM score adjustment of this process.
+
+    As root, this also sets the lowest value that this process and its
+    children can set later (measured: a container cannot go lower).
+    """
+    fd = os.open(OWN_OOM_SCORE_ADJ_PATH, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        data = f"{value}\n".encode("ascii")
+        if os.write(fd, data) != len(data):
+            raise OSError("Short write to oom_score_adj")
+    finally:
+        os.close(fd)
+
+
+@contextmanager  # ensures the value is restored at the call site
+def _oom_score_adj_for_children(value: Optional[int]) -> Iterator[None]:
+    """Give the children that start meanwhile an OOM score adjustment.
+
+    nspawn's --oom-score-adjust fails with --private-users (measured), so the
+    container inherits the value from the process that starts it.
+    """
+    if value is None:
+        yield
+        return
+    fd = os.open(OWN_OOM_SCORE_ADJ_PATH, READ_FILE_OPEN_FLAGS)
+    try:
+        original = _parse_oom_score_adj(
+            os.read(fd, OOM_SCORE_ADJ_MAX_BYTES).decode("ascii", "replace")
+        )
+    finally:
+        os.close(fd)
+    _write_own_oom_score_adj(value)
+    try:
+        yield
+    finally:
+        try:
+            _write_own_oom_score_adj(original)
+        except OSError:
+            # Only this sandy process keeps the value. Each later attach
+            # sets its own value from the container (see _entry_helper_main).
+            pass
+
+
 def _supervisor_scope_argv(
-    machine_name: str, systemd_version: int, detached: bool
+    machine_name: str, systemd_version: int, detached: bool, limits: ResourceLimits
 ) -> list:
     """Return the systemd-run prefix that starts nspawn in its own scope.
 
     systemd-run --scope execs its command, so nspawn inherits the machine
     directory descriptor. machined sets TasksMax=16384 on the scopes that it
-    creates, and a systemd-run scope gets DefaultTasksMax instead, so set it.
-    Scope units accept OOMPolicy= only from systemd 253.
+    creates, and a systemd-run scope gets DefaultTasksMax instead, so always
+    set it. The scope holds the supervisor, the container, and every attach,
+    so its limits cover all of them. Scope units accept OOMPolicy= only from
+    systemd 253.
     """
     argv = [
         "systemd-run",
@@ -1159,7 +1811,8 @@ def _supervisor_scope_argv(
     ]
     if systemd_version >= 253:
         argv.append("--property=OOMPolicy=continue")
-    argv.extend([f"--property=TasksMax={SUPERVISOR_TASKS_MAX}", "--"])
+    argv.extend(_scope_limit_properties(limits))
+    argv.append("--")
     return argv
 
 
@@ -1696,6 +2349,33 @@ def _open_stable_lock_file(path: str) -> Any:
         os.close(parent_fd)
 
 
+@contextmanager  # ensures flock acquisition/release is paired at the call site
+def _locked_state_file(
+    lock_path: str, state_path: str, exclusive: bool
+) -> Iterator[Optional[Any]]:
+    """Hold a stable lock inode and yield its state file, or None without one.
+
+    The state file opens only after the lock is held. Opening it before
+    flock() would pin an obsolete inode while another holder atomically
+    replaces the state path.
+    """
+    lock_handle = _open_stable_lock_file(lock_path)
+    state_handle = None
+    try:
+        lock_type = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(lock_handle.fileno(), lock_type)
+        state_handle = _open_existing_managed_text_file(state_path)
+        yield state_handle
+    finally:
+        if state_handle is not None:
+            state_handle.close()
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_handle.close()
+
+
 def _open_existing_managed_text_file(path: str) -> Optional[Any]:
     """Open an existing managed text file through its verified parent."""
     parent_fd, basename = _open_verified_parent(path)
@@ -2032,6 +2712,8 @@ UP_CONSOLE_CGROUP: Final = "up-console"
 UP_CONSOLE_TIMEOUT: Final = 5
 UP_CONSOLE_POLL_INTERVAL: Final = 0.01
 PROC_CGROUP_MAX_BYTES: Final = 4096
+CGROUP_COUNTERS_MAX_BYTES: Final = 4096
+CGROUP_COUNTER_PATTERN: Final = re.compile(r"([a-z_]{1,32}) ([0-9]{1,20})")
 PROC_CGROUP_PATTERN: Final = re.compile(r"0::(/[^\n]*)\n")
 CAPBND_LINE_PATTERN: Final = re.compile(r"CapBnd:\t([0-9a-f]{16})")
 PPID_LINE_PATTERN: Final = re.compile(r"PPid:\t(0|[1-9][0-9]{0,6})")
@@ -2058,6 +2740,8 @@ class LeaderConfinement(NamedTuple):
     capability_bounding_set: int
     # cgroup.kill of the attach leaf that this process joined.
     attach_kill_fd: int
+    # The Leader's value, which up set for the container (--oom-score-adj).
+    oom_score_adj: int
 
 
 class ProcessConfinement(NamedTuple):
@@ -2115,7 +2799,10 @@ def _parse_capability_bounding_set(status_text: str) -> int:
 
 
 def _read_proc_file(dir_fd: int, name: str, max_bytes: int) -> bytes:
-    """Read a whole file below an open host /proc directory, up to max_bytes."""
+    """Read a whole file below an open host procfs or cgroupfs directory.
+
+    Fail when the file has more than max_bytes.
+    """
     fd = os.open(name, READ_FILE_OPEN_FLAGS, dir_fd=dir_fd)
     try:
         chunks = []
@@ -2142,6 +2829,12 @@ def _read_process_status(proc_fd: int) -> str:
 def _read_capability_bounding_set(proc_fd: int) -> int:
     """Read CapBnd from the status file of an open host /proc/<pid> directory."""
     return _parse_capability_bounding_set(_read_process_status(proc_fd))
+
+
+def _read_oom_score_adj(proc_fd: int) -> int:
+    """Read oom_score_adj of an open host /proc/<pid> directory."""
+    data = _read_proc_file(proc_fd, "oom_score_adj", OOM_SCORE_ADJ_MAX_BYTES)
+    return _parse_oom_score_adj(data.decode("ascii", errors="replace"))
 
 
 def _open_process_dir(pid: int) -> int:
@@ -2285,11 +2978,18 @@ def _open_supervisor_cgroup(machine_name: str) -> int:
     container name, not from container data. FileNotFoundError means that the
     scope does not exist.
     """
-    unit = _supervisor_unit_name(machine_name)
+    return _open_cgroup_path((SUPERVISOR_SLICE, _supervisor_unit_name(machine_name)))
+
+
+def _open_cgroup_path(components: Tuple[str, ...]) -> int:
+    """Open a cgroup directory below the cgroup root, one component at a time.
+
+    Each component must be a root-owned directory on the cgroup file system.
+    """
     fd = os.open(CGROUP_ROOT, DIRECTORY_OPEN_FLAGS)
     try:
         root_dev = os.fstat(fd).st_dev
-        for component in (SUPERVISOR_SLICE, unit):
+        for component in components:
             next_fd = os.open(component, DIRECTORY_OPEN_FLAGS, dir_fd=fd)
             os.close(fd)
             fd = next_fd
@@ -2310,6 +3010,61 @@ def _write_cgroup_file(dir_fd: int, name: str, value: bytes) -> None:
             raise OSError(f"Short write to cgroup {name}")
     finally:
         os.close(fd)
+
+
+def _read_cgroup_counters(dir_fd: int, name: str) -> Dict[str, int]:
+    """Return the counters of a flat-keyed cgroup file, such as memory.events."""
+    data = _read_proc_file(dir_fd, name, CGROUP_COUNTERS_MAX_BYTES)
+    counters = {}
+    for line in data.decode("ascii", errors="replace").split("\n"):
+        if not line:
+            continue
+        match = CGROUP_COUNTER_PATTERN.fullmatch(line)
+        if match is None:
+            raise ValueError(f"Malformed {name}")
+        counters[match.group(1)] = int(match.group(2))
+    return counters
+
+
+class MemoryEvents(NamedTuple):
+    """OOM counters of a container's scope and of sandy.slice."""
+
+    # Processes of the container that an OOM killer ended, at any limit or
+    # when the host ran out of memory.
+    oom_kills: int
+    # The times that a memory limit of the container's scope, or of a cgroup
+    # inside the container, was reached. Sandy sets no such limit; container
+    # root can set one in its delegated cgroups.
+    container_ooms: int
+    # The times that the containers reached the memory limit that they share.
+    group_ooms: int
+
+
+def _container_memory_events(machine_name: str) -> Optional[MemoryEvents]:
+    """Return the memory events of the container, or None when unknown.
+
+    memory.events counts the events of a cgroup and of its descendants, so
+    the slice's own count comes from memory.events.local. An event inside
+    one container then does not count as an event of the shared limit.
+    """
+    try:
+        slice_fd = _open_cgroup_path((SUPERVISOR_SLICE,))
+    except (OSError, ValueError):
+        return None
+    try:
+        group = _read_cgroup_counters(slice_fd, "memory.events.local")
+        unit_fd = _open_supervisor_cgroup(machine_name)
+        try:
+            container = _read_cgroup_counters(unit_fd, "memory.events")
+        finally:
+            os.close(unit_fd)
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(slice_fd)
+    return MemoryEvents(
+        container.get("oom_kill", 0), container.get("oom", 0), group.get("oom", 0)
+    )
 
 
 def _cgroup_populated(dir_fd: int) -> bool:
@@ -2587,13 +3342,15 @@ def _close_leader_confinement(confinement: LeaderConfinement) -> None:
 def _extract_leader_confinement(
     machine_name: str, leader_pid: int, attach_leaf: str
 ) -> LeaderConfinement:
-    """Pin the Leader, read its filters and CapBnd, and join the attach leaf.
+    """Pin the Leader, read its confinement, and join the attach leaf.
 
     The Leader is the container's PID 1 as the host sees it: nspawn's stub
     init, (sd-stubinit), because nspawn runs with --as-pid2. The payload
     (PID 2) inherits its filters and bounding set, and the kernel only lets
     both become stricter, so they are the confinement to copy. See
-    specs/security-parity.md, item 1.
+    specs/security-parity.md, item 1. The Leader also has the OOM score
+    adjustment of the container (item 2). Container root cannot set it below
+    the lowest value that the container inherited from up.
 
     machined reports the Leader before nspawn has completed its setup, and
     nspawn starts the payload only after that setup. So find the payload
@@ -2638,6 +3395,7 @@ def _extract_leader_confinement(
                     namespace_fds.append(ns_fd)
                 seccomp_filters = _read_seccomp_filters(pid)
                 capability_bounding_set = _read_capability_bounding_set(proc_fd)
+                oom_score_adj = _read_oom_score_adj(proc_fd)
             finally:
                 os.close(proc_fd)
             # The process was alive from pidfd_open to here, so the PID
@@ -2661,6 +3419,7 @@ def _extract_leader_confinement(
         seccomp_filters=seccomp_filters,
         capability_bounding_set=capability_bounding_set,
         attach_kill_fd=attach_kill_fd,
+        oom_score_adj=oom_score_adj,
     )
 
 
@@ -2948,8 +3707,7 @@ def _read_cap_last_cap() -> int:
 
 
 CHILD_PIDS_PATTERN: Final = re.compile(r"(?:[1-9][0-9]{0,6} )*")
-# An entry takes at most 8 bytes, so this allows 131072 children, eight times
-# SUPERVISOR_TASKS_MAX.
+# An entry takes at most 8 bytes, so this allows 131072 children.
 CHILD_PIDS_MAX_BYTES: Final = 1048576
 
 
@@ -3209,6 +3967,14 @@ def _entry_helper_main(argv: list) -> int:
     if confinement.capability_bounding_set >> (cap_last + 1):
         _close_leader_confinement(confinement)
         _entry_error(PermissionError("CapBnd has unknown capabilities"))
+        return ENTRY_HELPER_FAILURE
+    # The session gets the container's OOM score adjustment. As host root,
+    # the write also sets the lowest value that the session can set.
+    try:
+        _write_own_oom_score_adj(confinement.oom_score_adj)
+    except OSError as exc:
+        _close_leader_confinement(confinement)
+        _entry_error(exc)
         return ENTRY_HELPER_FAILURE
     return _run_confined_entry(request, environment, confinement, cap_last)
 
@@ -5636,27 +6402,93 @@ class Sandy:
             exclusive: When True, take an exclusive lock suitable for writes.
         """
         self._ensure_cache_dir()
-        lock_handle = _open_stable_lock_file(self._get_port_mappings_lock_path())
-        state_handle = None
-        try:
-            lock_type = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-            fcntl.flock(lock_handle.fileno(), lock_type)
-
-            # Open state only after acquiring the stable lock. Opening it
-            # before flock() would pin an obsolete inode while another holder
-            # atomically replaces the state path.
-            state_handle = _open_existing_managed_text_file(
-                self._get_port_mappings_path()
-            )
+        with _locked_state_file(
+            self._get_port_mappings_lock_path(),
+            self._get_port_mappings_path(),
+            exclusive,
+        ) as state_handle:
             yield state_handle
-        finally:
-            if state_handle is not None:
-                state_handle.close()
-            try:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-            lock_handle.close()
+
+    def _get_shared_limits_path(self) -> str:
+        """Return the path of the saved shared limits."""
+        return os.path.join(self._get_cache_dir(), SHARED_LIMITS_FILENAME)
+
+    def _get_shared_limits_lock_path(self) -> str:
+        """Return the path of the stable lock of the shared limits."""
+        return os.path.join(self._get_cache_dir(), SHARED_LIMITS_LOCK_FILENAME)
+
+    @contextmanager  # ensures flock acquisition/release is paired at the call site
+    def _shared_limits_lock(self) -> Iterator[Optional[Any]]:
+        """Hold the shared limits lock; yield the saved limits file or None.
+
+        up and update --shared read the saved limits and set them on
+        sandy.slice under this lock, so the last saved limits apply.
+        """
+        self._ensure_cache_dir()
+        with _locked_state_file(
+            self._get_shared_limits_lock_path(),
+            self._get_shared_limits_path(),
+            exclusive=True,
+        ) as state_handle:
+            yield state_handle
+
+    def _set_shared_limits(
+        self,
+        facts: HostFacts,
+        changes: Optional[Dict[str, Any]] = None,
+        reset: bool = False,
+    ) -> Tuple[GroupLimits, SavedGroupLimits]:
+        """Set the saved or the default shared limits on sandy.slice, or exit.
+
+        With changes or reset, change the saved limits, and save them after
+        sandy.slice has them. Without reset, a malformed saved file stops the
+        call: up must not start a container with limits that root did not
+        choose.
+        """
+        try:
+            with self._shared_limits_lock() as handle:
+                if reset:
+                    saved = SavedGroupLimits()
+                else:
+                    try:
+                        saved = _read_saved_group_limits(handle, facts.online_cpus)
+                    except ValueError as exc:
+                        print(f"E: {exc}. {SHARED_LIMITS_RESET_HINT}")
+                        sys.exit(1)
+                    saved = saved._replace(**(changes or {}))
+                group = _effective_group_limits(_default_group_limits(facts), saved)
+                try:
+                    _sync_group_limits(group)
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    print(
+                        f"E: Could not set the limits of {SUPERVISOR_SLICE}: "
+                        f"{_terminal_safe_repr(str(exc))}"
+                    )
+                    sys.exit(1)
+                if changes or reset:
+                    try:
+                        _write(
+                            self._get_shared_limits_path(),
+                            _serialize_shared_limits(saved),
+                            mode=0o600,
+                        )
+                    except (OSError, ValueError) as exc:
+                        print(
+                            "E: Could not save the shared limits: "
+                            f"{_terminal_safe_repr(str(exc))}"
+                        )
+                        print(
+                            "   They apply now, but the next up sets the saved "
+                            "limits again"
+                        )
+                        sys.exit(1)
+        except (OSError, ValueError) as exc:
+            print(
+                "E: Could not read the saved shared limits: "
+                f"{_terminal_safe_repr(str(exc))}"
+            )
+            sys.exit(1)
+        return group, saved
 
     def _serialize_port_mapping_state(self, state: Dict[str, Any]) -> str:
         """Serialize the in-memory state to JSON."""
@@ -6026,9 +6858,16 @@ class Sandy:
         removed_any = False
         for entry in os.listdir(cache_dir):
             entry_path = os.path.join(cache_dir, entry)
-            if entry in (PORT_MAPPINGS_LOCK_FILENAME, LIFECYCLE_LOCK_FILENAME):
+            if entry in (
+                PORT_MAPPINGS_LOCK_FILENAME,
+                LIFECYCLE_LOCK_FILENAME,
+                SHARED_LIMITS_LOCK_FILENAME,
+            ):
                 # Each lock inode is permanent. Removing one could split
                 # queued and new processes across different locks.
+                continue
+            if entry == SHARED_LIMITS_FILENAME:
+                # Configuration that root saved, not a cache.
                 continue
             if preserve_state and entry == PORT_MAPPINGS_FILENAME:
                 continue
@@ -6207,11 +7046,11 @@ class Sandy:
                 removed_any = self._clear_cache_contents(preserve_state=True)
             if removed_any:
                 print(
-                    f"I: Purged cache directory ('{cache_dir}') except port mapping coordination state"
+                    f"I: Purged cache directory ('{cache_dir}') except coordination state and saved shared limits"
                 )
             else:
                 print(
-                    f"I: Cache directory retained only port mapping coordination state ('{cache_dir}')"
+                    f"I: Cache directory retained only coordination state and saved shared limits ('{cache_dir}')"
                 )
         else:
             print(f"I: No cache directory to purge")
@@ -6328,6 +7167,7 @@ class Sandy:
             print(f"E: Invalid container entry: {_terminal_safe_repr(str(exc))}")
             sys.exit(1)
 
+        events_before = _container_memory_events(self.container)
         try:
             with self._entry_helper_command(request) as (argv, script_fd):
                 with _attach_hangup_handlers():
@@ -6354,8 +7194,41 @@ class Sandy:
                 # The console did not start; handle it as a console exit.
                 self._stop_if_last_attach(console=True)
             sys.exit(1)
+        self._report_oom_kills(events_before)
         self._stop_if_last_attach(console=console)
         return status
+
+    def _report_oom_kills(self, before: Optional[MemoryEvents]) -> None:
+        """Tell the user when the kernel ended processes for lack of memory.
+
+        The processes inside cannot see the limits, so a killed build shows
+        only "Killed". Compare the memory events from before the session
+        with now, and name each limit that was reached meanwhile. When no
+        limit was reached, the host ran out of memory.
+        """
+        after = _container_memory_events(self.container)
+        if before is None or after is None:
+            return
+        kills = after.oom_kills - before.oom_kills
+        if kills <= 0:
+            return
+        processes = "1 process" if kills == 1 else f"{kills} processes"
+        print(
+            f"W: The kernel ended {processes} in '{self.container}' during this "
+            "session because memory ran out"
+        )
+        group_limit = after.group_ooms > before.group_ooms
+        own_limit = after.container_ooms > before.container_ooms
+        if group_limit:
+            print(
+                "   The Sandy containers reached the memory limit that they "
+                "share. Stop other containers, start less work at a time, or "
+                "raise the limit with: sandy update --shared -m SIZE"
+            )
+        if own_limit:
+            print("   The container reached a memory limit of its own")
+        if not group_limit and not own_limit:
+            print("   The host ran out of memory")
 
     def _stop_if_last_attach(self, console: bool = False) -> None:
         """Stop a container that up started without -d when no attach is left.
@@ -7213,6 +8086,9 @@ class Sandy:
         """Build and start container"""
         container_environment = _container_environment(self.user, self.user_home)
 
+        # The host values for the resource limits, before any host change.
+        facts = _read_host_facts()
+
         # Check if container is already running
         if self._is_container_running():
             print(f"E: Container '{self.container}' is already running")
@@ -7250,6 +8126,11 @@ class Sandy:
                     sys.exit(1)
                 self.port_mappings.append(validated)
             self.port_mappings = self._dedupe_port_mappings(self.port_mappings)
+
+        # The first host change: the limits that all containers share. No
+        # container may start outside them.
+        group, saved = self._set_shared_limits(facts)
+        limits = _resolve_resource_limits(args, group, facts.task_limit)
 
         # A container that stopped without sandy (its payload ended, or its
         # scope was stopped) leaves its port forwarding rules and state.
@@ -7332,7 +8213,7 @@ class Sandy:
         # --keep-unit             # the systemd-run scope is the machine unit
         # --console=passive       # no console; sessions attach through the
         #                         # entry helper
-        # --tmpfs=/tmp:mode=1777  # memory tmpfs
+        # --tmpfs=/tmp:mode=1777  # memory tmpfs, with the size of --tmp-size
         # --private-users         # user namespace - pick for >=250, fixed for <250
         # --as-pid2               # emulate docker app container (no init
         #                         # process; just minimal systemd stub init for
@@ -7346,7 +8227,7 @@ class Sandy:
             f"--machine={self.container}",
             "--keep-unit",
             "--console=passive",
-            "--tmpfs=/tmp:mode=1777",
+            _tmp_tmpfs_argument(limits.tmp_size),
             "--as-pid2",
             "--timezone=bind",
             "--user=root",
@@ -7540,10 +8421,20 @@ class Sandy:
             )
             scope_cmd = (
                 _supervisor_scope_argv(
-                    self.container, self.systemd_version, bool(args.detach)
+                    self.container, self.systemd_version, bool(args.detach), limits
                 )
                 + cmd
             )
+            print(
+                "I: Limits of all Sandy containers: "
+                f"{_describe_group_limits(group, saved)}"
+            )
+            print(
+                "I: Limits of this container: "
+                f"{_describe_resource_limits(limits, facts.memory)}"
+            )
+            for warning in _limit_warnings(group, limits, facts.memory):
+                print(warning)
             spinner_line_event = threading.Event()
             mode = " in detached state" if args.detach else ""
             print(f"I: Starting '{self.container}'{mode} ", end="", flush=True)
@@ -7558,15 +8449,26 @@ class Sandy:
                 self._ensure_cache_dir()
             with nullcontext() if args.detach else _lifecycle_lock():
                 try:
-                    supervisor = _run_secure_subprocess_popen(
-                        scope_cmd,
-                        start_new_session=True,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        env=container_environment,
-                        pass_fds=tuple(runtime_fds),
+                    # The container inherits the OOM score adjustment.
+                    with _oom_score_adj_for_children(limits.oom_score_adj):
+                        supervisor = _run_secure_subprocess_popen(
+                            scope_cmd,
+                            start_new_session=True,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            env=container_environment,
+                            pass_fds=tuple(runtime_fds),
+                        )
+                except (OSError, ValueError) as exc:
+                    # The value could not be set, or the start failed; the
+                    # restore raises nothing. So no supervisor runs.
+                    _finish_spinner_line(spinner_line_event)
+                    print(
+                        f"E: Could not start '{self.container}': "
+                        f"{_terminal_safe_repr(str(exc))}"
                     )
+                    sys.exit(1)
                 finally:
                     close_runtime_fds()
                 if not args.detach:
@@ -7814,6 +8716,109 @@ class Sandy:
         _run_secure_subprocess(
             ["machinectl", "status", "--no-pager", "--full", self.container]
         )
+        events = _container_memory_events(self.container)
+        if events is not None:
+            print(
+                f"OOM kills: {events.oom_kills} (memory limit reached: "
+                f"{_times_text(events.group_ooms)} by all Sandy containers, "
+                f"{_times_text(events.container_ooms)} inside this container)"
+            )
+
+    def run_update(self, args: argparse.Namespace) -> None:
+        """Change the process limit of a running container, as docker update
+        does, or with --shared the limits that all containers share."""
+        if args.shared_limits:
+            self._run_update_shared(args)
+            return
+        shared_only = [
+            option
+            for option, given in (
+                ("--cpuset-cpus", args.cpuset_cpus is not None),
+                ("--memory", args.memory is not None),
+                ("--reset", args.reset),
+            )
+            if given
+        ]
+        if shared_only:
+            print(
+                f"E: {', '.join(shared_only)} need --shared: a container has "
+                "no CPU or memory limit of its own"
+            )
+            sys.exit(1)
+        if args.pids_limit is None:
+            print(f"E: {UPDATE_NEEDS_OPTION}")
+            sys.exit(1)
+        unit = _supervisor_unit_name(self.container)
+        if not self._is_container_running():
+            print(f"E: Container '{self.container}' not found or not running")
+            sys.exit(1)
+        try:
+            if not _supervisor_unit_loaded(self.container):
+                print(f"E: Unit '{unit}' does not exist")
+                sys.exit(1)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(f"E: Could not query unit '{unit}': {_terminal_safe_repr(str(exc))}")
+            sys.exit(1)
+        try:
+            group = _read_live_group_limits()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(
+                f"E: Could not query {SUPERVISOR_SLICE}: "
+                f"{_terminal_safe_repr(str(exc))}"
+            )
+            sys.exit(1)
+        tasks_max = None if args.pids_limit == -1 else args.pids_limit
+        pids_warning = _pids_limit_warning(tasks_max, group.tasks_max)
+        if pids_warning is not None:
+            print(pids_warning)
+        assignment = "TasksMax=" + ("infinity" if tasks_max is None else str(tasks_max))
+        try:
+            # Measured: the change ends with the scope. On a stopped scope,
+            # set-property fails and writes nothing.
+            _run_secure_subprocess(
+                ["systemctl", "set-property", "--runtime", unit, assignment],
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"E: Could not update '{unit}': {_terminal_safe_repr(str(exc))}")
+            sys.exit(1)
+        print(f"I: Updated '{self.container}': {assignment}")
+
+    def _run_update_shared(self, args: argparse.Namespace) -> None:
+        """Change, save, and set the limits that all containers share.
+
+        This works with and without running containers. The values apply at
+        once, and up sets the saved values again at each start.
+        """
+        if args.container is not None:
+            print("E: update --shared cannot be used with --container")
+            sys.exit(1)
+        values = {
+            "cpus": args.cpuset_cpus,
+            "memory_max": args.memory,
+            "tasks_max": args.pids_limit,
+        }
+        given = {name: value for name, value in values.items() if value is not None}
+        if args.reset and given:
+            print(
+                "E: --reset cannot be used with --cpuset-cpus, --memory, or "
+                "--pids-limit"
+            )
+            sys.exit(1)
+        if not args.reset and not given:
+            print(f"E: {UPDATE_SHARED_NEEDS_OPTION}")
+            sys.exit(1)
+        facts = _read_host_facts()
+        if "cpus" in given and not set(given["cpus"]) <= set(facts.online_cpus):
+            print(
+                "E: --cpuset-cpus must name online CPUs; the online CPUs are "
+                f"{_format_cpu_list(facts.online_cpus)}"
+            )
+            sys.exit(1)
+        group, saved = self._set_shared_limits(facts, given, reset=args.reset)
+        print(
+            f"I: Limits of all Sandy containers: {_describe_group_limits(group, saved)}"
+        )
 
     def run_list(self):
         """List all containers and their status"""
@@ -7868,6 +8873,74 @@ class _StoreOnceAction(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
+def _add_up_limit_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the resource limit options of one container to up."""
+    parser.add_argument(
+        "--pids-limit",
+        action=_StoreOnceAction,
+        type=_parse_pids_limit_argument,
+        help="Process limit of this container (default: 25%% of the process "
+        "limit that all Sandy containers share, at least 8192 and at most half "
+        "of it; -1: no limit of its own)",
+    )
+    parser.add_argument(
+        "--tmp-size",
+        action=_StoreOnceAction,
+        type=_parse_tmp_size_argument,
+        help="Size of the /tmp tmpfs with a unit b, k, m, or g. Files in /tmp "
+        "count against the shared memory (default: 512m; 0: the tmpfs default, "
+        "half of the host memory)",
+    )
+    parser.add_argument(
+        "--oom-score-adj",
+        action=_StoreOnceAction,
+        type=_parse_oom_score_adj_argument,
+        help="OOM score adjustment of the container and its sessions, from -999 "
+        "to 1000. When the shared memory runs out, the kernel ends processes "
+        "with higher values first; -500 protects a long-running container "
+        "(default: the value of the sandy process)",
+    )
+
+
+def _add_update_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the options of update, after docker update."""
+    # The global -s/--shared already uses the destination "shared".
+    parser.add_argument(
+        "--shared",
+        dest="shared_limits",
+        action="store_true",
+        help="Change the limits that all Sandy containers share. Sandy saves "
+        "them, and they apply at once and at each up",
+    )
+    parser.add_argument(
+        "--cpuset-cpus",
+        action=_StoreOnceAction,
+        type=_parse_cpuset_argument,
+        help="With --shared: the CPUs that the containers share, such as 4-15 "
+        "or 0,2,4-7",
+    )
+    parser.add_argument(
+        "-m",
+        "--memory",
+        action=_StoreOnceAction,
+        type=_parse_memory_argument,
+        help="With --shared: the memory that the containers share, with a unit "
+        "b, k, m, or g, such as 24g (0: no limit)",
+    )
+    parser.add_argument(
+        "--pids-limit",
+        action=_StoreOnceAction,
+        type=_parse_pids_limit_argument,
+        help="Process limit of the running container, or with --shared, of all "
+        "containers together (-1: no limit)",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="With --shared: forget the saved limits and use the defaults again",
+    )
+
+
 def parse_args_custom():
     """Custom argument parser to handle REMAINDER args properly"""
 
@@ -7879,6 +8952,7 @@ def parse_args_custom():
         "exec",
         "status",
         "list",
+        "update",
     }
     global_value_options = {
         "-w",
@@ -7989,6 +9063,20 @@ Environment Variables:
         dest="ports",
         help="Port forwarding from host to container (format: proto:host_port:container_port, e.g., tcp:8080:80)",
     )
+    # Resource limits with the names and units of docker run and podman run.
+    # The CPU and memory limits are on sandy.slice, which all containers
+    # share; update --shared changes them.
+    _add_up_limit_arguments(up_parser)
+
+    # update command. No abbreviations: --cpus, the CPU count of docker
+    # update, would otherwise be taken as --cpuset-cpus, a CPU list.
+    update_parser = subparsers.add_parser(
+        "update",
+        help="Change the process limit of a running container, or with "
+        "--shared the limits that all containers share",
+        allow_abbrev=False,
+    )
+    _add_update_arguments(update_parser)
 
     # down command
     down_parser = subparsers.add_parser("down", help="Stop and remove container")
@@ -8134,6 +9222,8 @@ def main():
         sandy.run_exec(args)
     elif args.command == "status":
         sandy.run_status()
+    elif args.command == "update":
+        sandy.run_update(args)
     elif args.command == "list":
         sandy.run_list()
     else:

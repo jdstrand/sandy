@@ -16,15 +16,23 @@ from pathlib import Path
 
 from tests.e2e.support import (
     SANDY,
+    SHARED_LIMITS,
+    SLICE,
+    SLICE_CGROUP,
     E2EContext,
     E2EFailure,
     assert_contains,
     assert_not_contains,
 )
 
-CGROUP_SLICE = Path("/sys/fs/cgroup/system.slice")
+CGROUP_SLICE = SLICE_CGROUP
+ONLINE_CPUS = Path("/sys/devices/system/cpu/online")
+THREADS_MAX = Path("/proc/sys/kernel/threads-max")
+PID_MAX = Path("/proc/sys/kernel/pid_max")
 ATTACH_LEAF = re.compile(r"attach-[0-9a-f]{32}")
-DEFAULT_TASKS_MAX = "16384"
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+DEFAULT_TMP_SIZE = 512 * MIB
 KEEPALIVE_COMM = "sandy-keepalive"
 WAIT_TIMEOUT = 30
 
@@ -120,6 +128,136 @@ def _has_new_only_child(pid: int, old_child: int) -> bool:
     return len(children) == 1 and children[0] != old_child
 
 
+def _cpu_set(text: str) -> set[int]:
+    """Parse a CPU list of the kernel (0-3,8) or of systemctl (0-3 8)."""
+    cpus: set[int] = set()
+    for part in text.replace(",", " ").split():
+        first, _, last = part.partition("-")
+        cpus.update(range(int(first), int(last or first) + 1))
+    return cpus
+
+
+def _group_defaults() -> tuple[set[int], int, int]:
+    """Return the default CPUs, memory, and tasks of sandy.slice on this host.
+
+    specs/security-parity.md item 2: the host keeps its 4 lowest-numbered
+    online CPUs of 16 or more, 2 of 8 or more, otherwise 1. It keeps 25% of
+    its memory, at least 4 GiB, never more than half. The containers get the
+    same share of the system task limit (the smaller of threads-max and
+    pid_max).
+    """
+    online = sorted(_cpu_set(ONLINE_CPUS.read_text(encoding="ascii")))
+    reserved = 4 if len(online) >= 16 else 2 if len(online) >= 8 else 1
+    shared = online[len(online) - max(1, len(online) - reserved) :]
+    memory = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    reserve = min(max(memory * 25 // 100, 4 * GIB), memory // 2)
+    shared_memory = (memory - reserve) // MIB * MIB
+    task_limit = min(
+        int(THREADS_MAX.read_text(encoding="ascii")),
+        int(PID_MAX.read_text(encoding="ascii")),
+    )
+    return set(shared), shared_memory, max(1, task_limit * shared_memory // memory)
+
+
+def _container_tasks_default(group_tasks: int) -> int:
+    """25% of the shared process limit, at least 8192, at most half of it."""
+    return max(1, min(max(group_tasks * 25 // 100, 8192), group_tasks // 2))
+
+
+def _default_limits() -> dict[str, str]:
+    """Return the scope properties of the default limits of up.
+
+    A container has no CPU or memory limit of its own, no swap, and a share
+    of the shared process limit.
+    """
+    return {
+        "TasksMax": str(_container_tasks_default(_group_defaults()[2])),
+        "MemoryMax": "infinity",
+        "MemorySwapMax": "0",
+        "CPUQuotaPerSecUSec": "infinity",
+    }
+
+
+def _slice_show(context: E2EContext, prop: str) -> str:
+    return context.run(
+        ["systemctl", "show", SLICE, "-p", prop, "--value"]
+    ).stdout.strip()
+
+
+def _kernel_limit(text: str) -> int | None:
+    """Parse memory.max or pids.max; None for max."""
+    text = text.strip()
+    return None if text == "max" else int(text)
+
+
+def _check_group_limits(
+    context: E2EContext,
+    name: str | None,
+    expected: tuple[set[int], int | None, int | None] | None = None,
+) -> None:
+    """Check the limits of sandy.slice in systemd and in the kernel.
+
+    With a running container name, also check the CPUs that its processes
+    see: the CPU set is the only limit that they can see (measured).
+    """
+    if expected is None:
+        expected = _group_defaults()
+    cpus, memory, tasks = expected
+
+    def value(limit: int | None) -> str:
+        return "infinity" if limit is None else str(limit)
+
+    shown = (
+        _cpu_set(_slice_show(context, "AllowedCPUs")),
+        _slice_show(context, "MemoryMax"),
+        _slice_show(context, "TasksMax"),
+    )
+    if shown != (cpus, value(memory), value(tasks)):
+        raise E2EFailure(f"{SLICE} has {shown!r}, not {expected!r}")
+    if name is None:
+        return
+    kernel = (
+        _cpu_set((CGROUP_SLICE / "cpuset.cpus").read_text(encoding="ascii")),
+        _kernel_limit((CGROUP_SLICE / "memory.max").read_text(encoding="ascii")),
+        _kernel_limit((CGROUP_SLICE / "pids.max").read_text(encoding="ascii")),
+    )
+    if kernel != (cpus, memory, tasks):
+        raise E2EFailure(f"The kernel limits of {SLICE} are {kernel!r}")
+    inside = context.sandy(
+        ["exec", "--", "nproc; grep Cpus_allowed_list /proc/self/status"], name=name
+    ).stdout.split()
+    if inside[0] != str(len(cpus)) or _cpu_set(inside[-1]) != cpus:
+        raise E2EFailure(f"Processes inside see the CPUs {inside!r}")
+
+
+def _oom_score_adj(pid: int) -> int:
+    return int(Path(f"/proc/{pid}/oom_score_adj").read_text(encoding="ascii"))
+
+
+OOM_STATUS = re.compile(
+    r"OOM kills: ([0-9]+) \(memory limit reached: ([0-9]+) times? by all Sandy "
+    r"containers, ([0-9]+) times? inside this container\)"
+)
+
+
+def _oom_status(context: E2EContext, name: str) -> tuple[int, int, int]:
+    """Return the OOM kills, shared-limit OOMs, and own OOMs from status."""
+    status = context.sandy(["status"], name=name)
+    match = OOM_STATUS.search(status.stdout)
+    if match is None:
+        raise E2EFailure(f"No OOM line in status: {status.stdout[-2000:]}")
+    kills, shared, own = (int(value) for value in match.groups())
+    return kills, shared, own
+
+
+def _tmp_size(context: E2EContext, name: str) -> int:
+    """Return the size of /tmp in the container, in bytes."""
+    result = context.sandy(
+        ["exec", "--", "df -B1 --output=size /tmp | tail -n 1"], name=name
+    )
+    return int(result.stdout.strip())
+
+
 def _comm(pid: int) -> str:
     return Path(f"/proc/{pid}/comm").read_text(encoding="ascii").strip()
 
@@ -212,7 +350,8 @@ class _Attach:
         wait for the cgroup, not only for a child.
         """
         pattern = re.compile(
-            rf"0::/system\.slice/{re.escape(_unit(self.name))}/(attach-[0-9a-f]{{32}})"
+            rf"0::/{re.escape(SLICE)}/{re.escape(_unit(self.name))}/"
+            r"(attach-[0-9a-f]{32})"
         )
         found: list[str] = []
 
@@ -305,17 +444,14 @@ def test_main(context: E2EContext) -> None:
         raise E2EFailure("The main container is not running")
     leader = int(leader_text)
 
-    with context.case("the container runs in its own scope with today's limits"):
+    with context.case("the container runs in its own scope with the default limits"):
         expected = {
             "LoadState": "loaded",
             "ActiveState": "active",
-            "ControlGroup": f"/system.slice/{_unit(name)}",
+            "ControlGroup": f"/{SLICE}/{_unit(name)}",
             "Description": f"Sandy container {name} (detached)",
             "Delegate": "yes",
-            "TasksMax": DEFAULT_TASKS_MAX,
-            "MemoryMax": "infinity",
-            "MemorySwapMax": "infinity",
-            "CPUQuotaPerSecUSec": "infinity",
+            **_default_limits(),
         }
         # Scope units accept OOMPolicy= only from systemd 253.
         if version >= 253:
@@ -328,6 +464,8 @@ def test_main(context: E2EContext) -> None:
         ).stdout.strip()
         if machine_unit != _unit(name):
             raise E2EFailure(f"Machine unit is {machine_unit!r}")
+        if _tmp_size(context, name) != DEFAULT_TMP_SIZE:
+            raise E2EFailure(f"/tmp has {_tmp_size(context, name)} bytes")
         supervisors = [
             int(pid)
             for pid in (_unit_dir(name) / "supervisor" / "cgroup.procs")
@@ -343,8 +481,11 @@ def test_main(context: E2EContext) -> None:
             raise E2EFailure(
                 f"nspawn has a terminal or no own session: {stat_fields[:5]}"
             )
-        if not _cgroup(leader).startswith(f"0::/system.slice/{_unit(name)}/payload"):
+        if not _cgroup(leader).startswith(f"0::/{SLICE}/{_unit(name)}/payload"):
             raise E2EFailure(f"Leader cgroup {_cgroup(leader)!r}")
+
+    with context.case("all containers share the CPUs, memory, and tasks of the slice"):
+        _check_group_limits(context, name)
 
     with context.case("the keepalive is PID 2, container root, and survives users"):
         payload = _payload(leader)
@@ -473,17 +614,10 @@ def test_main(context: E2EContext) -> None:
         if stray.returncode == 0:
             raise E2EFailure(f"Attach processes remain: {stray.stdout!r}")
 
-    with context.case("an OOM in an attach kills only that process"):
-        # A test-only limit; sandy sets none by default.
+    with context.case("an OOM in an attach kills only that process and is reported"):
+        # A test-only limit of this scope; sandy sets none.
         context.run(
-            [
-                "systemctl",
-                "set-property",
-                "--runtime",
-                _unit(name),
-                "MemoryMax=256M",
-                "MemorySwapMax=0",
-            ]
+            ["systemctl", "set-property", "--runtime", _unit(name), "MemoryMax=256M"]
         )
         try:
             idle = _Attach(context, name, "sleep 304")
@@ -495,6 +629,13 @@ def test_main(context: E2EContext) -> None:
             )
             if hog.returncode == 0:
                 raise E2EFailure("The memory hog was not killed")
+            assert_contains(
+                hog,
+                f"W: The kernel ended 1 process in '{name}' during this session "
+                "because memory ran out",
+            )
+            assert_contains(hog, "The container reached a memory limit of its own")
+            assert_not_contains(hog, "share")
             if _show(context, name, "ActiveState") != "active":
                 raise E2EFailure("The OOM stopped the scope")
             if _payload(leader) != payload or not context.machine_running(name):
@@ -503,6 +644,11 @@ def test_main(context: E2EContext) -> None:
                 raise E2EFailure("The OOM ended another attach")
             idle.process.send_signal(signal.SIGTERM)
             idle.finish()
+            kills, shared_ooms, own_ooms = _oom_status(context, name)
+            if (kills, shared_ooms) != (1, 0) or own_ooms < 1:
+                raise E2EFailure(f"OOM counts {(kills, shared_ooms, own_ooms)!r}")
+            quiet = context.sandy(["exec", "--", "true"], name=name)
+            assert_not_contains(quiet, "W: The kernel ended")
         finally:
             context.run(
                 [
@@ -511,7 +657,6 @@ def test_main(context: E2EContext) -> None:
                     "--runtime",
                     _unit(name),
                     "MemoryMax=infinity",
-                    "MemorySwapMax=infinity",
                 ]
             )
 
@@ -525,6 +670,64 @@ def test_main(context: E2EContext) -> None:
             ["exec", "--", "cat /proc/self/cgroup"], name=second
         )
         assert_contains(second_inside, "0::/../attach-")
+        if _show(context, second, "ControlGroup") != f"/{SLICE}/{_unit(second)}":
+            raise E2EFailure(f"{_unit(second)} is not in {SLICE}")
+        _check_group_limits(context, second)
+
+    with context.case(
+        "update --shared changes running containers and saves the limits"
+    ):
+        online = sorted(_cpu_set(ONLINE_CPUS.read_text(encoding="ascii")))
+        # The lowest CPU, which the host keeps by default.
+        changed = ({online[0]}, GIB, 4096)
+        update = context.sandy(
+            [
+                "update",
+                "--shared",
+                "--cpuset-cpus",
+                str(online[0]),
+                "-m",
+                "1g",
+                "--pids-limit",
+                "4096",
+            ]
+        )
+        assert_contains(
+            update,
+            f"I: Limits of all Sandy containers: CPUs {online[0]} (saved), memory "
+            "1.0 GiB (saved), 4096 tasks (saved)",
+        )
+        # The change applies at once, also to running processes (measured).
+        _check_group_limits(context, second, changed)
+        cpus = _cpu_set(_status(_payload(leader), "Cpus_allowed_list"))
+        if cpus != changed[0]:
+            raise E2EFailure(f"The running keepalive has the CPUs {cpus!r}")
+        saved = SHARED_LIMITS.stat()
+        if (saved.st_uid, saved.st_gid, saved.st_mode & 0o777) != (0, 0, 0o600):
+            raise E2EFailure(f"Unsafe saved limits {saved!r}")
+        text = SHARED_LIMITS.read_text(encoding="ascii")
+        if text != f'{{"cpus":"{online[0]}","memory":{GIB},"tasks":4096}}\n':
+            raise E2EFailure(f"Saved limits {text!r}")
+        # Errors change nothing.
+        for arguments, message in (
+            ([], "update --shared needs at least one of"),
+            (["--reset", "-m", "2g"], "--reset cannot be used with"),
+            (["--cpuset-cpus", "4095"], "--cpuset-cpus must name online CPUs"),
+        ):
+            refused = context.sandy(["update", "--shared", *arguments], expected=1)
+            assert_contains(refused, message)
+        refused = context.sandy(
+            ["update", "--shared", "-m", "2g"], name=second, expected=1
+        )
+        assert_contains(refused, "update --shared cannot be used with --container")
+        refused = context.sandy(["update", "-m", "2g"], name=second, expected=1)
+        assert_contains(refused, "--memory need --shared")
+        _check_group_limits(context, None, changed)
+        reset = context.sandy(["update", "--shared", "--reset"])
+        assert_not_contains(reset, "(saved)")
+        _check_group_limits(context, second)
+        if SHARED_LIMITS.read_text(encoding="ascii") != "{}\n":
+            raise E2EFailure("--reset kept saved limits")
 
     with context.case("down stops the container and its scope in one step"):
         down = context.sandy(["down"], name=second)
@@ -663,6 +866,233 @@ def test_main(context: E2EContext) -> None:
         assert_not_contains(refused, "Traceback")
         _wait_stopped(context, second)
 
+    with context.case("up applies --pids-limit, --tmp-size, and --oom-score-adj"):
+        started = context.sandy(
+            [
+                "up",
+                "--detach",
+                "--persistent",
+                "--network",
+                "host",
+                "--tmp-size",
+                "16m",
+                "--pids-limit",
+                "512",
+                "--oom-score-adj",
+                "-500",
+            ],
+            name=second,
+        )
+        context.wait_for_machine(second, running=True)
+        assert_contains(
+            started,
+            "I: Limits of this container: 512 tasks, /tmp 16.0 MiB, no swap, OOM "
+            "score adjustment -500",
+        )
+        expected = {"TasksMax": "512", "MemorySwapMax": "0", "MemoryMax": "infinity"}
+        actual = {prop: _show(context, second, prop) for prop in expected}
+        if actual != expected:
+            raise E2EFailure(f"Scope properties {actual!r} != {expected!r}")
+        if (_unit_dir(second) / "pids.max").read_text(encoding="ascii") != "512\n":
+            raise E2EFailure("The kernel process limit of the scope is not 512")
+        if _tmp_size(context, second) != 16 * MIB:
+            raise E2EFailure(f"/tmp has {_tmp_size(context, second)} bytes")
+        # A full /tmp gives ENOSPC, below the shared memory.
+        full = context.sandy(
+            ["exec", "--", "dd if=/dev/zero of=/tmp/fill bs=1M count=32; rm /tmp/fill"],
+            name=second,
+            expected=None,
+        )
+        assert_contains(full, "No space left on device")
+        # The container and each session have the value; nspawn's own
+        # option fails with --private-users (measured).
+        second_leader = int(context.machine_leader(second) or 0)
+        for pid in (second_leader, _payload(second_leader)):
+            if _oom_score_adj(pid) != -500:
+                raise E2EFailure(
+                    f"PID {pid} has OOM score adjustment {_oom_score_adj(pid)}"
+                )
+        for user in (context.cache_user, "root"):
+            session = context.sandy(
+                ["exec", "--", "cat /proc/self/oom_score_adj"], name=second, user=user
+            )
+            if session.stdout.strip() != "-500":
+                raise E2EFailure(f"A session of {user} has {session.stdout!r}")
+            # Even container root cannot go lower; any user can go higher.
+            lower = context.sandy(
+                ["exec", "--", "echo -600 > /proc/self/oom_score_adj"],
+                name=second,
+                user=user,
+                expected=None,
+            )
+            if lower.returncode == 0:
+                raise E2EFailure(
+                    f"A session of {user} lowered its OOM score adjustment"
+                )
+            context.sandy(
+                ["exec", "--", "echo -400 > /proc/self/oom_score_adj"],
+                name=second,
+                user=user,
+            )
+
+    with context.case("an OOM at the shared memory ends the unprotected process"):
+        # Two containers: this one with the default value, and the second with
+        # -500. A test-only shared memory leaves 256 MiB above the use now.
+        current = int((CGROUP_SLICE / "memory.current").read_text(encoding="ascii"))
+        limit = (current // MIB + 256) * MIB
+        context.sandy(["update", "--shared", "-m", f"{limit // MIB}m"])
+        try:
+            holder = _Attach(
+                context,
+                second,
+                "python3 -c 'b = bytearray(150 << 20); import time; time.sleep(120)'",
+            )
+            holder.leaf()
+
+            def holding() -> bool:
+                used = (_unit_dir(second) / "memory.current").read_text(
+                    encoding="ascii"
+                )
+                return int(used) >= 150 * MIB
+
+            _wait_for("the protected container holds its memory", holding)
+            # More than the whole limit, so that page cache reclaim cannot
+            # make room.
+            hog = context.sandy(
+                ["exec", "--", f"python3 -c 'b = bytearray({limit + 64 * MIB})'"],
+                name=name,
+                expected=None,
+            )
+            if hog.returncode == 0:
+                raise E2EFailure("The memory hog was not killed")
+            assert_contains(hog, f"W: The kernel ended 1 process in '{name}'")
+            assert_contains(
+                hog, "The Sandy containers reached the memory limit that they share"
+            )
+            assert_not_contains(hog, "of its own")
+            if holder.process.poll() is not None:
+                raise E2EFailure("The OOM ended the protected container's process")
+            for container in (name, second):
+                if not context.machine_running(container):
+                    raise E2EFailure(f"The OOM stopped {container}")
+            if _payload(leader) != payload:
+                raise E2EFailure("The OOM stopped the keepalive")
+            holder.process.send_signal(signal.SIGTERM)
+            holder.finish()
+            # The second kill of this container; the first was at its own
+            # test-only limit.
+            kills, shared_ooms, now_own = _oom_status(context, name)
+            if (kills, now_own) != (2, own_ooms) or shared_ooms < 1:
+                raise E2EFailure(f"OOM counts {(kills, shared_ooms, now_own)!r}")
+        finally:
+            context.sandy(["update", "--shared", "--reset"])
+        _check_group_limits(context, name)
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("-1 and 0: no process limit of its own and the tmpfs default"):
+        context.sandy(
+            [
+                "up",
+                "--detach",
+                "--persistent",
+                "--network",
+                "host",
+                "--tmp-size",
+                "0",
+                "--pids-limit",
+                "-1",
+            ],
+            name=second,
+        )
+        context.wait_for_machine(second, running=True)
+        if _show(context, second, "TasksMax") != "infinity":
+            raise E2EFailure("--pids-limit -1 kept a process limit")
+        # The tmpfs default: half of the pages of the host memory.
+        half = os.sysconf("SC_PHYS_PAGES") // 2 * os.sysconf("SC_PAGE_SIZE")
+        if _tmp_size(context, second) != half:
+            raise E2EFailure(f"/tmp has {_tmp_size(context, second)} bytes, not {half}")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("invalid limits and a malformed saved file stop up"):
+        for arguments in (
+            ["--pids-limit", "0"],
+            ["--tmp-size", "1k"],
+            ["--oom-score-adj", "-1000"],
+            # A container has no CPU, memory, or swap option of its own.
+            ["--cpus", "2"],
+            ["-m", "1g"],
+        ):
+            refused = context.sandy(
+                ["up", "--detach", "--network", "host", *arguments],
+                name=second,
+                expected=2,
+            )
+            assert_not_contains(refused, "Traceback")
+        before = tuple(
+            _slice_show(context, prop) for prop in ("AllowedCPUs", "MemoryMax")
+        )
+        SHARED_LIMITS.write_text('{"memory":"8g"}\n', encoding="ascii")
+        SHARED_LIMITS.chmod(0o600)
+        refused = context.sandy(
+            ["up", "--detach", "--persistent", "--network", "host"],
+            name=second,
+            expected=1,
+        )
+        assert_contains(
+            refused,
+            "E: The saved shared memory is invalid. Reset them with: sandy update "
+            "--shared --reset",
+        )
+        after = tuple(
+            _slice_show(context, prop) for prop in ("AllowedCPUs", "MemoryMax")
+        )
+        if after != before:
+            raise E2EFailure(f"A malformed saved file changed {SLICE}: {after!r}")
+        if context.machine_running(second):
+            raise E2EFailure("up started the container anyway")
+        if _show(context, second, "LoadState") != "not-found":
+            raise E2EFailure("up created the scope anyway")
+        context.sandy(["update", "--shared", "--reset"])
+        if SHARED_LIMITS.read_text(encoding="ascii") != "{}\n":
+            raise E2EFailure("--reset did not replace the malformed file")
+
+    with context.case("update changes the process limit of a running container"):
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "host"], name=second
+        )
+        context.wait_for_machine(second, running=True)
+        updated = context.sandy(["update", "--pids-limit", "256"], name=second)
+        assert_contains(updated, f"I: Updated '{second}': TasksMax=256")
+        if (_unit_dir(second) / "pids.max").read_text(encoding="ascii") != "256\n":
+            raise E2EFailure("update did not change the kernel process limit")
+        context.sandy(["update", "--pids-limit", "-1"], name=second)
+        if (_unit_dir(second) / "pids.max").read_text(encoding="ascii") != "max\n":
+            raise E2EFailure("update --pids-limit -1 kept a process limit")
+        none = context.sandy(["update"], name=second, expected=1)
+        assert_contains(none, "update needs --pids-limit")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+        # The change ends with the scope: update of a stopped container fails
+        # and leaves no drop-in, and the next up has the defaults.
+        stopped = context.sandy(
+            ["update", "--pids-limit", "5"], name=second, expected=1
+        )
+        assert_contains(stopped, "not found or not running")
+        for directory in ("/run/systemd/system.control", "/run/systemd/transient"):
+            if Path(directory, f"{_unit(second)}.d").exists():
+                raise E2EFailure(f"A drop-in of {_unit(second)} remains in {directory}")
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "host"], name=second
+        )
+        context.wait_for_machine(second, running=True)
+        actual = {prop: _show(context, second, prop) for prop in _default_limits()}
+        if actual != _default_limits():
+            raise E2EFailure(f"Scope properties after update {actual!r}")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
     with context.case("up -d is never stopped by an attach exit"):
         context.sandy(
             ["up", "--detach", "--persistent", "--network", "host"], name=second
@@ -675,6 +1105,36 @@ def test_main(context: E2EContext) -> None:
         context.remove_container(second, context.cache_user)
         if _show(context, second, "LoadState") != "not-found":
             raise E2EFailure("The scope remains after rm")
+
+    with context.case("update --shared works before the first container"):
+        context.stop_container(name, context.main_user)
+        _wait_stopped(context, name)
+        # Test-only: the harness owns sandy.slice; return it to no state.
+        context.remove_shared_slice()
+        update = context.sandy(
+            ["update", "--shared", "-m", "512m", "--pids-limit", "4096"]
+        )
+        assert_contains(update, "memory 512.0 MiB (saved), 4096 tasks (saved)")
+        changed = (_group_defaults()[0], 512 * MIB, 4096)
+        _check_group_limits(context, None, changed)
+        if _slice_show(context, "ActiveState") != "inactive":
+            raise E2EFailure(f"update --shared started {SLICE}")
+        # The next up starts the slice with the saved limits; a container
+        # gets half of a small shared process limit.
+        started = context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=context.main_user,
+        )
+        context.wait_for_machine(name, running=True)
+        assert_contains(started, "memory 512.0 MiB (saved), 4096 tasks (saved)")
+        assert_contains(started, "I: Limits of this container: 2048 tasks")
+        _check_group_limits(context, name, changed)
+        context.sandy(["update", "--shared", "--reset"])
+        _check_group_limits(context, name)
+        # A container keeps the process limit that up gave it.
+        if _show(context, name, "TasksMax") != "2048":
+            raise E2EFailure("--reset changed the process limit of a container")
 
 
 def assert_contains_text(text: str, expected: str) -> None:

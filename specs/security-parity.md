@@ -2,8 +2,8 @@
 
 Confinement properties that Sandy lacked compared with Docker, and that the
 separate security audits (not in this repository) do not cover, because no
-audit finding touches these code paths. Items 1 and 5 are fixed; items 2 to
-4 are open.
+audit finding touches these code paths. Items 1, 2, and 5 are fixed; items
+3 and 4 are open.
 
 The comparison target is Docker with default options. Docker is not a
 production sandbox for hostile code either. It is used here only as a widely
@@ -388,7 +388,15 @@ measured.
 
 ## 2. No memory or CPU limits
 
-### Observation
+### Status
+
+Fixed. All containers share the CPU, memory, and process limits of
+`sandy.slice`, and the host keeps a reserve outside of it. Each container
+has a process limit, a `/tmp` size, and no swap, and can get an OOM score
+adjustment. `update --shared` changes the shared limits (see "Implemented
+fix" below).
+
+### Observation (before the fix)
 
 Sandy passes no `--property=` option to `systemd-nspawn`, sets no memory or
 CPU limit on its scope, and sets no explicit size on the `/tmp` tmpfs. There is
@@ -411,9 +419,10 @@ tmpfs        1.9G    /tmp    (50 percent of host RAM)
 
 Host RAM was 3894 MB.
 
-`TasksMax=16384` came from machined's default for the machine scope. Sandy now
-sets `TasksMax=16384` on its own scope, `sandy-<name>.scope`, to match, and no
-option changes it. Process count is therefore bounded, but generously.
+`TasksMax=16384` came from machined's default for the machine scope. Step 2
+of the scope brief set `TasksMax=16384` on Sandy's own scope,
+`sandy-<name>.scope`, to match, and no option changed it. Process count was
+therefore bounded, but generously.
 
 With `--volatile=overlay`, both writable file systems were tmpfs backed by host
 RAM, so the container could consume about 75 percent of host RAM by writing
@@ -446,6 +455,158 @@ all of them. Step 2 keeps the defaults of the machined scope
 Set an explicit `size=` on the `/tmp` tmpfs. Expose the values as validated
 CLI options with conservative defaults.
 
+### Implemented fix
+
+Sandy constrains AI agents, so it sets limits by default, unlike `docker
+run`. The design is similar in concept to the `kubepods` cgroup of
+Kubernetes: one shared cgroup for all containers, with the host keeping a
+reserve outside of it, and settings of each container inside it.
+
+- All `sandy-<name>.scope` units are in `sandy.slice`, which holds the
+  shared limits `AllowedCPUs=`, `MemoryMax=`, and `TasksMax=`.
+- Each scope has `TasksMax=` (`--pids-limit`) and `MemorySwapMax=0`. The
+  `/tmp` tmpfs gets a `size=` (`--tmp-size`). A container has no CPU or
+  memory limit of its own.
+- `up --oom-score-adj N` gives the container and each session an OOM score
+  adjustment.
+
+| Limit | Where | Default |
+| --- | --- | --- |
+| CPUs | `sandy.slice` `AllowedCPUs=` | the online CPUs without the lowest-numbered ones, which the host keeps: 1, 2 from 8 CPUs, 4 from 16 CPUs; the containers get at least 1 |
+| Memory | `sandy.slice` `MemoryMax=` | the host keeps 25% of its memory, at least 4 GiB, never more than half: 4, 8, 12, 16, 32, and 64 GiB hosts share 2, 4, 8, 12, 24, and 48 GiB |
+| Processes | `sandy.slice` `TasksMax=` | the same share of the system task limit, the smaller of `kernel.threads-max` and `kernel.pid_max` |
+| Processes of one container | scope `TasksMax=` | 25% of the shared limit, at least 8192, never more than half of it: 8192, 8192, 24576, 49152, and 98304 for 4, 8, 16, 32, and 64 GiB |
+| `/tmp` | tmpfs `size=` | 512 MiB |
+| Swap | scope `MemorySwapMax=` | none |
+| OOM score adjustment | inherited by the container | the value of the `sandy` process |
+
+The options have the names and units of `docker run` and `podman run`:
+
+- `up --pids-limit N` (`-1`: no limit of its own), `up --tmp-size SIZE`
+  (`0`: the tmpfs default, half of the host memory), and `up
+  --oom-score-adj N` (-999 to 1000; `-1000` would make processes that the
+  kernel never kills, so a shortage of the shared memory could find no
+  process to kill).
+- `update --pids-limit N` changes the process limit of a running container.
+  The change ends with the scope (measured: `systemctl set-property` on a
+  running transient scope writes `/run/systemd/transient/<unit>.d/`, which
+  systemd removes when the scope stops).
+- `update --shared [--cpuset-cpus LIST] [-m SIZE] [--pids-limit N]` and
+  `update --shared --reset` change the shared limits, with or without
+  running containers. `-m 0` and `--pids-limit -1` mean no shared limit;
+  `--cpuset-cpus` must name online CPUs. Sandy saves the values in
+  `shared_limits.json` in the cache directory, with the dedicated stable
+  lock `shared_limits.lock`. `update` holds the lock from the read of the
+  saved values until they are set and saved; `rm --cache` keeps both files.
+  `update` parses with no abbreviations, so that `--cpus`, the CPU count of
+  `docker update`, is not taken as `--cpuset-cpus`, a CPU list.
+- Sizes take the units `b`, `k`, `m`, and `g` (powers of 1024). The smallest
+  shared memory is 64m: a smaller value is more likely a missing unit (`-m
+  512` is 512 bytes). The smallest `/tmp` is 1m.
+
+At each `up`, under the shared limits lock, Sandy reads the saved values
+(otherwise the defaults) and the live values of the slice with one
+`systemctl show`, and runs `systemctl set-property --runtime` only when they
+differ. Runtime values end at the next boot, and the next `up` sets them
+again. This also corrects an outside change, and follows a change of the
+host (CPUs or memory). A malformed saved file stops `up` before any other
+host change and names `update --shared --reset`; unknown fields are
+discarded. `up` reads the host values before any host change, sets the
+shared limits as its first host change, prints the shared limits (marking
+the saved ones) and the limits of the container, and warns when
+`--pids-limit` is above the shared process limit or `/tmp` is larger than
+the shared memory.
+
+nspawn's `--oom-score-adjust=` fails with `--private-users` (measured), so
+`up` sets its own `/proc/self/oom_score_adj` while it starts the scope, and
+restores it. The container inherits the value. The entry helper reads the
+Leader's value through its pinned `/proc/<pid>` directory, and writes it to
+its own process after the bounding set check, before the session starts. As
+host root, each write also sets the lowest value that the container and the
+session can set; container root cannot go lower (measured).
+
+When the kernel ends processes of a container because memory ran out, the
+`up` console, `bash`, and `exec` report it when the session ends. Sandy
+compares the counters from before and after the session: `oom_kill` of the
+scope's `memory.events`, `oom` of the scope's `memory.events` (a limit of
+the scope or of a cgroup that container root made), and `oom` of the
+slice's `memory.events.local` (the shared limit; `memory.events` of the
+slice also counts the events inside each container). Without a new limit
+event, the host ran out of memory. `status` prints the counts.
+
+Decisions (the user, 2026-10-01): one shared slice instead of a CPU and
+memory limit for each container (a per-container `-m` can come later); the
+memory reserve of the host; the same share for the shared process limit; a
+separate process limit for each container; no swap; a fixed `/tmp` size;
+the runtime values that each `up` sets again; and `update --shared` with
+`--reset`. An earlier revision of this fix had a CPU quota, a memory limit,
+and a swap limit for each container (`--cpus`, `-m`, `--memory-swap`), half
+of the host memory as the default, and a `/tmp` of 25% of the memory limit.
+
+The defaults follow the local VM managers, which also run workloads on the
+user's machine: Docker Desktop and WSL2 give their VM half of the host
+memory; Lima gives min(4 GiB, half of the host memory) and min(4, host
+CPUs). Container engines (`docker run`, `podman run`) set no CPU or memory
+limit by default; Podman sets `--pids-limit` 2048.
+
+Measured on systemd 249, 255, and 257 (kernels 5.15, 6.8, and 6.12), in VMs
+with 2 CPUs and about 3.8 GiB of memory, with test scopes in a test slice:
+
+- A slice name with "-" makes a nested slice (`ai-probe.slice` became
+  `ai.slice/ai-probe.slice`); `sandy.slice` has none.
+- `systemctl set-property --runtime` works on a slice that does not exist:
+  the values apply when the first scope starts, and the slice stays
+  inactive. A change of a running slice applies at once, also to the CPU
+  affinity of running processes. The slice stays active after its last
+  scope stops, and its runtime drop-ins stay until `systemctl revert`.
+- `systemctl show` prints `AllowedCPUs=` with spaces between the ranges
+  (`0 2-3 5`), and stores `MemoryMax=` as given. An unset slice shows an
+  empty `AllowedCPUs=` and `infinity`.
+- Files in `/tmp` count against the memory limit. In a scope with
+  `MemoryMax=256M` and `MemorySwapMax=0`, a 100 MiB tmpfs file showed as 100
+  MiB `shmem` in the scope's `memory.stat`, and a 300 MiB write was ended by
+  the kernel's memory cgroup OOM killer, not by ENOSPC. A full `/tmp` gives
+  ENOSPC only when its size leaves room for the processes.
+- CPU in a shared slice with 2 CPUs: with `Delegate=yes`, a container with
+  8 busy threads and one with 2 got 1.0 CPU each.
+- Memory in a shared pool (`MemoryMax=512M`): when one container filled the
+  pool, the kernel ended the largest process in the slice, also of the other
+  container. `MemoryMin=` did not change the victim (no swap). An
+  `oom_score_adj` of -500 did: the kernel ended a process of the other
+  container. Pages of a tmpfs stayed charged to the slice after the scope of
+  the writer emptied. A lower `MemoryMax=` than the use ended processes at
+  once.
+- `TasksMax=` works on the slice and on its scopes, and the smaller limit
+  applies.
+- With `--memory 64m` on its scope (the earlier revision), a container
+  started, and attaches for the default user and for root worked, with no
+  OOM event.
+
+Measured result: `make e2e` passes 77 cases on systemd 249, 255, and 257
+with the Debian trixie image. For this item:
+
+- The defaults of the slice and of a container, in systemd and in the
+  kernel, and the CPUs that processes inside see (`nproc`).
+- `update --shared` with running containers: the new limits apply at once,
+  also to the CPU affinity of the running keepalive; the saved file is root's
+  with mode 0600; the errors change nothing; `--reset` sets the defaults.
+- `update --shared` before the first container: the slice stays inactive,
+  and the next `up` starts it with the saved limits and gives the container
+  half of the small shared process limit.
+- `--pids-limit`, `--tmp-size` (a write past it gives ENOSPC), and
+  `--oom-score-adj -500`: the Leader, the keepalive, and sessions of the
+  default user and of root have -500; none can set -600, and each can set
+  -400.
+- An OOM at the shared memory (the use at that time plus 256 MiB): the
+  kernel ended the process of the container with the default value, the
+  process of the container with -500 survived, and the session report named
+  the shared limit. An OOM at a test-only limit of a scope: the report named
+  a limit of the container itself.
+- Invalid values and a malformed saved file stop `up`, with no change of
+  the slice and no scope; `update --pids-limit` changes a running scope and
+  fails for a stopped one, and leaves no drop-in.
+- The harness refuses a pre-existing `sandy.slice`, and its cleanup leaves
+  the slice inactive, with no drop-ins and no cgroup.
 
 ## 3. No LSM confinement
 
