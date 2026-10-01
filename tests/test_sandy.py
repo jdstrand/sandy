@@ -918,6 +918,108 @@ class ParserTests(unittest.TestCase):
         with patch.object(sys, "argv", ["sandy", *arguments]):
             return sandy.parse_args_custom()
 
+    def test_up_resource_limit_options_follow_docker_run(self):
+        args = self.parse(
+            "up", "--pids-limit", "-1", "--tmp-size", "512m", "--oom-score-adj", "-500"
+        )
+        self.assertEqual(
+            (args.pids_limit, args.tmp_size, args.oom_score_adj), (-1, 512 * MIB, -500)
+        )
+        args = self.parse(
+            "up", "--tmp-size=1G", "--pids-limit=4096", "--oom-score-adj=1000"
+        )
+        self.assertEqual(
+            (args.pids_limit, args.tmp_size, args.oom_score_adj), (4096, GIB, 1000)
+        )
+        args = self.parse("up")
+        self.assertEqual(
+            (args.pids_limit, args.tmp_size, args.oom_score_adj), (None, None, None)
+        )
+
+    def test_up_resource_limit_options_reject_bad_or_repeated_values(self):
+        for arguments in (
+            ("--tmp-size", "5 g"),
+            ("--tmp-size", "1k"),
+            ("--pids-limit", "0"),
+            ("--oom-score-adj", "-1000"),
+            ("--oom-score-adj", "1001"),
+            ("--pids-limit", "1", "--pids-limit", "2"),
+            ("--oom-score-adj", "1", "--oom-score-adj", "2"),
+            # A container has no CPU, memory, or swap option of its own.
+            ("--cpus", "1"),
+            ("-m", "1g"),
+            ("--memory-swap", "1g"),
+        ):
+            with self.subTest(arguments=arguments):
+                with captured_output(), self.assertRaises(SystemExit) as raised:
+                    self.parse("up", *arguments)
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_update_options_follow_docker_update(self):
+        args = self.parse("-c", "box", "update", "--pids-limit", "512")
+        self.assertEqual(
+            (args.command, args.container, args.shared_limits, args.pids_limit),
+            ("update", "box", False, 512),
+        )
+        # update --shared does not change the global -s/--shared directory.
+        args = self.parse(
+            "-s",
+            "dir",
+            "update",
+            "--shared",
+            "--cpuset-cpus",
+            "4-7,9",
+            "-m",
+            "24g",
+            "--pids-limit",
+            "-1",
+        )
+        self.assertEqual(
+            (
+                args.shared,
+                args.shared_limits,
+                args.cpuset_cpus,
+                args.memory,
+                args.pids_limit,
+                args.reset,
+            ),
+            ("dir", True, (4, 5, 6, 7, 9), 24 * GIB, -1, False),
+        )
+        args = self.parse("update", "--shared", "--reset")
+        self.assertEqual(
+            (args.shared, args.shared_limits, args.reset), (None, True, True)
+        )
+        args = self.parse("update")
+        self.assertEqual(
+            (
+                args.shared_limits,
+                args.cpuset_cpus,
+                args.memory,
+                args.pids_limit,
+                args.reset,
+            ),
+            (False, None, None, None, False),
+        )
+        self.assertFalse(hasattr(args, "tmp_size"))
+        for arguments in (
+            ("--tmp-size", "1g"),
+            ("--oom-score-adj", "1"),
+            # No abbreviations: --cpus is a prefix of --cpuset-cpus.
+            ("--cpus", "1"),
+            ("--cpu", "1"),
+            ("--mem", "1g"),
+            ("--memory-swap", "1g"),
+            ("-m", "63m"),
+            ("-m", "1g", "-m", "2g"),
+            ("--cpuset-cpus", "x"),
+            ("--cpuset-cpus", "1", "--cpuset-cpus", "2"),
+            ("--pids-limit", "0"),
+        ):
+            with self.subTest(arguments=arguments):
+                with captured_output(), self.assertRaises(SystemExit) as raised:
+                    self.parse("update", *arguments)
+                self.assertEqual(raised.exception.code, 2)
+
     def test_no_command_defaults(self):
         args = self.parse()
         self.assertIsNone(args.command)
@@ -1191,6 +1293,7 @@ class MainDispatchTests(unittest.TestCase):
             "exec": ("run_exec", {}),
             "status": ("run_status", {}),
             "list": ("run_list", {}),
+            "update": ("run_update", {}),
         }
         for command, (method_name, extra) in cases.items():
             with self.subTest(command=command):
@@ -4195,16 +4298,16 @@ class LeaderExtractionTests(unittest.TestCase):
     def test_require_scope_payload_cgroup(self):
         unit = "sandy-ai-dev.scope"
         for cgroup in (
-            "/system.slice/sandy-ai-dev.scope/payload",
-            "/system.slice/sandy-ai-dev.scope/payload/init.scope",
+            "/sandy.slice/sandy-ai-dev.scope/payload",
+            "/sandy.slice/sandy-ai-dev.scope/payload/init.scope",
         ):
             with self.subTest(cgroup=cgroup):
                 sandy._require_scope_payload_cgroup(cgroup, unit)
         for cgroup in (
-            "/system.slice/sandy-ai-dev.scope/payloadx",
-            "/system.slice/sandy-ai-dev.scope/attach-0",
-            "/system.slice/sandy-ai-dev.scope/",
-            "/system.slice/sandy-ai-dev.scopex",
+            "/sandy.slice/sandy-ai-dev.scope/payloadx",
+            "/sandy.slice/sandy-ai-dev.scope/attach-0",
+            "/sandy.slice/sandy-ai-dev.scope/",
+            "/sandy.slice/sandy-ai-dev.scopex",
             "/machine.slice/machine-ai-dev.scope/payload",
             "/",
         ):
@@ -4214,9 +4317,7 @@ class LeaderExtractionTests(unittest.TestCase):
         # During the start, nspawn moves the Leader from the scope's own
         # cgroup to payload (measured on systemd 249, 255, and 257).
         with self.assertRaisesRegex(ProcessLookupError, "still starting"):
-            sandy._require_scope_payload_cgroup(
-                "/system.slice/sandy-ai-dev.scope", unit
-            )
+            sandy._require_scope_payload_cgroup("/sandy.slice/sandy-ai-dev.scope", unit)
 
     def test_pidfd_process_alive_uses_readability(self):
         # A pipe stands in for a pidfd: readable means that the process exited.
@@ -4363,6 +4464,7 @@ class LeaderExtractionTests(unittest.TestCase):
             seccomp_filters=(),
             capability_bounding_set=0,
             attach_kill_fd=6,
+            oom_score_adj=0,
         )
         with patch.object(
             sandy.os, "close", side_effect=[None, OSError(errno.EBADF, "x"), None, None]
@@ -4394,8 +4496,9 @@ class LeaderExtractionTests(unittest.TestCase):
         manager.query.return_value = overrides.get("leader", 42)
         manager.filters.return_value = (b"old", b"new")
         manager.capbnd.return_value = 0xFDECBFFF
+        manager.oom.return_value = -500
         manager.cgroup.return_value = overrides.get(
-            "cgroup", "/system.slice/sandy-ai-dev.scope/payload"
+            "cgroup", "/sandy.slice/sandy-ai-dev.scope/payload"
         )
         manager.join.return_value = 30
         manager.alive.return_value = overrides.get("alive", True)
@@ -4405,7 +4508,7 @@ class LeaderExtractionTests(unittest.TestCase):
                 "payload_confinement", sandy.ProcessConfinement(2, 0xFDECBFFF)
             ),
         )
-        for name in ("filters", "capbnd", "pidfd_open", "join", "payload"):
+        for name in ("filters", "capbnd", "oom", "pidfd_open", "join", "payload"):
             if name in overrides:
                 getattr(manager, name).side_effect = overrides[name]
         if "cgroup_error" in overrides:
@@ -4426,6 +4529,7 @@ class LeaderExtractionTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(sandy, "_read_capability_bounding_set", manager.capbnd)
             )
+            stack.enter_context(patch.object(sandy, "_read_oom_score_adj", manager.oom))
             stack.enter_context(
                 patch.object(sandy, "_read_process_cgroup", manager.cgroup)
             )
@@ -4447,6 +4551,7 @@ class LeaderExtractionTests(unittest.TestCase):
                 seccomp_filters=(b"old", b"new"),
                 capability_bounding_set=0xFDECBFFF,
                 attach_kill_fd=30,
+                oom_score_adj=-500,
             ),
         )
         ns_flags = os.O_RDONLY | os.O_CLOEXEC
@@ -4470,6 +4575,8 @@ class LeaderExtractionTests(unittest.TestCase):
                 call.open("ns/user", ns_flags, dir_fd=20),
                 call.filters(42),
                 call.capbnd(20),
+                # From the pinned Leader directory (item 2).
+                call.oom(20),
                 call.close(20),
                 call.alive(10),
                 call.join("ai-dev", ATTACH_LEAF),
@@ -4478,7 +4585,7 @@ class LeaderExtractionTests(unittest.TestCase):
         )
 
     def test_extract_leader_confinement_accepts_nested_payload_cgroup(self):
-        cgroup = "/system.slice/sandy-ai-dev.scope/payload/init.scope"
+        cgroup = "/sandy.slice/sandy-ai-dev.scope/payload/init.scope"
         with self.extraction_mocks(cgroup=cgroup) as manager:
             confinement = sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
         self.assertEqual(confinement.attach_kill_fd, 30)
@@ -4492,22 +4599,22 @@ class LeaderExtractionTests(unittest.TestCase):
                 "restart it",
             ),
             (
-                "/system.slice/sandy-ai-dev.scope/supervisor",
+                "/sandy.slice/sandy-ai-dev.scope/supervisor",
                 PermissionError,
                 "restart it",
             ),
             (
-                "/system.slice/sandy-ai-dev.scope/payloadx",
+                "/sandy.slice/sandy-ai-dev.scope/payloadx",
                 PermissionError,
                 "restart it",
             ),
             (
-                "/system.slice/sandy-other.scope/payload",
+                "/sandy.slice/sandy-other.scope/payload",
                 PermissionError,
                 "restart it",
             ),
             # nspawn has not yet moved the Leader below payload.
-            ("/system.slice/sandy-ai-dev.scope", ProcessLookupError, "still starting"),
+            ("/sandy.slice/sandy-ai-dev.scope", ProcessLookupError, "still starting"),
         ):
             with self.subTest(cgroup=cgroup):
                 with self.extraction_mocks(cgroup=cgroup) as manager:
@@ -4584,6 +4691,7 @@ class LeaderExtractionTests(unittest.TestCase):
         for name, error in (
             ("filters", OSError(errno.EACCES, "x")),
             ("capbnd", ValueError("bad")),
+            ("oom", ValueError("Malformed oom_score_adj")),
             ("pidfd_open", ProcessLookupError("gone")),
             ("cgroup_error", ValueError("bad")),
             ("payload", ValueError("bad")),
@@ -4610,6 +4718,7 @@ class LeaderExtractionTests(unittest.TestCase):
         )
         manager.filters.assert_not_called()
         manager.capbnd.assert_not_called()
+        manager.oom.assert_not_called()
         manager.alive.assert_not_called()
         manager.join.assert_not_called()
         self.assertEqual(manager.close.call_args_list, [call(20), call(10)])
@@ -4656,6 +4765,13 @@ class _ExitCalled(Exception):
 
 
 ATTACH_LEAF = "attach-" + "0123456789abcdef" * 2
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+# A host with 8 CPUs, 16 GiB, and a task limit of 131072. By default the
+# containers share CPUs 2-7, 12 GiB, and 98304 tasks, and one container gets
+# 24576 tasks.
+HOST_FACTS = sandy.HostFacts(tuple(range(8)), 16 * GIB, 131072)
+DEFAULT_GROUP = sandy.GroupLimits(tuple(range(2, 8)), 12 * GIB, 98304)
 
 
 def entry_args(**overrides):
@@ -4686,6 +4802,7 @@ def entry_confinement(mask=0b101010):
         seccomp_filters=(b"oldest00", b"newest00"),
         capability_bounding_set=mask,
         attach_kill_fd=30,
+        oom_score_adj=-500,
     )
 
 
@@ -5530,7 +5647,7 @@ class EntryHelperTests(unittest.TestCase):
         )
         manager.run.return_value = 0
         manager.getppid.return_value = overrides.get("ppid", 4100)
-        for name in ("verify", "extract", "cap_last", "pdeathsig"):
+        for name in ("verify", "extract", "cap_last", "pdeathsig", "oom"):
             if name in overrides:
                 getattr(manager, name).side_effect = overrides[name]
         with patch.object(sandy.os, "geteuid", manager.geteuid), patch.object(
@@ -5547,6 +5664,8 @@ class EntryHelperTests(unittest.TestCase):
             sandy, "_extract_leader_confinement", manager.extract
         ), patch.object(
             sandy, "_close_leader_confinement", manager.close
+        ), patch.object(
+            sandy, "_write_own_oom_score_adj", manager.oom
         ), patch.object(
             sandy, "_run_confined_entry", manager.run
         ), patch.object(
@@ -5571,6 +5690,10 @@ class EntryHelperTests(unittest.TestCase):
         names = [entry[0] for entry in manager.mock_calls]
         self.assertLess(names.index("pdeathsig"), names.index("getppid"))
         self.assertLess(names.index("getppid"), names.index("extract"))
+        # The session gets the Leader's OOM score adjustment before it starts.
+        manager.oom.assert_called_once_with(-500)
+        self.assertLess(names.index("extract"), names.index("oom"))
+        self.assertLess(names.index("oom"), names.index("run"))
         manager.run.assert_called_once_with(
             entry_request(),
             sandy._container_environment("developer", "/home/developer")
@@ -5600,6 +5723,7 @@ class EntryHelperTests(unittest.TestCase):
                 with self.helper_mocks(**overrides) as manager:
                     self.assertEqual(sandy._entry_helper_main(argv), 125)
                 manager.extract.assert_not_called()
+                manager.oom.assert_not_called()
                 manager.run.assert_not_called()
                 manager.error.assert_called_once()
 
@@ -5614,6 +5738,7 @@ class EntryHelperTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 with self.helper_mocks(extract=error) as manager:
                     self.assertEqual(sandy._entry_helper_main(self.helper_argv()), 125)
+                manager.oom.assert_not_called()
                 manager.run.assert_not_called()
                 manager.error.assert_called_once_with(error)
 
@@ -5622,6 +5747,16 @@ class EntryHelperTests(unittest.TestCase):
         with self.helper_mocks(confinement=confinement) as manager:
             self.assertEqual(sandy._entry_helper_main(self.helper_argv()), 125)
         manager.close.assert_called_once_with(confinement)
+        manager.oom.assert_not_called()
+        manager.run.assert_not_called()
+
+    def test_entry_helper_main_fails_closed_without_the_oom_value(self):
+        # Mocks: as helper_mocks; the write of oom_score_adj fails.
+        error = OSError(errno.EACCES, "x")
+        with self.helper_mocks(oom=error) as manager:
+            self.assertEqual(sandy._entry_helper_main(self.helper_argv()), 125)
+        manager.close.assert_called_once_with(entry_confinement(0xFDECBFFF))
+        manager.error.assert_called_once_with(error)
         manager.run.assert_not_called()
 
     def test_main_dispatches_entry_helper_before_argument_parsing(self):
@@ -7839,6 +7974,10 @@ class CacheTests(unittest.TestCase):
             state = cache / sandy.PORT_MAPPINGS_FILENAME
             lock = cache / sandy.PORT_MAPPINGS_LOCK_FILENAME
             lifecycle_lock = cache / sandy.LIFECYCLE_LOCK_FILENAME
+            # The saved shared limits are configuration, and their lock
+            # inode is permanent.
+            shared_limits = cache / sandy.SHARED_LIMITS_FILENAME
+            shared_limits_lock = cache / sandy.SHARED_LIMITS_LOCK_FILENAME
             archive = cache / "cache.tar"
             directory = cache / "partial"
             state_alias = cache / "state-alias"
@@ -7846,6 +7985,8 @@ class CacheTests(unittest.TestCase):
             state.write_text("{}")
             lock.write_text("")
             lifecycle_lock.write_text("")
+            shared_limits.write_text("{}\n")
+            shared_limits_lock.write_text("")
             archive.write_text("archive")
             directory.mkdir()
             (directory / "file").write_text("partial")
@@ -7862,6 +8003,8 @@ class CacheTests(unittest.TestCase):
             self.assertTrue(state.exists())
             self.assertTrue(lock.exists())
             self.assertTrue(lifecycle_lock.exists())
+            self.assertTrue(shared_limits.exists())
+            self.assertTrue(shared_limits_lock.exists())
             self.assertFalse(archive.exists())
             self.assertFalse(state_alias.exists())
             self.assertFalse(directory_alias.exists())
@@ -8154,12 +8297,12 @@ class CacheTests(unittest.TestCase):
             (
                 True,
                 True,
-                "except port mapping coordination state",
+                "except coordination state and saved shared limits",
             ),
             (
                 True,
                 False,
-                "retained only port mapping coordination state",
+                "retained only coordination state and saved shared limits",
             ),
         )
         for cache_exists, removed, message in cases:
@@ -8201,6 +8344,14 @@ class CacheTests(unittest.TestCase):
 
 
 class ExecutionTests(unittest.TestCase):
+    def setUp(self):
+        # The session's OOM report reads cgroupfs; OomReportTests cover it.
+        memory_events = patch.object(
+            sandy, "_container_memory_events", return_value=None
+        )
+        memory_events.start()
+        self.addCleanup(memory_events.stop)
+
     def test_is_container_running(self):
         instance = make_sandy()
         result = SimpleNamespace(stdout="1234\n")
@@ -8391,6 +8542,37 @@ class ExecutionTests(unittest.TestCase):
         script.remove_leaf.assert_called_once_with("ai-dev", ATTACH_LEAF)
         environment = interactive.call_args.kwargs["environment"]
         self.assertNotIn("SANDY_TEST_HOST_SECRET", environment)
+
+    def test_exec_reports_oom_kills_before_the_last_attach_stop(self):
+        # Mocks: as in the entry helper test, plus the memory events.
+        instance = make_sandy()
+        events = []
+        before = sandy.MemoryEvents(0, 0, 0)
+        with patch.object(
+            sandy,
+            "_container_memory_events",
+            side_effect=lambda name: events.append(("read", name)) or before,
+        ), patch.object(instance, "_is_container_running", return_value="123"):
+            with patch.object(instance, "_get_machine_dir", return_value="/machine"):
+                with patch.object(sandy.os.path, "isdir", return_value=True):
+                    with self.entry_script(instance):
+                        with patch.object(
+                            instance,
+                            "_run_container_interactive",
+                            side_effect=lambda *a, **k: events.append(("run",)) or 0,
+                        ), patch.object(
+                            instance,
+                            "_report_oom_kills",
+                            side_effect=lambda value: events.append(("report", value)),
+                        ), patch.object(
+                            instance,
+                            "_stop_if_last_attach",
+                            side_effect=lambda console: events.append(("stop",)),
+                        ):
+                            instance._exec("true")
+        self.assertEqual(
+            events, [("read", "ai-dev"), ("run",), ("report", before), ("stop",)]
+        )
 
     def test_exec_rejects_missing_container_or_command(self):
         instance = make_sandy()
@@ -9408,13 +9590,33 @@ class CommandMethodTests(unittest.TestCase):
                         method(arguments)
                 self.assertEqual(raised.exception.code, expected)
 
-    def test_status_uses_machinectl(self):
+    def test_status_uses_machinectl_and_reports_oom_kills(self):
+        # Mocks: the subprocess wrapper and the memory events.
         instance = make_sandy()
-        with patch.object(sandy, "_run_secure_subprocess") as run:
-            instance.run_status()
-        run.assert_called_once_with(
-            ["machinectl", "status", "--no-pager", "--full", "ai-dev"]
-        )
+        for events, line in (
+            (
+                sandy.MemoryEvents(3, 2, 5),
+                "OOM kills: 3 (memory limit reached: 5 times by all Sandy "
+                "containers, 2 times inside this container)\n",
+            ),
+            (
+                sandy.MemoryEvents(1, 0, 1),
+                "OOM kills: 1 (memory limit reached: 1 time by all Sandy "
+                "containers, 0 times inside this container)\n",
+            ),
+            (None, ""),
+        ):
+            with self.subTest(events=events):
+                with patch.object(sandy, "_run_secure_subprocess") as run, patch.object(
+                    sandy, "_container_memory_events", return_value=events
+                ) as read:
+                    with captured_output() as (stdout, _):
+                        instance.run_status()
+                run.assert_called_once_with(
+                    ["machinectl", "status", "--no-pager", "--full", "ai-dev"]
+                )
+                read.assert_called_once_with("ai-dev")
+                self.assertEqual(stdout.getvalue(), line)
 
     def test_list_sorts_and_reports_status(self):
         instance = make_sandy()
@@ -9779,6 +9981,693 @@ class RemovalTests(unittest.TestCase):
         remove.assert_called_once_with(path, prompt=False)
 
 
+class ResourceLimitTests(unittest.TestCase):
+    """Parsing, defaults, and messages of the resource limits (item 2).
+
+    Most tests use no mocks. Each test that mocks says what.
+    """
+
+    def test_parse_size_argument_takes_docker_units(self):
+        cases = {
+            "0": 0,
+            "512": 512,
+            "512b": 512,
+            "1k": 1024,
+            "64m": 64 * MIB,
+            "64M": 64 * MIB,
+            "2g": 2 * GIB,
+            "1048576g": 1048576 * GIB,
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(sandy._parse_size_argument(value), expected)
+        for value in (
+            "",
+            "-1",
+            "01",
+            "1.5g",
+            "1gb",
+            "1t",
+            " 1g",
+            "1g ",
+            "1e3",
+            "١g",
+            "1048577g",
+            "1" * 17,
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(sandy.argparse.ArgumentTypeError):
+                    sandy._parse_size_argument(value)
+
+    def test_parse_memory_and_tmp_size_arguments(self):
+        # The shared memory: 0 (no limit) or at least 64m.
+        for value, expected in (("0", 0), ("64m", 64 * MIB), ("24g", 24 * GIB)):
+            with self.subTest(value=value):
+                self.assertEqual(sandy._parse_memory_argument(value), expected)
+        for value in ("1", "512", "63m", str(64 * MIB - 1), "x"):
+            with self.subTest(value=value):
+                with self.assertRaises(sandy.argparse.ArgumentTypeError):
+                    sandy._parse_memory_argument(value)
+        # /tmp: 0 (the tmpfs default) or at least 1m.
+        for value, expected in (("0", 0), ("1m", MIB), ("1024k", MIB), ("2g", 2 * GIB)):
+            with self.subTest(value=value):
+                self.assertEqual(sandy._parse_tmp_size_argument(value), expected)
+        for value in ("1", "1023k", "-1", "1.5m"):
+            with self.subTest(value=value):
+                with self.assertRaises(sandy.argparse.ArgumentTypeError):
+                    sandy._parse_tmp_size_argument(value)
+
+    def test_parse_pids_limit_argument(self):
+        for value, expected in (("-1", -1), ("1", 1), ("16384", 16384)):
+            with self.subTest(value=value):
+                self.assertEqual(sandy._parse_pids_limit_argument(value), expected)
+        self.assertEqual(
+            sandy._parse_pids_limit_argument(str(sandy.PID_MAX_LIMIT - 1)),
+            sandy.PID_MAX_LIMIT - 1,
+        )
+        for value in ("0", "-2", str(sandy.PID_MAX_LIMIT), "01", "", "1.0", "1k"):
+            with self.subTest(value=value):
+                with self.assertRaises(sandy.argparse.ArgumentTypeError):
+                    sandy._parse_pids_limit_argument(value)
+
+    def test_parse_oom_score_adj_argument(self):
+        for value in ("-999", "-500", "0", "1", "500", "1000"):
+            with self.subTest(value=value):
+                self.assertEqual(sandy._parse_oom_score_adj_argument(value), int(value))
+        # -1000 would make every process of the containers unkillable.
+        for value in ("-1000", "1001", "-0", "01", "+1", "", "1.0", " 1", "١"):
+            with self.subTest(value=value):
+                with self.assertRaises(sandy.argparse.ArgumentTypeError):
+                    sandy._parse_oom_score_adj_argument(value)
+
+    def test_parse_and_format_cpu_lists(self):
+        cases = {
+            "0": (0,),
+            "0-3": (0, 1, 2, 3),
+            "0-1,4,6-7": (0, 1, 4, 6, 7),
+            "3,1-2": (1, 2, 3),
+            "8191": (8191,),
+        }
+        for text, cpus in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(sandy._parse_cpu_list(text), cpus)
+        for cpus, text in (
+            ((0,), "0"),
+            ((0, 1, 2, 3), "0-3"),
+            ((0, 1, 4, 6, 7), "0-1,4,6-7"),
+            ((2, 4, 6), "2,4,6"),
+            ((4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), "4-15"),
+        ):
+            with self.subTest(cpus=cpus):
+                self.assertEqual(sandy._format_cpu_list(cpus), text)
+        for text in (
+            "",
+            "a",
+            "1-",
+            "-1",
+            "1,",
+            ",1",
+            "3-1",
+            "8192",
+            "0 1",
+            "1\n",
+            "١",
+            "1--2",
+            "1-2-3",
+            "12345",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(ValueError, "Malformed CPU list"):
+                    sandy._parse_cpu_list(text)
+
+    def test_parse_cpuset_argument(self):
+        self.assertEqual(sandy._parse_cpuset_argument("4-7,9"), (4, 5, 6, 7, 9))
+        for value in ("", "4-", "a", "0 1", "8192", "0," * 2048 + "0"):
+            with self.subTest(value=value[:16]):
+                with self.assertRaises(sandy.argparse.ArgumentTypeError):
+                    sandy._parse_cpuset_argument(value)
+
+    def test_host_online_cpus(self):
+        # Mocks: os.open and os.read of the online CPU list.
+        for data, expected in (
+            (b"0-7\n", tuple(range(8))),
+            (b"0-1,4-5\n", (0, 1, 4, 5)),
+        ):
+            with self.subTest(data=data):
+                with patch.object(sandy.os, "open", return_value=99), patch.object(
+                    sandy.os, "read", return_value=data
+                ), patch.object(sandy.os, "close") as close:
+                    self.assertEqual(sandy._host_online_cpus(), expected)
+                close.assert_called_once_with(99)
+        for data in (b"0-7", b"", b"x\n", b"0" * 4096 + b"\n"):
+            with self.subTest(data=data[:8]):
+                with patch.object(sandy.os, "open", return_value=99), patch.object(
+                    sandy.os, "read", return_value=data
+                ), patch.object(sandy.os, "close") as close:
+                    with self.assertRaises(ValueError):
+                        sandy._host_online_cpus()
+                close.assert_called_once_with(99)
+
+    def test_host_task_limit_is_the_smaller_kernel_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            threads_max = Path(directory, "threads-max")
+            pid_max = Path(directory, "pid_max")
+            with patch.object(
+                sandy, "THREADS_MAX_PATH", str(threads_max)
+            ), patch.object(sandy, "PID_MAX_PATH", str(pid_max)):
+                for threads, pids, expected in (
+                    ("30516\n", "4194304\n", 30516),
+                    ("1000000\n", "32768\n", 32768),
+                ):
+                    with self.subTest(threads=threads, pids=pids):
+                        threads_max.write_text(threads)
+                        pid_max.write_text(pids)
+                        self.assertEqual(sandy._host_task_limit(), expected)
+                pid_max.write_text("32768\n")
+                for text in ("0\n", "01\n", "x\n", "1", "", "1" * 11 + "\n", "1" * 40):
+                    with self.subTest(text=text):
+                        threads_max.write_text(text)
+                        with self.assertRaises(ValueError):
+                            sandy._host_task_limit()
+
+    def test_read_host_facts(self):
+        # Mocks: the three host readers.
+        with patch.object(
+            sandy, "_host_online_cpus", return_value=(0, 1)
+        ), patch.object(
+            sandy, "_host_memory_bytes", return_value=4 * GIB
+        ), patch.object(
+            sandy, "_host_task_limit", return_value=32768
+        ) as task_limit:
+            self.assertEqual(
+                sandy._read_host_facts(), sandy.HostFacts((0, 1), 4 * GIB, 32768)
+            )
+            for error in (
+                ValueError("Malformed /proc/sys/kernel/pid_max"),
+                FileNotFoundError("No such file"),
+            ):
+                with self.subTest(error=error):
+                    task_limit.side_effect = error
+                    with captured_output() as (stdout, _):
+                        with self.assertRaises(SystemExit) as raised:
+                            sandy._read_host_facts()
+                    self.assertEqual(raised.exception.code, 1)
+                    self.assertEqual(
+                        stdout.getvalue(),
+                        "E: Could not read the CPUs, the memory, or the task limit "
+                        f"of the host: '{error}'\n",
+                    )
+
+    def test_host_memory(self):
+        # Mocks: os.sysconf.
+        values = {"SC_PHYS_PAGES": 4096, "SC_PAGE_SIZE": 4096}
+        with patch.object(sandy.os, "sysconf", side_effect=values.__getitem__):
+            self.assertEqual(sandy._host_memory_bytes(), 16 * MIB)
+        for broken in (
+            {"SC_PHYS_PAGES": -1, "SC_PAGE_SIZE": 4096},
+            {"SC_PHYS_PAGES": 4096, "SC_PAGE_SIZE": 0},
+        ):
+            with self.subTest(broken=broken):
+                with patch.object(sandy.os, "sysconf", side_effect=broken.__getitem__):
+                    with self.assertRaises(ValueError):
+                        sandy._host_memory_bytes()
+
+    def test_default_group_keeps_the_lowest_cpus(self):
+        # The host keeps 4 CPUs of 16 or more, 2 of 8 or more, otherwise 1;
+        # the containers get at least 1 CPU.
+        cases = {
+            1: (0,),
+            2: (1,),
+            4: (1, 2, 3),
+            7: tuple(range(1, 7)),
+            8: tuple(range(2, 8)),
+            15: tuple(range(2, 15)),
+            16: tuple(range(4, 16)),
+            64: tuple(range(4, 64)),
+        }
+        for count, expected in cases.items():
+            with self.subTest(count=count):
+                facts = sandy.HostFacts(tuple(range(count)), 16 * GIB, 131072)
+                self.assertEqual(sandy._default_group_limits(facts).cpus, expected)
+        # Online CPUs need not be contiguous.
+        facts = sandy.HostFacts((0, 2, 4, 6, 8, 10, 12, 14), 16 * GIB, 131072)
+        self.assertEqual(sandy._default_group_limits(facts).cpus, (4, 6, 8, 10, 12, 14))
+
+    def test_default_group_memory_and_tasks_per_host_size(self):
+        # The host keeps 25% of its memory, at least 4 GiB, never more than
+        # half; the containers get the same share of the system task limit.
+        # The task limits are those of kernel.threads-max at these sizes.
+        for memory_gib, task_limit, shared_gib, tasks in (
+            (4, 32768, 2, 16384),
+            (8, 65536, 4, 32768),
+            (12, 98304, 8, 65536),
+            (16, 131072, 12, 98304),
+            (32, 262144, 24, 196608),
+            (64, 524288, 48, 393216),
+        ):
+            with self.subTest(memory_gib=memory_gib):
+                facts = sandy.HostFacts((0, 1), memory_gib * GIB, task_limit)
+                group = sandy._default_group_limits(facts)
+                self.assertEqual(
+                    (group.memory_max, group.tasks_max), (shared_gib * GIB, tasks)
+                )
+        # Measured VM: 3984496 KiB and threads-max 30516. Half, rounded down
+        # to MiB, and the same share of the tasks.
+        facts = sandy.HostFacts((0, 1), 3984496 * 1024, 30516)
+        self.assertEqual(
+            sandy._default_group_limits(facts),
+            sandy.GroupLimits((1,), 1945 * MIB, 30516 * 1945 * MIB // (3984496 * 1024)),
+        )
+
+    def test_container_tasks_default_per_host_size(self):
+        # 25% of the shared process limit, at least 8192, never more than
+        # half of it.
+        for memory_gib, task_limit, expected in (
+            (4, 32768, 8192),
+            (8, 65536, 8192),
+            (16, 131072, 24576),
+            (32, 262144, 49152),
+            (64, 524288, 98304),
+        ):
+            with self.subTest(memory_gib=memory_gib):
+                facts = sandy.HostFacts((0, 1), memory_gib * GIB, task_limit)
+                group = sandy._default_group_limits(facts)
+                self.assertEqual(
+                    sandy._container_tasks_default(group, task_limit), expected
+                )
+        # A small shared limit: half of it. No shared limit: the system limit.
+        self.assertEqual(
+            sandy._container_tasks_default(DEFAULT_GROUP._replace(tasks_max=100), 1),
+            50,
+        )
+        self.assertEqual(
+            sandy._container_tasks_default(DEFAULT_GROUP._replace(tasks_max=1), 1), 1
+        )
+        self.assertEqual(
+            sandy._container_tasks_default(
+                DEFAULT_GROUP._replace(tasks_max=None), 4194304
+            ),
+            1048576,
+        )
+
+    def test_effective_group_limits_prefer_the_saved_values(self):
+        self.assertEqual(
+            sandy._effective_group_limits(DEFAULT_GROUP, sandy.SavedGroupLimits()),
+            DEFAULT_GROUP,
+        )
+        self.assertEqual(
+            sandy._effective_group_limits(
+                DEFAULT_GROUP, sandy.SavedGroupLimits((0, 1), 8 * GIB, 4096)
+            ),
+            sandy.GroupLimits((0, 1), 8 * GIB, 4096),
+        )
+        # 0 and -1 mean no limit, as on the command line.
+        self.assertEqual(
+            sandy._effective_group_limits(
+                DEFAULT_GROUP, sandy.SavedGroupLimits(None, 0, -1)
+            ),
+            sandy.GroupLimits(DEFAULT_GROUP.cpus, None, None),
+        )
+
+    def test_parse_shared_limits(self):
+        online = tuple(range(8))
+        self.assertEqual(
+            sandy._parse_shared_limits("", online), sandy.SavedGroupLimits()
+        )
+        self.assertEqual(
+            sandy._parse_shared_limits("{}\n", online), sandy.SavedGroupLimits()
+        )
+        self.assertEqual(
+            sandy._parse_shared_limits(
+                '{"cpus":"0-1,4","memory":8589934592,"tasks":-1}\n', online
+            ),
+            sandy.SavedGroupLimits((0, 1, 4), 8 * GIB, -1),
+        )
+        # Unknown fields are discarded.
+        self.assertEqual(
+            sandy._parse_shared_limits('{"memory":0,"swap":1,"x":null}', online),
+            sandy.SavedGroupLimits(None, 0, None),
+        )
+        with patch.object(sandy.json, "loads", side_effect=RecursionError):
+            with self.assertRaisesRegex(ValueError, "not valid JSON"):
+                sandy._parse_shared_limits("[[]]", online)
+        for text, message in (
+            ("{", "not valid JSON"),
+            # Python 3.10 gives RecursionError, 3.13 a list.
+            ("[" * 3000 + "]" * 3000, "not valid JSON|not a JSON object"),
+            ('{"tasks":' + "9" * 5000 + "}", "not valid JSON"),
+            ("[]", "not a JSON object"),
+            ('"x"', "not a JSON object"),
+            ('{"cpus":1}', "CPUs are invalid"),
+            ('{"cpus":"0-"}', "CPUs are invalid"),
+            ('{"cpus":"0 1"}', "CPUs are invalid"),
+            ('{"cpus":"' + "0," * 2048 + '0"}', "CPUs are invalid"),
+            ('{"cpus":"7-8"}', "CPUs 7-8 are not all online"),
+            ('{"memory":"8g"}', "memory is invalid"),
+            ('{"memory":true}', "memory is invalid"),
+            ('{"memory":1.5}', "memory is invalid"),
+            ('{"memory":67108863}', "memory is invalid"),
+            ('{"memory":-1}', "memory is invalid"),
+            ('{"memory":%d}' % (sandy.SIZE_MAX + 1), "memory is invalid"),
+            ('{"tasks":0}', "process limit is invalid"),
+            ('{"tasks":-2}', "process limit is invalid"),
+            ('{"tasks":%d}' % sandy.PID_MAX_LIMIT, "process limit is invalid"),
+            ('{"tasks":false}', "process limit is invalid"),
+        ):
+            with self.subTest(text=text[:24]):
+                with self.assertRaisesRegex(ValueError, message):
+                    sandy._parse_shared_limits(text, online)
+
+    def test_serialize_shared_limits_round_trip(self):
+        for saved, text in (
+            (sandy.SavedGroupLimits(), "{}\n"),
+            (
+                sandy.SavedGroupLimits((4, 5, 6, 7, 9), 24 * GIB, 65536),
+                '{"cpus":"4-7,9","memory":25769803776,"tasks":65536}\n',
+            ),
+            (sandy.SavedGroupLimits(None, 0, -1), '{"memory":0,"tasks":-1}\n'),
+        ):
+            with self.subTest(saved=saved):
+                self.assertEqual(sandy._serialize_shared_limits(saved), text)
+                self.assertEqual(
+                    sandy._parse_shared_limits(text, tuple(range(16))), saved
+                )
+
+    def test_read_saved_group_limits(self):
+        online = tuple(range(8))
+        self.assertEqual(
+            sandy._read_saved_group_limits(None, online), sandy.SavedGroupLimits()
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "shared_limits.json")
+            path.write_text('{"memory":0}\n')
+            with path.open(encoding="utf-8") as handle:
+                self.assertEqual(
+                    sandy._read_saved_group_limits(handle, online),
+                    sandy.SavedGroupLimits(memory_max=0),
+                )
+            for data, message in (
+                (b'{"memory":0}' + b" " * sandy.SHARED_LIMITS_MAX_BYTES, "too large"),
+                (b'{"cpus":"\xff"}', "not valid text"),
+            ):
+                with self.subTest(message=message):
+                    path.write_bytes(data)
+                    with path.open(encoding="utf-8") as handle:
+                        with self.assertRaisesRegex(ValueError, message):
+                            sandy._read_saved_group_limits(handle, online)
+
+    def args(self, **overrides):
+        values = {"pids_limit": None, "tmp_size": None, "oom_score_adj": None}
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_resolve_resource_limits(self):
+        self.assertEqual(
+            sandy._resolve_resource_limits(self.args(), DEFAULT_GROUP, 131072),
+            sandy.ResourceLimits(24576, 512 * MIB, None),
+        )
+        self.assertEqual(
+            sandy._resolve_resource_limits(
+                self.args(pids_limit=512, tmp_size=64 * MIB, oom_score_adj=-500),
+                DEFAULT_GROUP,
+                131072,
+            ),
+            sandy.ResourceLimits(512, 64 * MIB, -500),
+        )
+        # -1 and 0 mean no process limit of its own and the tmpfs default.
+        self.assertEqual(
+            sandy._resolve_resource_limits(
+                self.args(pids_limit=-1, tmp_size=0), DEFAULT_GROUP, 131072
+            ),
+            sandy.ResourceLimits(None, None, None),
+        )
+
+    def test_limit_warnings(self):
+        for limits, group, expected in (
+            (sandy.ResourceLimits(98304, 12 * GIB, None), DEFAULT_GROUP, []),
+            (sandy.ResourceLimits(None, None, None), DEFAULT_GROUP, []),
+            (
+                sandy.ResourceLimits(98305, None, None),
+                DEFAULT_GROUP,
+                [
+                    "W: --pids-limit 98305 is above the process limit that all "
+                    "Sandy containers share (98304), which applies too"
+                ],
+            ),
+            # The tmpfs default is half of the host memory.
+            (
+                sandy.ResourceLimits(None, None, None),
+                DEFAULT_GROUP._replace(memory_max=4 * GIB),
+                [
+                    "W: /tmp (8.0 GiB) is larger than the memory that all Sandy "
+                    "containers share (4.0 GiB). Files in /tmp count against it, "
+                    "so a full /tmp ends processes"
+                ],
+            ),
+            (
+                sandy.ResourceLimits(10**6, 64 * GIB, None),
+                sandy.GroupLimits((0,), None, None),
+                [],
+            ),
+        ):
+            with self.subTest(limits=limits, group=group):
+                self.assertEqual(
+                    sandy._limit_warnings(group, limits, 16 * GIB), expected
+                )
+
+    def test_scope_limit_properties_and_tmpfs_argument(self):
+        self.assertEqual(
+            sandy._scope_limit_properties(sandy.ResourceLimits(512, 64 * MIB, -500)),
+            ["--property=TasksMax=512", "--property=MemorySwapMax=0"],
+        )
+        self.assertEqual(
+            sandy._scope_limit_properties(sandy.ResourceLimits(None, None, None)),
+            ["--property=TasksMax=infinity", "--property=MemorySwapMax=0"],
+        )
+        self.assertEqual(
+            sandy._tmp_tmpfs_argument(64 * MIB),
+            f"--tmpfs=/tmp:mode=1777,size={64 * MIB}",
+        )
+        self.assertEqual(sandy._tmp_tmpfs_argument(None), "--tmpfs=/tmp:mode=1777")
+
+    def test_apply_group_limits(self):
+        # Mocks: the subprocess wrapper.
+        for group, values in (
+            (
+                sandy.GroupLimits((4, 5, 6, 7, 9), 8 * GIB, 4096),
+                ["AllowedCPUs=4-7,9", f"MemoryMax={8 * GIB}", "TasksMax=4096"],
+            ),
+            (
+                sandy.GroupLimits((1,), None, None),
+                ["AllowedCPUs=1", "MemoryMax=infinity", "TasksMax=infinity"],
+            ),
+        ):
+            with self.subTest(group=group):
+                with patch.object(sandy, "_run_secure_subprocess") as run:
+                    sandy._apply_group_limits(group)
+                run.assert_called_once_with(
+                    ["systemctl", "set-property", "--runtime", "sandy.slice", *values],
+                    check=True,
+                )
+
+    def test_parse_systemd_values(self):
+        # The formats of systemctl show, measured on systemd 249, 255, 257.
+        for text, expected in (("infinity", None), ("0", 0), ("1073741824", GIB)):
+            with self.subTest(text=text):
+                self.assertEqual(sandy._parse_systemd_limit(text), expected)
+        for text in ("", "max", "-1", "01", "1G", "1" * 21):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    sandy._parse_systemd_limit(text)
+        for text, expected in (
+            ("", ()),
+            ("1", (1,)),
+            ("0-1", (0, 1)),
+            ("0 2-3 5", (0, 2, 3, 5)),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(sandy._parse_systemd_cpu_list(text), expected)
+        for text in ("0,1", "0  1", " 0", "0 ", "x", "0-"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    sandy._parse_systemd_cpu_list(text)
+
+    def show(self, stdout):
+        # Mocks: the subprocess wrapper returns the systemctl show output.
+        result = SimpleNamespace(stdout=stdout)
+        with patch.object(sandy, "_run_secure_subprocess", return_value=result) as run:
+            limits = sandy._read_live_group_limits()
+        run.assert_called_once_with(
+            [
+                "systemctl",
+                "show",
+                "sandy.slice",
+                "-p",
+                "AllowedCPUs",
+                "-p",
+                "MemoryMax",
+                "-p",
+                "TasksMax",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return limits
+
+    def test_read_live_group_limits(self):
+        self.assertEqual(
+            self.show("AllowedCPUs=0 2-3 5\nMemoryMax=1000000\nTasksMax=5\n"),
+            sandy.GroupLimits((0, 2, 3, 5), 1000000, 5),
+        )
+        # A slice that does not exist (measured), in any order.
+        self.assertEqual(
+            self.show("TasksMax=infinity\nAllowedCPUs=\nMemoryMax=infinity\n"),
+            sandy.GroupLimits((), None, None),
+        )
+        for stdout in (
+            "",
+            "AllowedCPUs=\nMemoryMax=infinity\n",
+            "AllowedCPUs=\nMemoryMax=infinity\nTasksMax=infinity\nTasksMax=1\n",
+            "AllowedCPUs=\nMemoryMax=infinity\nTasksMax=infinity\nCPUQuota=1\n",
+            "AllowedCPUs\nMemoryMax=infinity\nTasksMax=infinity\n",
+            "AllowedCPUs=\x1b[1m\nMemoryMax=infinity\nTasksMax=infinity\n",
+            "AllowedCPUs=0,1\nMemoryMax=infinity\nTasksMax=infinity\n",
+            "AllowedCPUs=\nMemoryMax=max\nTasksMax=infinity\n",
+            "AllowedCPUs=\nMemoryMax=infinity\nTasksMax=50%\n",
+            "AllowedCPUs=" + "0 " * 4096 + "1\nMemoryMax=infinity\nTasksMax=infinity\n",
+        ):
+            with self.subTest(stdout=stdout[:40]):
+                with self.assertRaises(ValueError):
+                    self.show(stdout)
+
+    def test_sync_group_limits_changes_only_a_different_slice(self):
+        # Mocks: the systemctl query and change.
+        for live, applied in (
+            (DEFAULT_GROUP, False),
+            (sandy.GroupLimits((), None, None), True),
+            (DEFAULT_GROUP._replace(memory_max=8 * GIB), True),
+            (DEFAULT_GROUP._replace(tasks_max=None), True),
+            (DEFAULT_GROUP._replace(cpus=(2, 3)), True),
+        ):
+            with self.subTest(live=live):
+                with patch.object(
+                    sandy, "_read_live_group_limits", return_value=live
+                ), patch.object(sandy, "_apply_group_limits") as apply:
+                    sandy._sync_group_limits(DEFAULT_GROUP)
+                if applied:
+                    apply.assert_called_once_with(DEFAULT_GROUP)
+                else:
+                    apply.assert_not_called()
+
+    def test_describe_limits(self):
+        self.assertEqual(
+            sandy._describe_group_limits(DEFAULT_GROUP, sandy.SavedGroupLimits()),
+            "CPUs 2-7, memory 12.0 GiB, 98304 tasks",
+        )
+        self.assertEqual(
+            sandy._describe_group_limits(
+                sandy.GroupLimits((0, 1, 2, 3), None, None),
+                sandy.SavedGroupLimits((0, 1, 2, 3), 0, -1),
+            ),
+            "CPUs 0-3 (saved), no memory limit (saved), no process limit (saved)",
+        )
+        self.assertEqual(
+            sandy._describe_group_limits(
+                DEFAULT_GROUP._replace(memory_max=512 * MIB),
+                sandy.SavedGroupLimits(memory_max=512 * MIB),
+            ),
+            "CPUs 2-7, memory 512.0 MiB (saved), 98304 tasks",
+        )
+        self.assertEqual(
+            sandy._describe_resource_limits(
+                sandy.ResourceLimits(24576, 512 * MIB, None), 16 * GIB
+            ),
+            "24576 tasks, /tmp 512.0 MiB, no swap",
+        )
+        self.assertEqual(
+            sandy._describe_resource_limits(
+                sandy.ResourceLimits(None, None, -500), 16 * GIB
+            ),
+            "no process limit of its own, /tmp 8.0 GiB, no swap, OOM score "
+            "adjustment -500",
+        )
+        self.assertEqual(sandy._times_text(1), "1 time")
+        self.assertEqual(sandy._times_text(0), "0 times")
+
+    def test_parse_and_read_oom_score_adj(self):
+        for text, expected in (
+            ("0\n", 0),
+            ("-1000\n", -1000),
+            ("-500\n", -500),
+            ("1000\n", 1000),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(sandy._parse_oom_score_adj(text), expected)
+        for text in ("0", "-0\n", "1001\n", "-1001\n", "x\n", "\n", "1\n\n", "01\n"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    sandy._parse_oom_score_adj(text)
+        # The Leader's value from its open /proc directory.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "oom_score_adj")
+            fd = os.open(directory, sandy.DIRECTORY_OPEN_FLAGS)
+            self.addCleanup(os.close, fd)
+            path.write_text("-500\n")
+            self.assertEqual(sandy._read_oom_score_adj(fd), -500)
+            for text in ("x\n", "1" * 17):
+                with self.subTest(text=text):
+                    path.write_text(text)
+                    with self.assertRaises(ValueError):
+                        sandy._read_oom_score_adj(fd)
+
+    def test_write_own_oom_score_adj(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "oom_score_adj")
+            path.write_text("")
+            with patch.object(sandy, "OWN_OOM_SCORE_ADJ_PATH", str(path)):
+                sandy._write_own_oom_score_adj(-500)
+                self.assertEqual(path.read_text(), "-500\n")
+                # Mocks: a short write.
+                with patch.object(sandy.os, "write", return_value=1):
+                    with self.assertRaisesRegex(OSError, "Short write"):
+                        sandy._write_own_oom_score_adj(-500)
+
+    def test_oom_score_adj_for_children_restores_the_value(self):
+        # Mocks: the write of the value; the read uses a temporary file.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "oom_score_adj")
+            path.write_text("100\n")
+            with patch.object(sandy, "OWN_OOM_SCORE_ADJ_PATH", str(path)), patch.object(
+                sandy, "_write_own_oom_score_adj"
+            ) as write:
+                with sandy._oom_score_adj_for_children(None):
+                    pass
+                write.assert_not_called()
+                with sandy._oom_score_adj_for_children(-500):
+                    self.assertEqual(write.call_args_list, [call(-500)])
+                self.assertEqual(write.call_args_list, [call(-500), call(100)])
+                # The value is restored after an error too.
+                write.reset_mock()
+                with self.assertRaises(RuntimeError):
+                    with sandy._oom_score_adj_for_children(-500):
+                        raise RuntimeError("start failed")
+                self.assertEqual(write.call_args_list, [call(-500), call(100)])
+                # A failed restore is ignored: each attach sets its own value.
+                write.reset_mock()
+                write.side_effect = [None, OSError(errno.EACCES, "x")]
+                with sandy._oom_score_adj_for_children(-500):
+                    pass
+                self.assertEqual(write.call_args_list, [call(-500), call(100)])
+                # A malformed value of this process: nothing is written.
+                write.reset_mock(side_effect=True)
+                path.write_text("x\n")
+                with self.assertRaises(ValueError):
+                    with sandy._oom_score_adj_for_children(-500):
+                        pass
+                write.assert_not_called()
+
+
 class RunUpTests(unittest.TestCase):
     def setUp(self):
         def open_runtime_machine(path):
@@ -9803,6 +10692,28 @@ class RunUpTests(unittest.TestCase):
         self.wait_for_keepalive_open = self.start_patch(
             sandy.Sandy, "_wait_for_keepalive_open", True
         )
+        # The host facts and the shared limits; SharedLimitTests cover them.
+        self.read_host_facts = self.start_patch(sandy, "_read_host_facts", HOST_FACTS)
+        self.set_shared_limits = self.start_patch(
+            sandy.Sandy,
+            "_set_shared_limits",
+            (DEFAULT_GROUP, sandy.SavedGroupLimits()),
+        )
+        # The OOM score adjustment around the start of the supervisor.
+        self.oom_events = []
+
+        @contextmanager
+        def oom_score_adj(value):
+            self.oom_events.append(("set", value))
+            try:
+                yield
+            finally:
+                self.oom_events.append(("restore", value))
+
+        self.oom_score_adj = self.start_patch(
+            sandy, "_oom_score_adj_for_children", None
+        )
+        self.oom_score_adj.side_effect = oom_score_adj
         self.exec = self.start_patch(sandy.Sandy, "_exec", 0)
         self.machine_poweroff = self.start_patch(sandy.Sandy, "_machine_poweroff", None)
         # The lifecycle lock and the up-console marker of up without -d.
@@ -9851,6 +10762,9 @@ class RunUpTests(unittest.TestCase):
             "build": False,
             "persistent": False,
             "detach": True,
+            "tmp_size": None,
+            "pids_limit": None,
+            "oom_score_adj": None,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -10049,6 +10963,190 @@ class RunUpTests(unittest.TestCase):
                 self.assertIn("E: Container 'ai-dev'", stdout.getvalue())
                 self.assertFalse(os.path.lexists(self.keepalive_dir_of(popen)))
 
+    def run_up_with_mocks(self, instance, args, popen_side_effect=None):
+        """Run up with a temporary machine; return the popen mock and output."""
+        with tempfile.TemporaryDirectory() as machine, patch.object(
+            instance, "_is_container_running", return_value=None
+        ), patch.object(instance, "_remove_port_mappings_from_state"), patch.object(
+            instance, "_get_machine_dir", return_value=machine
+        ), patch.object(
+            sandy, "_run_secure_subprocess_popen", side_effect=popen_side_effect
+        ) as popen, patch.object(
+            instance, "_run_init_script", return_value=False
+        ):
+            with captured_output() as (stdout, _):
+                instance.run_up(args)
+        return popen, stdout.getvalue()
+
+    def test_default_limits_are_reported(self):
+        instance = make_sandy()
+        instance.workspace = None
+        popen, output = self.run_up_with_mocks(instance, self.arguments())
+        self.assertIn(
+            "I: Limits of all Sandy containers: CPUs 2-7, memory 12.0 GiB, 98304 "
+            "tasks\nI: Limits of this container: 24576 tasks, /tmp 512.0 MiB, no "
+            "swap\n",
+            output,
+        )
+        self.assertNotIn("W: --pids-limit", output)
+        self.assertNotIn("W: /tmp", output)
+        self.read_host_facts.assert_called_once_with()
+        self.set_shared_limits.assert_called_once_with(HOST_FACTS)
+        # Without --oom-score-adj the container keeps the value of up.
+        self.assertEqual(self.oom_events, [("set", None), ("restore", None)])
+        popen.assert_called_once()
+
+    def test_explicit_limits_reach_the_scope_and_the_tmpfs(self):
+        instance = make_sandy()
+        instance.workspace = None
+        events = self.oom_events
+        args = self.arguments(pids_limit=512, tmp_size=64 * MIB, oom_score_adj=-500)
+        popen, output = self.run_up_with_mocks(
+            instance, args, lambda *a, **k: events.append(("popen",))
+        )
+        scope_command = popen.call_args.args[0]
+        self.assertEqual(
+            scope_command[8 : scope_command.index("--")],
+            ["--property=TasksMax=512", "--property=MemorySwapMax=0"],
+        )
+        self.assertIn(
+            f"--tmpfs=/tmp:mode=1777,size={64 * MIB}",
+            self.nspawn_command(scope_command),
+        )
+        self.assertIn(
+            "I: Limits of this container: 512 tasks, /tmp 64.0 MiB, no swap, OOM "
+            "score adjustment -500\n",
+            output,
+        )
+        # The supervisor, and so the container, inherits the value.
+        self.assertEqual(events, [("set", -500), ("popen",), ("restore", -500)])
+
+    def test_no_limits_of_its_own(self):
+        instance = make_sandy()
+        instance.workspace = None
+        popen, output = self.run_up_with_mocks(
+            instance, self.arguments(pids_limit=-1, tmp_size=0)
+        )
+        scope_command = popen.call_args.args[0]
+        self.assertEqual(
+            scope_command[8 : scope_command.index("--")],
+            ["--property=TasksMax=infinity", "--property=MemorySwapMax=0"],
+        )
+        self.assertIn("--tmpfs=/tmp:mode=1777", self.nspawn_command(scope_command))
+        # The tmpfs default is half of the host memory.
+        self.assertIn(
+            "I: Limits of this container: no process limit of its own, /tmp 8.0 "
+            "GiB, no swap\n",
+            output,
+        )
+
+    def test_up_warns_about_limits_above_the_shared_limits(self):
+        for args, warnings in (
+            (self.arguments(pids_limit=98304, tmp_size=12 * GIB), []),
+            (
+                self.arguments(pids_limit=98305),
+                [
+                    "W: --pids-limit 98305 is above the process limit that all "
+                    "Sandy containers share (98304), which applies too"
+                ],
+            ),
+            (
+                self.arguments(tmp_size=12 * GIB + MIB),
+                [
+                    "W: /tmp (12.0 GiB) is larger than the memory that all Sandy "
+                    "containers share (12.0 GiB). Files in /tmp count against it, "
+                    "so a full /tmp ends processes"
+                ],
+            ),
+        ):
+            with self.subTest(args=args):
+                instance = make_sandy()
+                instance.workspace = None
+                _, output = self.run_up_with_mocks(instance, args)
+                self.assertEqual(
+                    [
+                        line
+                        for line in output.splitlines()
+                        if line.startswith(("W: --pids-limit", "W: /tmp"))
+                    ],
+                    warnings,
+                )
+
+    def test_shared_limits_are_the_first_host_change(self):
+        instance = make_sandy()
+        instance.workspace = None
+        events = []
+        self.read_host_facts.side_effect = lambda: events.append("facts") or HOST_FACTS
+        self.set_shared_limits.side_effect = lambda facts: events.append("shared") or (
+            DEFAULT_GROUP,
+            sandy.SavedGroupLimits(),
+        )
+        self.stale_cleanup.side_effect = lambda name: events.append("cleanup")
+        with tempfile.TemporaryDirectory() as machine, patch.object(
+            instance,
+            "_is_container_running",
+            side_effect=lambda: events.append("running") or None,
+        ), patch.object(
+            instance, "_get_machine_dir", return_value=machine
+        ), patch.object(
+            sandy,
+            "_run_secure_subprocess_popen",
+            side_effect=lambda *args, **kwargs: events.append("popen"),
+        ), patch.object(
+            instance, "_run_init_script", return_value=False
+        ):
+            with captured_output():
+                instance.run_up(self.arguments())
+        self.assertEqual(events, ["facts", "running", "shared", "cleanup", "popen"])
+
+    def test_shared_limit_failure_stops_up_before_other_changes(self):
+        # Mocks: _set_shared_limits reports its error and exits.
+        instance = make_sandy()
+        self.set_shared_limits.side_effect = SystemExit(1)
+        with patch.object(
+            instance, "_is_container_running", return_value=None
+        ), patch.object(sandy, "_run_secure_subprocess_popen") as popen:
+            with captured_output():
+                with self.assertRaises(SystemExit) as raised:
+                    instance.run_up(self.arguments())
+        self.assertEqual(raised.exception.code, 1)
+        self.stale_cleanup.assert_not_called()
+        popen.assert_not_called()
+
+    def test_host_fact_error_stops_up_before_any_check(self):
+        instance = make_sandy()
+        self.read_host_facts.side_effect = SystemExit(1)
+        with patch.object(instance, "_is_container_running") as running:
+            with self.assertRaises(SystemExit):
+                instance.run_up(self.arguments())
+        running.assert_not_called()
+        self.set_shared_limits.assert_not_called()
+
+    def test_oom_score_adjustment_failure_starts_nothing(self):
+        # Mocks: the write of the value of up fails before the start.
+        for error in (
+            OSError(errno.EACCES, "x"),
+            ValueError("Malformed oom_score_adj"),
+        ):
+            with self.subTest(error=error):
+                instance = make_sandy()
+                instance.workspace = None
+                self.oom_score_adj.side_effect = error
+                with tempfile.TemporaryDirectory() as machine, patch.object(
+                    instance, "_is_container_running", return_value=None
+                ), patch.object(
+                    instance, "_get_machine_dir", return_value=machine
+                ), patch.object(
+                    sandy, "_run_secure_subprocess_popen"
+                ) as popen:
+                    with captured_output() as (stdout, _):
+                        with self.assertRaises(SystemExit) as raised:
+                            instance.run_up(self.arguments(oom_score_adj=-500))
+                self.assertEqual(raised.exception.code, 1)
+                self.assertIn("E: Could not start 'ai-dev': ", stdout.getvalue())
+                popen.assert_not_called()
+                self.wait_for_container_ready.assert_not_called()
+
     def test_keepalive_open_is_not_awaited_before_ready(self):
         instance = make_sandy()
         instance.workspace = None
@@ -10242,11 +11340,14 @@ class RunUpTests(unittest.TestCase):
                 "--scope",
                 "--quiet",
                 "--unit=sandy-ai-dev.scope",
-                "--slice=system.slice",
+                "--slice=sandy.slice",
                 "--description=Sandy container ai-dev (detached)",
                 "--property=Delegate=yes",
                 "--property=OOMPolicy=continue",
-                "--property=TasksMax=16384",
+                # 25% of the shared process limit; the CPU and memory limits
+                # are those of sandy.slice.
+                "--property=TasksMax=24576",
+                "--property=MemorySwapMax=0",
                 "--",
             ],
         )
@@ -10257,7 +11358,7 @@ class RunUpTests(unittest.TestCase):
                 "--machine=ai-dev",
                 "--keep-unit",
                 "--console=passive",
-                "--tmpfs=/tmp:mode=1777",
+                f"--tmpfs=/tmp:mode=1777,size={512 * MIB}",
                 "--as-pid2",
                 "--timezone=bind",
                 "--user=root",
@@ -11075,25 +12176,30 @@ class SupervisorScopeTests(unittest.TestCase):
             "--scope",
             "--quiet",
             "--unit=sandy-ai-dev.scope",
-            "--slice=system.slice",
+            "--slice=sandy.slice",
             "--description=Sandy container ai-dev (attached)",
             "--property=Delegate=yes",
         ]
-        suffix = ["--property=TasksMax=16384", "--"]
+        limits = sandy.ResourceLimits(16384, 512 * MIB, -500)
+        suffix = [
+            "--property=TasksMax=16384",
+            "--property=MemorySwapMax=0",
+            "--",
+        ]
         for version in (249, 252):
             with self.subTest(version=version):
                 self.assertEqual(
-                    sandy._supervisor_scope_argv("ai-dev", version, False),
+                    sandy._supervisor_scope_argv("ai-dev", version, False, limits),
                     prefix + suffix,
                 )
         for version in (253, 257):
             with self.subTest(version=version):
                 self.assertEqual(
-                    sandy._supervisor_scope_argv("ai-dev", version, False),
+                    sandy._supervisor_scope_argv("ai-dev", version, False, limits),
                     prefix + ["--property=OOMPolicy=continue"] + suffix,
                 )
         with self.assertRaises(ValueError):
-            sandy._supervisor_scope_argv("Bad", 255, False)
+            sandy._supervisor_scope_argv("Bad", 255, False, limits)
 
     def test_systemctl_show_value_runs_exact_command(self):
         result = SimpleNamespace(stdout="loaded\n")
@@ -11238,7 +12344,7 @@ class AttachCgroupTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
-        self.unit = self.root / "system.slice" / "sandy-ai-dev.scope"
+        self.unit = self.root / "sandy.slice" / "sandy-ai-dev.scope"
         self.unit.mkdir(parents=True)
 
     def fake_leaf(self, name=ATTACH_LEAF, events="populated 0\nfrozen 0\n"):
@@ -11266,8 +12372,8 @@ class AttachCgroupTests(unittest.TestCase):
         proc = self.root / "proc"
         proc.mkdir()
         cases = {
-            "0::/system.slice/sandy-ai-dev.scope/payload\n": (
-                "/system.slice/sandy-ai-dev.scope/payload"
+            "0::/sandy.slice/sandy-ai-dev.scope/payload\n": (
+                "/sandy.slice/sandy-ai-dev.scope/payload"
             ),
             "0::/\n": "/",
         }
@@ -11310,8 +12416,8 @@ class AttachCgroupTests(unittest.TestCase):
                     sandy._open_supervisor_cgroup("ai-dev")
 
         link_root = self.root / "link-root"
-        (link_root / "system.slice").mkdir(parents=True)
-        (link_root / "system.slice" / "sandy-ai-dev.scope").symlink_to(self.unit)
+        (link_root / "sandy.slice").mkdir(parents=True)
+        (link_root / "sandy.slice" / "sandy-ai-dev.scope").symlink_to(self.unit)
         with patch.object(sandy, "CGROUP_ROOT", str(link_root)), self.root_fstat():
             with self.assertRaises(OSError):
                 sandy._open_supervisor_cgroup("ai-dev")
@@ -11327,7 +12433,7 @@ class AttachCgroupTests(unittest.TestCase):
         with patch.object(sandy, "CGROUP_ROOT", str(self.root)), patch.object(
             sandy.os, "fstat", side_effect=fstat
         ), patch.object(sandy.os, "close", wraps=os.close) as close:
-            with self.assertRaisesRegex(PermissionError, "system.slice"):
+            with self.assertRaisesRegex(PermissionError, "sandy.slice"):
                 sandy._open_supervisor_cgroup("ai-dev")
         # The root and the slice descriptors are closed.
         self.assertEqual(close.call_count, 2)
@@ -11558,6 +12664,14 @@ class AttachLifecycleTests(unittest.TestCase):
     Tests mock systemctl, the lifecycle lock, the cgroup directory, signal
     handling, and the stop. E2E tests must prove the rule with real attaches.
     """
+
+    def setUp(self):
+        # The session's OOM report reads cgroupfs; OomReportTests cover it.
+        memory_events = patch.object(
+            sandy, "_container_memory_events", return_value=None
+        )
+        memory_events.start()
+        self.addCleanup(memory_events.stop)
 
     def test_supervisor_started_attached_reads_the_exact_description(self):
         for value, expected in (
@@ -11888,6 +13002,553 @@ class AttachLifecycleTests(unittest.TestCase):
                     rule.assert_called_once_with(console=True)
                 else:
                     rule.assert_not_called()
+
+
+class OomReportTests(unittest.TestCase):
+    """memory.events of the scope and the slice, and the OOM kill report.
+
+    The cgroup tree is a temporary directory; a patched fstat reports root
+    ownership, as on cgroupfs. E2E tests prove the counters with real kills.
+    """
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.slice = self.root / "sandy.slice"
+        self.unit = self.slice / "sandy-ai-dev.scope"
+        self.unit.mkdir(parents=True)
+        real_fstat = os.fstat
+
+        def fstat(fd):
+            return SimpleNamespace(st_uid=0, st_dev=real_fstat(fd).st_dev)
+
+        for patcher in (
+            patch.object(sandy, "CGROUP_ROOT", str(self.root)),
+            patch.object(sandy.os, "fstat", side_effect=fstat),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def events_text(self, oom=0, oom_kill=0):
+        return (
+            f"low 0\nhigh 0\nmax 7\noom {oom}\noom_kill {oom_kill}\noom_group_kill 0\n"
+        )
+
+    def test_read_cgroup_counters(self):
+        (self.unit / "memory.events").write_text(self.events_text(2, 3))
+        fd = os.open(self.unit, sandy.DIRECTORY_OPEN_FLAGS)
+        self.addCleanup(os.close, fd)
+        self.assertEqual(
+            sandy._read_cgroup_counters(fd, "memory.events"),
+            {
+                "low": 0,
+                "high": 0,
+                "max": 7,
+                "oom": 2,
+                "oom_kill": 3,
+                "oom_group_kill": 0,
+            },
+        )
+        for text in (
+            "oom 1 2\n",
+            "oom -1\n",
+            "OOM 1\n",
+            "oom\t1\n",
+            "oom 1" + "0" * 20 + "\n",
+            "\x1b[31m 1\n",
+            "x" * 4097,
+        ):
+            with self.subTest(text=text[:20]):
+                (self.unit / "memory.events").write_text(text)
+                with self.assertRaises(ValueError):
+                    sandy._read_cgroup_counters(fd, "memory.events")
+        (self.unit / "memory.events").write_text("")
+        self.assertEqual(sandy._read_cgroup_counters(fd, "memory.events"), {})
+
+    def test_container_memory_events(self):
+        # The slice's own count is in memory.events.local; its memory.events
+        # also counts the events inside each container.
+        (self.slice / "memory.events").write_text(self.events_text(oom=7, oom_kill=9))
+        (self.slice / "memory.events.local").write_text(
+            self.events_text(oom=5, oom_kill=0)
+        )
+        (self.unit / "memory.events").write_text(self.events_text(oom=2, oom_kill=3))
+        self.assertEqual(
+            sandy._container_memory_events("ai-dev"), sandy.MemoryEvents(3, 2, 5)
+        )
+        # A missing counter is 0.
+        (self.unit / "memory.events").write_text("oom_kill 4\n")
+        self.assertEqual(
+            sandy._container_memory_events("ai-dev"), sandy.MemoryEvents(4, 0, 5)
+        )
+
+    def test_container_memory_events_is_none_when_unknown(self):
+        (self.slice / "memory.events.local").write_text(self.events_text())
+        (self.unit / "memory.events").write_text(self.events_text())
+        # No scope, a malformed file, or a missing file: no report.
+        self.assertIsNone(sandy._container_memory_events("other"))
+        (self.unit / "memory.events").write_text("oom x\n")
+        self.assertIsNone(sandy._container_memory_events("ai-dev"))
+        (self.unit / "memory.events").unlink()
+        self.assertIsNone(sandy._container_memory_events("ai-dev"))
+        (self.unit / "memory.events").write_text(self.events_text())
+        (self.slice / "memory.events.local").unlink()
+        self.assertIsNone(sandy._container_memory_events("ai-dev"))
+        with patch.object(sandy, "CGROUP_ROOT", str(self.root / "missing")):
+            self.assertIsNone(sandy._container_memory_events("ai-dev"))
+
+    def test_container_memory_events_closes_its_descriptors(self):
+        (self.slice / "memory.events.local").write_text(self.events_text())
+        (self.unit / "memory.events").write_text("oom x\n")
+        real_close = os.close
+        closed = []
+
+        def close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        real_open = os.open
+        opened = []
+
+        def tracking_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        with patch.object(sandy.os, "open", side_effect=tracking_open), patch.object(
+            sandy.os, "close", side_effect=close
+        ):
+            self.assertIsNone(sandy._container_memory_events("ai-dev"))
+        self.assertEqual(sorted(opened), sorted(closed))
+
+    def report(self, before, after):
+        instance = make_sandy()
+        with patch.object(sandy, "_container_memory_events", return_value=after):
+            with captured_output() as (stdout, _):
+                instance._report_oom_kills(before)
+        return stdout.getvalue()
+
+    def test_report_names_the_limit_that_was_reached(self):
+        before = sandy.MemoryEvents(1, 1, 4)
+        shared = (
+            "   The Sandy containers reached the memory limit that they share. "
+            "Stop other containers, start less work at a time, or raise the "
+            "limit with: sandy update --shared -m SIZE\n"
+        )
+        own = "   The container reached a memory limit of its own\n"
+        self.assertEqual(
+            self.report(before, sandy.MemoryEvents(4, 1, 5)),
+            "W: The kernel ended 3 processes in 'ai-dev' during this session "
+            "because memory ran out\n" + shared,
+        )
+        # A limit of the scope, or one that container root set inside.
+        self.assertEqual(
+            self.report(before, sandy.MemoryEvents(2, 2, 4)),
+            "W: The kernel ended 1 process in 'ai-dev' during this session because "
+            "memory ran out\n" + own,
+        )
+        # Both limits were reached during the session: name both.
+        self.assertEqual(
+            self.report(before, sandy.MemoryEvents(3, 2, 5)),
+            "W: The kernel ended 2 processes in 'ai-dev' during this session "
+            "because memory ran out\n" + shared + own,
+        )
+        self.assertEqual(
+            self.report(before, sandy.MemoryEvents(3, 1, 4)),
+            "W: The kernel ended 2 processes in 'ai-dev' during this session "
+            "because memory ran out\n"
+            "   The host ran out of memory\n",
+        )
+
+    def test_report_is_silent_without_new_kills_or_counters(self):
+        events = sandy.MemoryEvents(1, 1, 1)
+        for before, after in (
+            (events, events),
+            (events, sandy.MemoryEvents(1, 2, 2)),
+            # A new scope with the same name restarts the counters.
+            (sandy.MemoryEvents(5, 0, 0), sandy.MemoryEvents(0, 0, 0)),
+            (None, events),
+            (events, None),
+        ):
+            with self.subTest(before=before, after=after):
+                self.assertEqual(self.report(before, after), "")
+
+
+class UpdateCommandTests(unittest.TestCase):
+    """sandy update: validation, the systemctl call, and errors.
+
+    Mocks: host facts, the running check, systemctl queries, the subprocess
+    wrapper, and _set_shared_limits (SharedLimitTests cover it). E2E tests
+    prove the change of a running scope and of sandy.slice.
+    """
+
+    def start_patch(self, target: object, name: str, value: object) -> MagicMock:
+        patcher = patch.object(target, name, return_value=value)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def setUp(self):
+        self.read_host_facts = self.start_patch(sandy, "_read_host_facts", HOST_FACTS)
+        self.supervisor_unit_loaded = self.start_patch(
+            sandy, "_supervisor_unit_loaded", True
+        )
+        self.live = self.start_patch(sandy, "_read_live_group_limits", DEFAULT_GROUP)
+        self.systemctl = self.start_patch(sandy, "_run_secure_subprocess", None)
+        self.set_shared_limits = self.start_patch(
+            sandy.Sandy,
+            "_set_shared_limits",
+            (DEFAULT_GROUP, sandy.SavedGroupLimits()),
+        )
+        self.instance = make_sandy()
+        running = patch.object(self.instance, "_is_container_running", return_value="9")
+        self.running = running.start()
+        self.addCleanup(running.stop)
+
+    def update(self, **overrides):
+        values = {
+            "container": None,
+            "shared_limits": False,
+            "cpuset_cpus": None,
+            "memory": None,
+            "pids_limit": None,
+            "reset": False,
+        }
+        values.update(overrides)
+        with captured_output() as (stdout, _):
+            try:
+                self.instance.run_update(SimpleNamespace(**values))
+            except SystemExit as exc:
+                return exc.code, stdout.getvalue()
+        return 0, stdout.getvalue()
+
+    def test_update_sets_the_process_limit_of_the_running_scope(self):
+        for pids_limit, value in ((512, "512"), (-1, "infinity")):
+            with self.subTest(pids_limit=pids_limit):
+                self.systemctl.reset_mock()
+                status, output = self.update(pids_limit=pids_limit)
+                self.assertEqual(status, 0)
+                self.systemctl.assert_called_once_with(
+                    [
+                        "systemctl",
+                        "set-property",
+                        "--runtime",
+                        "sandy-ai-dev.scope",
+                        f"TasksMax={value}",
+                    ],
+                    check=True,
+                )
+                self.assertEqual(output, f"I: Updated 'ai-dev': TasksMax={value}\n")
+        self.set_shared_limits.assert_not_called()
+
+    def test_update_warns_above_the_shared_process_limit(self):
+        status, output = self.update(pids_limit=98305)
+        self.assertEqual(status, 0)
+        self.assertIn(
+            "W: --pids-limit 98305 is above the process limit that all Sandy "
+            "containers share (98304), which applies too\n",
+            output,
+        )
+        self.systemctl.assert_called_once()
+        # No warning without a shared process limit.
+        self.live.return_value = DEFAULT_GROUP._replace(tasks_max=None)
+        status, output = self.update(pids_limit=98305)
+        self.assertNotIn("W: ", output)
+
+    def test_update_rejects_before_any_change(self):
+        for overrides, message in (
+            ({}, "E: update needs --pids-limit, or --shared to change the limits"),
+            (
+                {"memory": GIB, "pids_limit": 5},
+                "E: --memory need --shared: a container has no CPU or memory limit "
+                "of its own",
+            ),
+            (
+                {"cpuset_cpus": (1,), "memory": GIB, "reset": True},
+                "E: --cpuset-cpus, --memory, --reset need --shared",
+            ),
+        ):
+            with self.subTest(overrides=overrides):
+                status, output = self.update(**overrides)
+                self.assertEqual(status, 1)
+                self.assertIn(message, output)
+        self.running.assert_not_called()
+        self.systemctl.assert_not_called()
+
+    def test_update_needs_a_running_container_and_its_scope(self):
+        self.running.return_value = None
+        status, output = self.update(pids_limit=100)
+        self.assertEqual(
+            (status, output), (1, "E: Container 'ai-dev' not found or not running\n")
+        )
+        self.running.return_value = "9"
+        self.supervisor_unit_loaded.return_value = False
+        status, output = self.update(pids_limit=100)
+        self.assertEqual(
+            (status, output), (1, "E: Unit 'sandy-ai-dev.scope' does not exist\n")
+        )
+        self.supervisor_unit_loaded.side_effect = subprocess.CalledProcessError(
+            1, ["systemctl"]
+        )
+        status, output = self.update(pids_limit=100)
+        self.assertEqual(status, 1)
+        self.assertIn("E: Could not query unit 'sandy-ai-dev.scope'", output)
+        self.supervisor_unit_loaded.side_effect = None
+        self.supervisor_unit_loaded.return_value = True
+        self.live.side_effect = ValueError("Malformed limits of sandy.slice")
+        status, output = self.update(pids_limit=100)
+        self.assertEqual(
+            (status, output),
+            (1, "E: Could not query sandy.slice: 'Malformed limits of sandy.slice'\n"),
+        )
+        self.systemctl.assert_not_called()
+
+    def test_update_reports_a_failed_change(self):
+        # Measured: set-property on a stopped scope fails and writes nothing.
+        self.systemctl.side_effect = subprocess.CalledProcessError(1, ["systemctl"])
+        status, output = self.update(pids_limit=100)
+        self.assertEqual(status, 1)
+        self.assertIn("E: Could not update 'sandy-ai-dev.scope'", output)
+
+    def test_update_shared_saves_and_sets_the_given_limits(self):
+        saved = sandy.SavedGroupLimits((0, 1), 8 * GIB, None)
+        self.set_shared_limits.return_value = (
+            sandy.GroupLimits((0, 1), 8 * GIB, 98304),
+            saved,
+        )
+        status, output = self.update(
+            shared_limits=True, cpuset_cpus=(0, 1), memory=8 * GIB
+        )
+        self.assertEqual(status, 0)
+        self.set_shared_limits.assert_called_once_with(
+            HOST_FACTS, {"cpus": (0, 1), "memory_max": 8 * GIB}, reset=False
+        )
+        self.assertEqual(
+            output,
+            "I: Limits of all Sandy containers: CPUs 0-1 (saved), memory 8.0 GiB "
+            "(saved), 98304 tasks\n",
+        )
+        # It needs no running container.
+        self.running.assert_not_called()
+        self.systemctl.assert_not_called()
+        self.set_shared_limits.reset_mock()
+        self.assertEqual(self.update(shared_limits=True, pids_limit=-1)[0], 0)
+        self.set_shared_limits.assert_called_once_with(
+            HOST_FACTS, {"tasks_max": -1}, reset=False
+        )
+        self.set_shared_limits.reset_mock()
+        self.assertEqual(self.update(shared_limits=True, reset=True)[0], 0)
+        self.set_shared_limits.assert_called_once_with(HOST_FACTS, {}, reset=True)
+
+    def test_update_shared_rejects_before_any_change(self):
+        for overrides, message in (
+            (
+                {"container": "ai-dev", "memory": GIB},
+                "E: update --shared cannot be used with --container",
+            ),
+            ({}, "E: update --shared needs at least one of --cpuset-cpus"),
+            (
+                {"reset": True, "pids_limit": 5},
+                "E: --reset cannot be used with --cpuset-cpus, --memory, or "
+                "--pids-limit",
+            ),
+            (
+                {"cpuset_cpus": (7, 8)},
+                "E: --cpuset-cpus must name online CPUs; the online CPUs are 0-7",
+            ),
+        ):
+            with self.subTest(overrides=overrides):
+                status, output = self.update(shared_limits=True, **overrides)
+                self.assertEqual(status, 1)
+                self.assertIn(message, output)
+        self.set_shared_limits.assert_not_called()
+        self.systemctl.assert_not_called()
+
+
+class SharedLimitTests(unittest.TestCase):
+    """The saved shared limits: lock, file, defaults, and the slice change.
+
+    The cache directory is a temporary directory: a patched
+    _open_verified_parent anchors the managed paths there. Mocks: the
+    systemctl query and change of sandy.slice. E2E tests prove the systemd
+    and kernel values.
+    """
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.cache = Path(self.tempdir.name)
+
+        def open_parent(path):
+            if os.path.dirname(path) != "/managed/sandy.__cache":
+                raise AssertionError(f"Unexpected managed path {path}")
+            return (
+                os.open(self.cache, sandy.DIRECTORY_OPEN_FLAGS),
+                os.path.basename(path),
+            )
+
+        self.events = []
+        self.live = DEFAULT_GROUP._replace(memory_max=None)
+        for patcher in (
+            patch.object(sandy, "_open_verified_parent", side_effect=open_parent),
+            patch.object(
+                sandy.Sandy, "_get_cache_dir", return_value="/managed/sandy.__cache"
+            ),
+            patch.object(sandy.Sandy, "_ensure_cache_dir"),
+            patch.object(
+                sandy,
+                "_read_live_group_limits",
+                side_effect=lambda: self.events.append("show") or self.live,
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        apply_patcher = patch.object(
+            sandy,
+            "_apply_group_limits",
+            side_effect=lambda group: self.events.append(("apply", group)),
+        )
+        self.apply = apply_patcher.start()
+        self.addCleanup(apply_patcher.stop)
+        self.instance = make_sandy()
+
+    @property
+    def saved_file(self) -> Path:
+        return self.cache / "shared_limits.json"
+
+    def set_limits(self, changes=None, reset=False):
+        with captured_output() as (stdout, _):
+            try:
+                result = self.instance._set_shared_limits(HOST_FACTS, changes, reset)
+            except SystemExit as exc:
+                return exc.code, stdout.getvalue()
+        return result, stdout.getvalue()
+
+    def test_defaults_without_a_saved_file(self):
+        result, output = self.set_limits()
+        self.assertEqual(result, (DEFAULT_GROUP, sandy.SavedGroupLimits()))
+        self.assertEqual(output, "")
+        self.assertEqual(self.events, ["show", ("apply", DEFAULT_GROUP)])
+        # up saves nothing; the lock inode stays.
+        self.assertFalse(self.saved_file.exists())
+        lock = self.cache / "shared_limits.lock"
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+
+    def test_a_slice_with_the_limits_is_not_changed(self):
+        self.live = DEFAULT_GROUP
+        result, _ = self.set_limits()
+        self.assertEqual(result, (DEFAULT_GROUP, sandy.SavedGroupLimits()))
+        self.assertEqual(self.events, ["show"])
+
+    def test_saved_values_replace_the_defaults(self):
+        self.saved_file.write_text('{"cpus":"0-1","tasks":-1,"unknown":1}\n')
+        self.saved_file.chmod(0o600)
+        result, _ = self.set_limits()
+        group = sandy.GroupLimits((0, 1), 12 * GIB, None)
+        self.assertEqual(result, (group, sandy.SavedGroupLimits((0, 1), None, -1)))
+        self.assertEqual(self.events, ["show", ("apply", group)])
+        # Reading does not rewrite the file.
+        self.assertIn("unknown", self.saved_file.read_text())
+
+    def recorded_write(self):
+        real_write = sandy._write
+        return patch.object(
+            sandy,
+            "_write",
+            side_effect=lambda *a, **k: self.events.append("write")
+            or real_write(*a, **k),
+        )
+
+    def test_changes_are_set_then_saved(self):
+        self.saved_file.write_text('{"cpus":"0-1"}\n')
+        self.saved_file.chmod(0o600)
+        with self.recorded_write():
+            result, output = self.set_limits({"memory_max": 0, "tasks_max": 4096})
+        group = sandy.GroupLimits((0, 1), None, 4096)
+        self.assertEqual(result, (group, sandy.SavedGroupLimits((0, 1), 0, 4096)))
+        self.assertEqual(output, "")
+        self.assertEqual(self.events, ["show", ("apply", group), "write"])
+        self.assertEqual(
+            self.saved_file.read_text(), '{"cpus":"0-1","memory":0,"tasks":4096}\n'
+        )
+        self.assertEqual(stat.S_IMODE(self.saved_file.stat().st_mode), 0o600)
+
+    def test_reset_saves_no_values_even_over_a_malformed_file(self):
+        self.saved_file.write_text("{")
+        self.saved_file.chmod(0o600)
+        result, _ = self.set_limits(reset=True)
+        self.assertEqual(result, (DEFAULT_GROUP, sandy.SavedGroupLimits()))
+        self.assertEqual(self.saved_file.read_text(), "{}\n")
+
+    def test_a_malformed_file_stops_before_any_change(self):
+        for text, message in (
+            ("{", "The saved shared limits are not valid JSON"),
+            ('{"cpus":"8-9"}', "The saved shared CPUs 8-9 are not all online"),
+        ):
+            with self.subTest(text=text):
+                self.events.clear()
+                self.saved_file.write_text(text)
+                self.saved_file.chmod(0o600)
+                for changes in (None, {"memory_max": 0}):
+                    status, output = self.set_limits(changes)
+                    self.assertEqual(status, 1)
+                    self.assertEqual(
+                        output,
+                        f"E: {message}. Reset them with: sandy update --shared "
+                        "--reset\n",
+                    )
+                self.assertEqual(self.events, [])
+                self.assertEqual(self.saved_file.read_text(), text)
+
+    def test_an_unsafe_saved_file_stops_before_any_change(self):
+        self.saved_file.write_text("{}\n")
+        self.saved_file.chmod(0o644)
+        status, output = self.set_limits()
+        self.assertEqual(status, 1)
+        self.assertIn("E: Could not read the saved shared limits: ", output)
+        self.assertIn("unsafe permissions", output)
+        self.assertEqual(self.events, [])
+
+    def test_a_failed_slice_change_saves_nothing(self):
+        for error in (
+            subprocess.CalledProcessError(1, ["systemctl"]),
+            OSError("no systemctl"),
+            ValueError("Malformed limits of sandy.slice"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.apply.side_effect = error
+                status, output = self.set_limits({"memory_max": 8 * GIB})
+                self.assertEqual(status, 1)
+                self.assertIn("E: Could not set the limits of sandy.slice: ", output)
+                self.assertFalse(self.saved_file.exists())
+
+    def test_a_failed_save_is_reported(self):
+        with patch.object(sandy, "_write", side_effect=OSError(errno.ENOSPC, "full")):
+            status, output = self.set_limits({"memory_max": 0})
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output,
+            "E: Could not save the shared limits: '[Errno 28] full'\n"
+            "   They apply now, but the next up sets the saved limits again\n",
+        )
+
+    def test_the_lock_is_held_from_the_read_to_the_save(self):
+        # Mocks: flock records its operations next to the other events.
+        real_flock = sandy.fcntl.flock
+
+        def flock(fd, operation):
+            self.events.append(("flock", operation))
+            return real_flock(fd, operation)
+
+        with patch.object(sandy.fcntl, "flock", side_effect=flock):
+            with self.recorded_write():
+                self.set_limits({"tasks_max": 64})
+        self.assertEqual(
+            [event if isinstance(event, str) else event[0] for event in self.events],
+            ["flock", "show", "apply", "write", "flock"],
+        )
+        self.assertEqual(self.events[0], ("flock", sandy.fcntl.LOCK_EX))
+        self.assertEqual(self.events[-1], ("flock", sandy.fcntl.LOCK_UN))
 
 
 if __name__ == "__main__":

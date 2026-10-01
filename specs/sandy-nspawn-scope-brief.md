@@ -118,7 +118,9 @@ Conclusions:
    value `infinity` (`max` in cgroupfs), as today. A later sandy option can set
    a memory limit on the container unit. With a limit, the kernel kills a
    process inside the unit before the host runs out of memory. The option would
-   address item 2 of `security-parity.md` (see Related work).
+   address item 2 of `security-parity.md` (see Related work). Superseded by
+   that item: all containers now share the memory limit of `sandy.slice` by
+   default (the host keeps a reserve), and no container gets swap.
 5. Each attach (`sandy -c <name> bash` and `exec`) runs inside the container's
    unit, not in the terminal's scope. Its memory counts against the container
    unit, and against the limit when one is set. An OOM in one attach must not
@@ -133,7 +135,10 @@ Conclusions:
    bounding set. This includes `-u root`. Step 1 (see Implementation order)
    delivers this before the console becomes an attach.
 9. Resource defaults stay as today: `TasksMax=16384`, `MemoryMax=infinity`,
-   `MemorySwapMax=infinity`, and no CPU quota.
+   `MemorySwapMax=infinity`, and no CPU quota. Superseded by
+   `security-parity.md` item 2: by default, shared CPU, memory, and process
+   limits on `sandy.slice`, and for each container a process limit, a `/tmp`
+   size, and no swap.
 
 ## Tool facts (systemd 255, verified in the test VM unless noted)
 
@@ -397,7 +402,11 @@ systemd-run --scope --quiet --unit=sandy-<name>.scope --slice=system.slice \
   must set `-p TasksMax=16384` explicitly. The memory and CPU defaults already
   match.
 - A later sandy option can add `-p MemoryMax=`, `-p MemorySwapMax=`, and other
-  limits (Requirement 4). The default passes none.
+  limits (Requirement 4). The default passes none. `security-parity.md` item
+  2 later moved the scopes to `sandy.slice`, which holds the limits that all
+  containers share, and set a process limit and no swap on each scope. The
+  scope cgroups in this brief are then below `/sys/fs/cgroup/sandy.slice`,
+  not `/sys/fs/cgroup/system.slice`.
 
 - Start it through `_run_secure_subprocess_popen` with `pass_fds`,
   `start_new_session=True`, and stdin, stdout, and stderr on `/dev/null`, for
@@ -655,7 +664,8 @@ Rejected alternatives:
   With this design, a later option puts the limits on the `systemd-run --scope`
   unit. This change keeps the defaults unlimited, so it does not close item 2.
   The item's other points (validated CLI options, `size=` on the `/tmp`
-  tmpfs) still apply.
+  tmpfs) still apply. Item 2 was later fixed with shared limits on
+  `sandy.slice` and limits on each scope.
 - **"PTY and signal behavior".** It records the orphan behavior of test 5 and
   says to fix it separately. The `cgroup.kill` cleanup of each attach cgroup is
   that fix.
@@ -945,7 +955,8 @@ with at least two images: the default (Debian trixie) and Ubuntu 26.04
 Open questions:
 
 - A later change: CLI options for `MemoryMax=`, `MemorySwapMax=`, `TasksMax=`,
-  and `CPUQuota=`. Defaults stay as today.
+  and `CPUQuota=`. Defaults stay as today. Done in `security-parity.md` item
+  2, with shared limits on `sandy.slice` by default.
 - A later change: `NoNewPrivs=1` on all paths.
 - A later change: `rm --network` without a bridge. `run_rm` constructs
   `SandyNet()` before the running-container check and the confirmation. With

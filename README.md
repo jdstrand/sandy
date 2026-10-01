@@ -138,6 +138,9 @@ $ sudo /path/to/sandy [GLOBAL OPTIONS] [COMMAND] [COMMAND OPTIONS]
     (default `lenient`).
   - `--port proto:host:container` forwards 127.0.0.1 traffic (e.g., `--port
     tcp:8080:80`). Multiple flags allowed.
+  - `--pids-limit N`, `--tmp-size SIZE`, and `--oom-score-adj N` set limits
+    of this container, with the names and units of `docker run` and `podman
+    run`. See "Resource limits" below.
 - `down` - Stop the container
 - `rm` - Remove containers, cache, or network artifacts. Accepts `--all`,
   `--force`, `--cache`, `--network`.
@@ -149,7 +152,11 @@ $ sudo /path/to/sandy [GLOBAL OPTIONS] [COMMAND] [COMMAND OPTIONS]
 `bash` and `exec` attach to a container that `up` started. They run with the
 same seccomp filters and capability bounding set as the container itself, also
 with `-u root` (see "Attached sessions" below).
-- `status` - Show `machinectl status` for the container.
+- `status` - Show `machinectl status` for the container and its OOM kills.
+- `update` - Change resource limits, as `docker update` does.
+  `update --pids-limit N` changes the process limit of a running container
+  until it stops. `update --shared` changes the limits that all containers
+  share. See "Resource limits" below.
 - `list` - Enumerate managed containers and their paths under
   `/var/lib/machines`.
 
@@ -165,7 +172,9 @@ Port mapping state uses a persistent `0600` coordination lock in
 `/var/lib/machines/sandy.__cache`. Once created, `rm --cache` retains that
 empty lock and its directory so concurrent Sandy processes always coordinate
 on the same inode; it contains no port mappings or cache payload. The
-`lifecycle.lock` file in the same directory is retained in the same way.
+`lifecycle.lock` and `shared_limits.lock` files in the same directory are
+retained in the same way. `rm --cache` also keeps `shared_limits.json`, the
+shared limits that `update --shared` saved.
 
 
 ## Security
@@ -248,12 +257,12 @@ Differences from earlier versions:
 ### Container scope and session lifecycle
 
 `up` starts `systemd-nspawn` in its own transient systemd scope,
-`sandy-<name>.scope` in `system.slice`, with no terminal and in its own
+`sandy-<name>.scope` in `sandy.slice`, with no terminal and in its own
 session. Because of this, the container keeps running when the terminal
 closes, or when systemd stops the terminal's scope (for example, after an OOM
-kill in that scope). The scope has the same resource defaults
-as the machine scopes that `machinectl` creates: `TasksMax=16384`, and no
-memory or CPU limit. On systemd 253 or later it also has
+kill in that scope). The scope holds the process limit of the container, and
+`sandy.slice` holds the limits that all containers share (see "Resource
+limits" below). On systemd 253 or later the scope also has
 `OOMPolicy=continue`, so that an OOM kill of one process does not stop the
 container. `up` fails if a unit with the scope's name already exists.
 
@@ -342,9 +351,84 @@ gone (for example, after a host reboot), `sandy` removes the state and the
 nftables rules. The iptables rules need the address of the bridge, so any that
 remain are removed by the next bridge setup or by `rm --network`.
 
-Containers started by earlier versions of `sandy` are not in a
-`sandy-<name>.scope`. `bash` and `exec` refuse to attach to them; stop them
-with `down` and start them again with `up`.
+Containers that earlier versions of `sandy` started are not in a
+`sandy-<name>.scope` in `sandy.slice`. `bash` and `exec` refuse to attach to
+them; stop them with `down` and start them again with `up`.
+
+### Resource limits
+
+Sandy constrains AI agents, so it sets limits by default. The design is
+similar in concept to the `kubepods` cgroup of Kubernetes: all containers
+run in one shared cgroup, `sandy.slice`, and the host keeps a reserve
+outside of it. Each container is a scope in the slice, with settings of its
+own inside the shared limits. A process that grows past the shared memory is
+killed inside the containers, not on the host.
+
+The flags have the names and units of `docker run` and `podman run`. Sizes
+are a number with an optional unit `b`, `k`, `m`, or `g` (powers of 1024),
+such as `8g`.
+
+| Limit | Default | Change it with |
+| --- | --- | --- |
+| CPUs (shared) | all online CPUs except the lowest-numbered ones, which the host keeps: 1 CPU, 2 CPUs from 8, and 4 CPUs from 16 | `update --shared --cpuset-cpus LIST` |
+| Memory (shared) | the host keeps 25% of its memory, at least 4 GiB, never more than half | `update --shared -m SIZE` (`0`: no limit) |
+| Processes (shared) | the same share of the system task limit | `update --shared --pids-limit N` (`-1`: no limit) |
+| Processes (per container) | 25% of the shared process limit, at least 8192, never more than half of it | `up --pids-limit N`, `update --pids-limit N` (`-1`: no limit of its own) |
+| `/tmp` (per container) | 512 MiB | `up --tmp-size SIZE` (`0`: the tmpfs default, half of the host memory) |
+| Swap | none | - |
+| OOM score adjustment (per container) | the value of the `sandy` process | `up --oom-score-adj N` |
+
+Examples of the defaults: a host with 4 GiB of memory shares 2 GiB with the
+containers, 8 GiB shares 4 GiB, 16 GiB shares 12 GiB, and 64 GiB shares 48
+GiB. The system task limit is the smaller of `kernel.threads-max` and
+`kernel.pid_max`; `threads-max` grows with the memory. With 16 GiB of memory
+it is about 131072, so the containers share about 98304 tasks, and each
+container gets about 24576 by default. `up` prints the limits of all
+containers and of the new container, and warns when `--pids-limit` is above
+the shared process limit or `/tmp` is larger than the shared memory.
+
+Files in `/tmp` use memory and count against the shared memory. A full
+`/tmp` gives "No space left on device" only when it is smaller than the
+memory that is free; a larger `/tmp` can make the kernel end processes
+instead.
+
+`sudo sandy update --shared [--cpuset-cpus LIST] [-m SIZE] [--pids-limit N]`
+changes the shared limits, with or without running containers. The new
+limits apply at once, also to running containers, and `sandy` saves them in
+`shared_limits.json` in the cache directory. Each `up` sets the saved limits
+(otherwise the defaults) on `sandy.slice` again, so they also apply after a
+reboot or an outside change. `update --shared --reset` forgets the saved
+limits and sets the defaults. `--cpuset-cpus` takes CPU numbers and ranges,
+such as `4-15` or `0,2,4-7`, of online CPUs. A lower memory limit than the
+containers use now makes the kernel end processes at once. A malformed
+`shared_limits.json` stops `up` until `update --shared --reset`.
+
+`sudo sandy -c NAME update --pids-limit N` changes the process limit of a
+running container. The change ends with the container; the next `up` uses
+its own flags. A container has no CPU or memory limit of its own.
+
+When the shared memory runs out, the kernel ends the process with the
+highest score in `sandy.slice`. The score is the memory use of the process
+plus its OOM score adjustment times the shared memory / 1000 (when the host
+has swap, the kernel adds the swap size to the shared memory). So with 12
+GiB of shared memory and no swap, `--oom-score-adj -500` subtracts 6 GiB
+from the score of each process of the container. Use it to protect a
+long-running container, such as a chat session with an agent, from a build
+in another container. Or give positive values to the containers that may
+die first. The values are
+from -999 to 1000; `-1000` (never kill) is not allowed. The container and
+each `bash` and `exec` session get the value. Processes in the container,
+also container root, cannot set a lower value. The value also applies when
+the host runs out of memory; the kernel then prefers to end host processes
+before a protected container.
+
+Processes in a container see the shared CPUs, for example with `nproc`.
+They do not see the memory or process limits: `/proc/meminfo` shows the
+host memory. When the kernel ends processes of a container because memory
+ran out, the `up` console, `bash`, and `exec` report it when the session
+ends: the limit that the containers share, a memory limit of the container
+itself (Sandy sets none, but container root can set one in its own cgroups),
+or the memory of the host. `status` shows the counts.
 
 As mentioned above, `sandy` was written with security in mind with the goal of
 creating a strong sandbox for AI agents, but it should be understood there may
@@ -392,9 +476,10 @@ make check LANGUAGE_CHECKER=/path/to/language-checker
 The end-to-end suite exercises the real root-only container, cache,
 `systemd-nspawn`, mount, network, firewall, and cleanup paths. Run it only in a
 disposable Linux VM. It creates and removes `/var/lib/machines/sandy.*`,
-`sandybr0`, Sandy firewall rules and caches, and temporarily changes
-`net.ipv4.ip_forward`. The runner refuses to start if it detects pre-existing
-Sandy machine, bridge, or firewall state.
+`sandybr0`, Sandy firewall rules and caches, and the state of `sandy.slice`,
+and temporarily changes `net.ipv4.ip_forward`. The runner refuses to start if
+it detects pre-existing Sandy machine, bridge, firewall, or `sandy.slice`
+state.
 
 Ubuntu 24.04 (Noble) is the minimum tested guest. The VM must support nested
 `systemd-nspawn` containers and user namespaces, have outbound DNS, HTTP, and

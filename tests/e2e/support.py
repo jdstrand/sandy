@@ -39,8 +39,16 @@ CACHE_DIR = SYSTEMD_MACHINES / "sandy.__cache"
 PORT_STATE = CACHE_DIR / "port_mappings.json"
 PORT_LOCK = CACHE_DIR / "port_mappings.lock"
 LIFECYCLE_LOCK = CACHE_DIR / "lifecycle.lock"
+SHARED_LIMITS = CACHE_DIR / "shared_limits.json"
+SHARED_LIMITS_LOCK = CACHE_DIR / "shared_limits.lock"
 # Product code never removes these stable lock inodes.
-PERSISTENT_LOCKS = (PORT_LOCK, LIFECYCLE_LOCK)
+PERSISTENT_LOCKS = (PORT_LOCK, LIFECYCLE_LOCK, SHARED_LIMITS_LOCK)
+# Nor the saved shared limits, which are configuration (rm --cache keeps them).
+PERSISTENT_FILES = (*PERSISTENT_LOCKS, SHARED_LIMITS)
+# All Sandy containers run in this slice, which holds their shared limits.
+SLICE = "sandy.slice"
+SLICE_CGROUP = Path("/sys/fs/cgroup") / SLICE
+SLICE_STATE_PROPERTIES = ("ActiveState", "FragmentPath", "DropInPaths")
 BRIDGE_NAME = "sandybr0"
 NAME_PATTERN = re.compile(r"^e2e-[a-z0-9-]{1,48}$")
 DEFAULT_TIMEOUT = 120
@@ -428,6 +436,11 @@ class E2EContext:
             raise E2EFailure(f"Refusing to use existing bridge {BRIDGE_NAME}")
         if self._sandy_firewall_exists():
             raise E2EFailure("Refusing to use pre-existing Sandy firewall state")
+        slice_state = self.slice_artifacts()
+        if slice_state:
+            raise E2EFailure(
+                f"Refusing to use pre-existing {SLICE} state: " + ", ".join(slice_state)
+            )
 
         ip_forward = self.run(["sysctl", "-n", "net.ipv4.ip_forward"]).stdout.strip()
         if ip_forward not in {"0", "1"}:
@@ -497,6 +510,55 @@ class E2EContext:
         artifacts = self.sandy_state_artifacts()
         if artifacts:
             raise E2EFailure("Sandy state remains: " + ", ".join(artifacts))
+
+    def slice_artifacts(self) -> list[str]:
+        """Return the state of sandy.slice: active, a unit file, or drop-ins.
+
+        A slice without state is inactive, with no unit file, no drop-ins,
+        and no cgroup. systemctl set-property creates the cgroup of an
+        inactive slice (measured on systemd 249, 255, and 257).
+        """
+        command = ["systemctl", "show", SLICE]
+        for name in SLICE_STATE_PROPERTIES:
+            command.extend(["-p", name])
+        values = {}
+        for line in self.run(command).stdout.splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name in SLICE_STATE_PROPERTIES:
+                values[name] = value
+        if set(values) != set(SLICE_STATE_PROPERTIES):
+            raise E2EFailure(f"Unexpected systemctl show output for {SLICE}")
+        artifacts = []
+        if values["ActiveState"] != "inactive":
+            artifacts.append(f"{SLICE} is {values['ActiveState']}")
+        if values["FragmentPath"]:
+            artifacts.append(f"{SLICE} unit file {values['FragmentPath']}")
+        if values["DropInPaths"]:
+            artifacts.append(f"{SLICE} drop-ins {values['DropInPaths']}")
+        if SLICE_CGROUP.exists():
+            artifacts.append(f"cgroup {SLICE_CGROUP}")
+        return artifacts
+
+    def remove_shared_slice(self) -> None:
+        """Revert and stop sandy.slice once no process of the run is in it.
+
+        Preflight proved that the slice had no state, so its state belongs to
+        this run. A stop would also stop the units in the slice, so the slice
+        must be empty.
+        """
+        if not self.slice_artifacts():
+            return
+        events = SLICE_CGROUP / "cgroup.events"
+        if (
+            events.exists()
+            and "populated 0" not in events.read_text(encoding="ascii").splitlines()
+        ):
+            raise E2EFailure(f"Refusing to stop {SLICE}: it still has processes")
+        self.run(["systemctl", "revert", SLICE])
+        self.run(["systemctl", "stop", SLICE])
+        remaining = self.slice_artifacts()
+        if remaining:
+            raise E2EFailure(f"{SLICE} state remains: " + ", ".join(remaining))
 
     def _filesystem_fixture_paths(self) -> tuple[Path, ...]:
         return (
@@ -1097,15 +1159,15 @@ class E2EContext:
     def purge_cache(self) -> None:
         if CACHE_DIR.exists():
             self.sandy(["rm", "--cache", "--force"])
-        for lock in PERSISTENT_LOCKS:
-            if lock.exists() or lock.is_symlink():
-                if not self._persistent_lock_is_safe(lock):
-                    raise E2EFailure(f"Unsafe persistent lock: {lock}")
-                # Product code never removes this stable inode because a
-                # waiter could still hold it. The harness owns the
-                # otherwise-clean VM and removes it only after all Sandy
-                # operations have stopped.
-                lock.unlink()
+        for path in PERSISTENT_FILES:
+            if path.exists() or path.is_symlink():
+                if not self._persistent_lock_is_safe(path):
+                    raise E2EFailure(f"Unsafe persistent file: {path}")
+                # Product code never removes a stable lock inode because a
+                # waiter could still hold it, nor the saved shared limits.
+                # The harness owns the otherwise-clean VM and removes them
+                # only after all Sandy operations have stopped.
+                path.unlink()
         if CACHE_DIR.exists() and not any(CACHE_DIR.iterdir()):
             CACHE_DIR.rmdir()
         if CACHE_DIR.exists():
@@ -1123,7 +1185,7 @@ class E2EContext:
         )
 
     def _persistent_lock_is_safe(self, lock: Path) -> bool:
-        """Return whether a persistent lock has its exact safe metadata."""
+        """Return whether a persistent lock or file has its exact safe metadata."""
         if not lock.exists() or lock.is_symlink():
             return False
         lock_stat = lock.lstat()
@@ -1231,6 +1293,11 @@ class E2EContext:
                 self.purge_cache()
             except Exception as exc:
                 errors.append(f"cache: {exc}")
+
+            try:
+                self.remove_shared_slice()
+            except Exception as exc:
+                errors.append(f"{SLICE}: {exc}")
 
             if self._ip_forward_original is not None:
                 try:

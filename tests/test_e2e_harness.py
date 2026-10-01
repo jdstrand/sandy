@@ -12,11 +12,12 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+from tests.e2e import support
 from tests.e2e.support import (
     ACL_PROMPT_ANSWERS,
     CONTAINER_USER_ID,
@@ -68,6 +69,7 @@ class CleanupProbeContext(E2EContext):
         self.bridge_checks = 0
         self.firewall_checks = 0
         self.cache_purges = 0
+        self.slice_removals = 0
         self.state_checks = 0
         self.sandy_calls: list[list[str]] = []
 
@@ -97,6 +99,9 @@ class CleanupProbeContext(E2EContext):
 
     def purge_cache(self) -> None:
         self.cache_purges += 1
+
+    def remove_shared_slice(self) -> None:
+        self.slice_removals += 1
 
     def assert_no_sandy_state(self) -> None:
         self.state_checks += 1
@@ -159,6 +164,7 @@ class CleanupOwnershipTests(unittest.TestCase):
             self.assertEqual(context.firewall_checks, 0)
             self.assertEqual(context.sandy_calls, [])
             self.assertEqual(context.cache_purges, 0)
+            self.assertEqual(context.slice_removals, 0)
             self.assertEqual(context.state_checks, 0)
 
     def test_successful_preflight_cleanup_verifies_owned_host_state(self):
@@ -172,6 +178,7 @@ class CleanupOwnershipTests(unittest.TestCase):
             self.assertFalse(root.exists())
             self.assertEqual(context.bridge_checks, 1)
             self.assertEqual(context.cache_purges, 1)
+            self.assertEqual(context.slice_removals, 1)
             self.assertEqual(context.state_checks, 1)
 
     def test_cleanup_removes_the_network_when_the_bridge_or_firewall_remains(self):
@@ -361,6 +368,188 @@ class CleanupOwnershipTests(unittest.TestCase):
                     )
 
             self.assertFalse(context.filesystem_image_root.exists())
+
+
+class SliceProbeContext(CleanupProbeContext):
+    """Record each command; return queued output for systemctl show."""
+
+    def __init__(self, root: Path, *, host_state_owned: bool = True) -> None:
+        super().__init__(root, host_state_owned=host_state_owned)
+        self.commands: list[list[str]] = []
+        self.shows: list[str] = []
+        self.on_stop: Callable[[], None] | None = None
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        expected: int | None = 0,
+        timeout: int = DEFAULT_TIMEOUT,
+        environment: Mapping[str, str] | None = None,
+        input_text: str | None = None,
+        cwd: Path | None = None,
+    ) -> CommandResult:
+        del expected, timeout, environment, input_text, cwd
+        self.commands.append(list(command))
+        if command[1] == "stop" and self.on_stop is not None:
+            self.on_stop()
+        stdout = self.shows.pop(0) if command[1] == "show" else ""
+        return CommandResult(tuple(command), 0, stdout, "")
+
+
+class SharedLimitStateTests(unittest.TestCase):
+    """sandy.slice and the saved shared limits in preflight and cleanup.
+
+    Mocks: systemctl output, the slice cgroup (a temporary path), and the
+    cache paths (a temporary directory). The tests call the real E2EContext
+    methods that the probe replaces. E2E runs prove the real state.
+    """
+
+    SHOW = [
+        "systemctl",
+        "show",
+        "sandy.slice",
+        "-p",
+        "ActiveState",
+        "-p",
+        "FragmentPath",
+        "-p",
+        "DropInPaths",
+    ]
+
+    @staticmethod
+    def show(active="inactive", fragment="", dropins=""):
+        return f"ActiveState={active}\nFragmentPath={fragment}\nDropInPaths={dropins}\n"
+
+    def test_slice_artifacts(self):
+        with tempfile.TemporaryDirectory() as parent:
+            cgroup = Path(parent) / "sandy.slice"
+            with patch.object(support, "SLICE_CGROUP", cgroup):
+                context = SliceProbeContext(Path(parent))
+                context.shows = [self.show()]
+                self.assertEqual(context.slice_artifacts(), [])
+                self.assertEqual(context.commands, [self.SHOW])
+                cgroup.mkdir()
+                dropin = "/run/systemd/system.control/sandy.slice.d/50-TasksMax.conf"
+                context.shows = [
+                    self.show("active", "/etc/systemd/system/sandy.slice", dropin)
+                ]
+                self.assertEqual(
+                    context.slice_artifacts(),
+                    [
+                        "sandy.slice is active",
+                        "sandy.slice unit file /etc/systemd/system/sandy.slice",
+                        f"sandy.slice drop-ins {dropin}",
+                        f"cgroup {cgroup}",
+                    ],
+                )
+                context.shows = ["ActiveState=inactive\n"]
+                with self.assertRaisesRegex(E2EFailure, "Unexpected systemctl show"):
+                    context.slice_artifacts()
+
+    def test_remove_shared_slice_reverts_and_stops_an_empty_slice(self):
+        with tempfile.TemporaryDirectory() as parent:
+            cgroup = Path(parent) / "sandy.slice"
+            events = cgroup / "cgroup.events"
+            with patch.object(support, "SLICE_CGROUP", cgroup):
+                context = SliceProbeContext(Path(parent))
+                # No state: nothing to do.
+                context.shows = [self.show()]
+                E2EContext.remove_shared_slice(context)
+                self.assertEqual(context.commands, [self.SHOW])
+                # A slice with processes is never stopped.
+                cgroup.mkdir()
+                events.write_text("populated 1\nfrozen 0\n", encoding="ascii")
+                context.commands.clear()
+                context.shows = [self.show("active")]
+                with self.assertRaisesRegex(E2EFailure, "still has processes"):
+                    E2EContext.remove_shared_slice(context)
+                self.assertEqual(context.commands, [self.SHOW])
+                # An empty slice: revert, stop, and verify.
+                events.write_text("populated 0\nfrozen 0\n", encoding="ascii")
+                context.commands.clear()
+                context.shows = [self.show("active", dropins="x.conf"), self.show()]
+
+                def remove_cgroup() -> None:
+                    events.unlink()
+                    cgroup.rmdir()
+
+                context.on_stop = remove_cgroup
+                E2EContext.remove_shared_slice(context)
+                self.assertEqual(
+                    context.commands,
+                    [
+                        self.SHOW,
+                        ["systemctl", "revert", "sandy.slice"],
+                        ["systemctl", "stop", "sandy.slice"],
+                        self.SHOW,
+                    ],
+                )
+                # State that remains after the stop is an error.
+                context.on_stop = None
+                context.shows = [self.show("active"), self.show("active")]
+                with self.assertRaisesRegex(E2EFailure, "sandy.slice state remains"):
+                    E2EContext.remove_shared_slice(context)
+
+    def test_preflight_refuses_a_pre_existing_slice(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            machines = root / "machines"
+            machines.mkdir()
+            context = SliceProbeContext(root / "run", host_state_owned=False)
+            context.filesystem_machine_link = machines / "sandy.e2e-filesystem-x"
+            context.filesystem_image_root = root / "missing-image"
+            context.filesystem_host_target = root / "missing-host"
+            with patch.object(support.os, "getuid", return_value=0), patch.dict(
+                support.os.environ, {"SANDY_E2E": "1"}
+            ), patch.object(support, "SYSTEMD_MACHINES", machines), patch.object(
+                support, "INSTALL_DIR", root / "missing-install"
+            ), patch.object(
+                support.shutil, "which", return_value="/usr/bin/tool"
+            ), patch.object(
+                context, "slice_artifacts", return_value=["sandy.slice is active"]
+            ):
+                with self.assertRaisesRegex(
+                    E2EFailure,
+                    "Refusing to use pre-existing sandy.slice state: sandy.slice is "
+                    "active",
+                ):
+                    context.preflight()
+            # The run owns no host state, so cleanup leaves the slice alone.
+            self.assertFalse(context._host_state_owned)
+            self.assertEqual(context.commands, [])
+
+    def test_purge_cache_removes_the_saved_limits_and_the_locks(self):
+        with tempfile.TemporaryDirectory() as parent:
+            cache = Path(parent) / "sandy.__cache"
+            cache.mkdir()
+            files = tuple(
+                cache / name
+                for name in (
+                    "port_mappings.lock",
+                    "lifecycle.lock",
+                    "shared_limits.lock",
+                    "shared_limits.json",
+                )
+            )
+            for path in files:
+                path.write_text("", encoding="ascii")
+            context = SliceProbeContext(Path(parent))
+            with patch.object(support, "CACHE_DIR", cache), patch.object(
+                support, "PERSISTENT_FILES", files
+            ), patch.object(context, "_persistent_lock_is_safe", return_value=True):
+                E2EContext.purge_cache(context)
+                self.assertEqual(context.sandy_calls, [["rm", "--cache", "--force"]])
+                self.assertFalse(cache.exists())
+                # An unsafe file stops the purge.
+                cache.mkdir()
+                files[3].write_text("{}\n", encoding="ascii")
+                with patch.object(
+                    context, "_persistent_lock_is_safe", return_value=False
+                ):
+                    with self.assertRaisesRegex(E2EFailure, "Unsafe persistent file"):
+                        E2EContext.purge_cache(context)
+                self.assertTrue(files[3].exists())
 
 
 class FilesystemMountTrackingTests(unittest.TestCase):
@@ -590,15 +779,17 @@ class LeaderHoldTests(unittest.TestCase):
 
     def test_open_scope_process_accepts_only_the_scope(self):
         for cgroup in (
-            "0::/system.slice/sandy-e2e-main-1.scope\n",
-            "0::/system.slice/sandy-e2e-main-1.scope/payload\n",
+            "0::/sandy.slice/sandy-e2e-main-1.scope\n",
+            "0::/sandy.slice/sandy-e2e-main-1.scope/payload\n",
         ):
             with self.subTest(cgroup=cgroup):
                 pidfd, read_fd = self.open_with_cgroup(cgroup)
                 self.assertEqual(pidfd, read_fd)
                 os.close(pidfd)
         for cgroup in (
-            "0::/system.slice/sandy-e2e-main-10.scope/payload\n",
+            "0::/sandy.slice/sandy-e2e-main-10.scope/payload\n",
+            # The scope of an earlier Sandy, outside the shared slice.
+            "0::/system.slice/sandy-e2e-main-1.scope/payload\n",
             "0::/system.slice/ssh.service\n",
             "0::/\n",
         ):
@@ -609,7 +800,7 @@ class LeaderHoldTests(unittest.TestCase):
     def test_open_scope_process_rejects_an_exited_process(self):
         with self.assertRaisesRegex(E2EFailure, "exited"):
             self.open_with_cgroup(
-                "0::/system.slice/sandy-e2e-main-1.scope/payload\n", exited=True
+                "0::/sandy.slice/sandy-e2e-main-1.scope/payload\n", exited=True
             )
 
     def test_machined_leader_parses_the_state_file(self):
