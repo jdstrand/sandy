@@ -55,12 +55,31 @@ DEFAULT_TIMEOUT = 120
 BUILD_TIMEOUT = 1800
 FULL_BUILD_TIMEOUT = 7200
 OUTPUT_TAIL_LENGTH = 12000
-CONTAINER_USER_ID = 1000
-# On systemd < 250 sandy grants workspace access with ACLs. It needs SUDO_UID
-# (the invoking user, who owns the workspace) and asks once for each of the
-# workspace and shared directories, as it does for a real `sudo sandy up`.
-# No other prompt can appear during `up`.
-ACL_PROMPT_ANSWERS = "y\ny\n"
+# The workspace and shared directories belong to a host user whose uid is not
+# the uid of the container user: Sandy maps the owner of each directory to the
+# image user (see README.md, "Workspace and shared directories"). The uid and
+# the gid are both SANDY_E2E_HOST_UID; the default is 1000, the uid of the
+# first user of many hosts. On the Ubuntu 26.04 image uid 1000 is `ubuntu`, and
+# the container user is 1001.
+HOST_UID_VARIABLE = "SANDY_E2E_HOST_UID"
+DEFAULT_HOST_UID = 1000
+HOST_UID_MAX = 60000
+HOST_UID_PATTERN = re.compile(r"[1-9][0-9]{0,4}")
+# SANDY_E2E_BASE_IMAGE selects the base image of every build (Sandy reads it as
+# SANDY_BOOTSTRAP_BASE), such as ubuntu:26.04. Unset: Sandy's default image.
+BASE_IMAGE_VARIABLE = "SANDY_E2E_BASE_IMAGE"
+BASE_IMAGE_PATTERN = re.compile(
+    r"[a-z0-9][a-z0-9._/-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+)
+# Scratch file systems that a case mounts on a directory of its run root.
+SCRATCH_FILESYSTEMS = ("ramfs", "tmpfs")
+MOUNTINFO = Path("/proc/self/mountinfo")
+# up makes a private directory for each of its two binds, in /tmp, and removes
+# it when it ends. One remains when a case kills an up that runs in the
+# background. sandy gets no TMPDIR from the E2E environment.
+UP_TEMPORARY_ROOT = Path("/tmp")
+UP_TEMPORARY_PATTERNS = ("sandy-keepalive-*", "sandy-init-*")
+MOUNTINFO_ESCAPE = re.compile(r"\\([0-7]{3})")
 HOST_SECRET_NAME = "SANDY_HOST_SECRET"
 HOST_SECRET_VALUE = "must-not-enter-container"
 DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -146,6 +165,61 @@ def assert_not_contains(result: CommandResult, unexpected: str) -> None:
         )
 
 
+def up_temporary_directories() -> list[Path]:
+    """Return the directories that up made for its binds, sorted."""
+    return sorted(
+        path
+        for pattern in UP_TEMPORARY_PATTERNS
+        for path in UP_TEMPORARY_ROOT.glob(pattern)
+    )
+
+
+def parse_mountinfo(text: str) -> list[tuple[str, frozenset[str]]]:
+    """Return the mount point and the mount options of each mountinfo line.
+
+    The kernel writes a space, a tab, a newline, and a backslash in a mount
+    point as an octal escape, such as \\040. A line that is too short is skipped.
+    """
+    mounts = []
+    for line in text.replace("\r", "").splitlines():
+        fields = line.split(" ")
+        if len(fields) < 6:
+            continue
+        mount_point = MOUNTINFO_ESCAPE.sub(
+            lambda match: chr(int(match[1], 8)), fields[4]
+        )
+        mounts.append((mount_point, frozenset(fields[5].split(","))))
+    return mounts
+
+
+def parse_host_uid(value: str | None) -> int:
+    """Return the uid and gid of the host user from SANDY_E2E_HOST_UID.
+
+    Only decimal digits without a leading zero are valid, from 1 to
+    HOST_UID_MAX. Unset gives the default.
+    """
+    if value is None:
+        return DEFAULT_HOST_UID
+    if not HOST_UID_PATTERN.fullmatch(value) or int(value) > HOST_UID_MAX:
+        raise E2EFailure(
+            f"Invalid {HOST_UID_VARIABLE} {value!r}: use a number from 1 to "
+            f"{HOST_UID_MAX}"
+        )
+    return int(value)
+
+
+def parse_base_image(value: str | None) -> str | None:
+    """Return the base image from SANDY_E2E_BASE_IMAGE; None when unset."""
+    if value is None:
+        return None
+    if not BASE_IMAGE_PATTERN.fullmatch(value):
+        raise E2EFailure(
+            f"Invalid {BASE_IMAGE_VARIABLE} {value!r}: use NAME:TAG, such as "
+            "ubuntu:26.04"
+        )
+    return value
+
+
 class E2EContext:
     """Own all mutable state created by one end-to-end run."""
 
@@ -158,6 +232,7 @@ class E2EContext:
         self.full_name = f"e2e-full-{suffix}"
         self.scope_name = f"e2e-scope-{suffix}"
         self.other_name = f"e2e-other-{suffix}"
+        self.mounts_name = f"e2e-mounts-{suffix}"
         self.nft_name = f"e2e-nft-{suffix}"
         self.nft_other_name = f"e2e-nft-other-{suffix}"
         self.cache_user = "developer"
@@ -165,6 +240,9 @@ class E2EContext:
         self.main_user = "developer"
         self.full_user = "developer"
         self._validate_names()
+        # Validate the environment before anything is created.
+        self.host_uid = parse_host_uid(os.environ.get(HOST_UID_VARIABLE))
+        self.base_image = parse_base_image(os.environ.get(BASE_IMAGE_VARIABLE))
 
         self.root = Path(tempfile.mkdtemp(prefix="sandy-e2e-", dir="/tmp"))
         os.chmod(self.root, 0o755)
@@ -173,7 +251,7 @@ class E2EContext:
         self.workspace.mkdir(mode=0o755)
         self.shared.mkdir(mode=0o755)
         for mount_path in (self.workspace, self.shared):
-            os.chown(mount_path, CONTAINER_USER_ID, CONTAINER_USER_ID)
+            os.chown(mount_path, self.host_uid, self.host_uid)
 
         self.filesystem_image_root = Path("/var/lib") / f"sandy-e2e-image-{suffix}"
         self.filesystem_host_target = Path("/var/lib") / f"sandy-e2e-host-{suffix}"
@@ -194,6 +272,7 @@ class E2EContext:
             FilesystemFixtureIdentity,
         ] = {}
         self._filesystem_mounts: list[Path] = []
+        self._scratch_mounts: list[Path] = []
         # When True, every sandy call runs without a visible iptables.
         self.hide_iptables = False
 
@@ -206,6 +285,7 @@ class E2EContext:
             self.full_name,
             self.scope_name,
             self.other_name,
+            self.mounts_name,
             self.nft_name,
             self.nft_other_name,
         ):
@@ -224,6 +304,8 @@ class E2EContext:
             "SYSTEMD_COLORS": "0",
             "TERM": "xterm-256color",
         }
+        if self.base_image is not None:
+            environment["SANDY_BOOTSTRAP_BASE"] = self.base_image
         if overrides:
             for key, value in overrides.items():
                 if not re.fullmatch(r"SANDY_[A-Z_]{1,48}", key):
@@ -288,18 +370,21 @@ class E2EContext:
         environment: Mapping[str, str] | None = None,
         input_text: str | None = None,
         executable: Path | None = None,
+        workspace: str | None = None,
+        shared: str | None = None,
     ) -> CommandResult:
         """Invoke sandy with the E2E workspace and optional owned container.
 
         executable selects another copy of sandy, such as the one from
-        group_writable_sandy().
+        group_writable_sandy(). workspace and shared name other directories,
+        relative to the run root where sandy runs.
         """
         command = [
             str(executable or SANDY),
             "--workspace",
-            self.workspace.name,
+            workspace or self.workspace.name,
             "--shared",
-            self.shared.name,
+            shared or self.shared.name,
             "--user",
             user,
         ]
@@ -310,15 +395,11 @@ class E2EContext:
         command.extend(arguments)
         if self.hide_iptables:
             command = self.without_iptables(command)
-        sandy_environment = dict(environment or self.safe_environment())
-        # sudo sets this for the invoking user. Sandy reads it only for
-        # workspace ACLs on systemd < 250.
-        sandy_environment["SUDO_UID"] = str(CONTAINER_USER_ID)
         return self.run(
             command,
             expected=expected,
             timeout=timeout,
-            environment=sandy_environment,
+            environment=environment,
             input_text=input_text,
         )
 
@@ -431,6 +512,12 @@ class E2EContext:
         if existing:
             raise E2EFailure(
                 "Refusing to run with pre-existing Sandy state: " + ", ".join(existing)
+            )
+        leftovers = up_temporary_directories()
+        if leftovers:
+            raise E2EFailure(
+                "Refusing to run with pre-existing Sandy temporary directories: "
+                + ", ".join(str(path) for path in leftovers)
             )
         if self.bridge_exists():
             raise E2EFailure(f"Refusing to use existing bridge {BRIDGE_NAME}")
@@ -953,6 +1040,129 @@ class E2EContext:
             raise E2EFailure(f"Could not unmount filesystem fixture: {mount_path}")
         self._filesystem_mounts.remove(mount_path)
 
+    def _require_scratch_directory(self, path: Path) -> None:
+        """Require an existing directory below this run's root, not a link."""
+        if (
+            not path.is_absolute()
+            or ".." in path.parts
+            or self.root not in path.parents
+            or path.is_symlink()
+            or not path.is_dir()
+        ):
+            raise E2EFailure(f"Unsafe scratch mount directory: {path}")
+
+    def is_mount_point(self, path: Path) -> bool:
+        """Return whether the host has a mount at path, from its mountinfo.
+
+        os.path.ismount compares device numbers, so it misses a bind mount on
+        the same file system.
+        """
+        target = os.path.realpath(path)
+        mounts = parse_mountinfo(MOUNTINFO.read_text(encoding="utf-8"))
+        return any(mount_point == target for mount_point, _ in mounts)
+
+    @property
+    def scratch_mounts(self) -> tuple[Path, ...]:
+        """The directories that are tracked as mounts, oldest first."""
+        return tuple(self._scratch_mounts)
+
+    def track_scratch_mount(self, path: Path) -> None:
+        """Track a directory that is, or may become, a mount point.
+
+        Cleanup unmounts it. Use it for a mount that a case does not make
+        itself, such as one that the product could make by mistake, so that
+        cleanup removes it also when the case fails before it can.
+        """
+        self._require_scratch_directory(path)
+        if path in self._scratch_mounts:
+            raise E2EFailure(f"Scratch mount is already tracked: {path}")
+        self._scratch_mounts.append(path)
+
+    def forget_scratch_mount(self, path: Path) -> None:
+        """Stop tracking a directory; it must not be a mount point."""
+        if path not in self._scratch_mounts:
+            raise E2EFailure(f"Scratch mount is not tracked: {path}")
+        if self.is_mount_point(path):
+            raise E2EFailure(f"Scratch mount is still mounted: {path}")
+        self._scratch_mounts.remove(path)
+
+    def _mount_scratch(self, path: Path, command: Sequence[str]) -> None:
+        """Run a mount command for path, which is tracked before the command.
+
+        So cleanup also covers an interrupt, or a failure after the kernel made
+        the mount. A command that failed without a mount is forgotten at once.
+        """
+        self.track_scratch_mount(path)
+        try:
+            self.run(command)
+        except BaseException:
+            if not self.is_mount_point(path):
+                self._scratch_mounts.remove(path)
+            raise
+
+    def mount_scratch_filesystem(self, kind: str, path: Path) -> None:
+        """Mount a ramfs or tmpfs on a directory of this run's root."""
+        if kind not in SCRATCH_FILESYSTEMS:
+            raise E2EFailure(f"Unsupported scratch file system: {kind!r}")
+        self._require_scratch_directory(path)
+        self._mount_scratch(path, ["mount", "-t", kind, kind, str(path)])
+
+    def mount_scratch_bind(self, source: Path, path: Path) -> None:
+        """Bind mount a directory of this run's root on another one."""
+        self._require_scratch_directory(source)
+        self._require_scratch_directory(path)
+        self._mount_scratch(path, ["mount", "--bind", "--", str(source), str(path)])
+
+    def unmount_scratch_filesystem(self, path: Path) -> None:
+        """Unmount one tracked scratch mount; forget it only after success."""
+        if path not in self._scratch_mounts:
+            raise E2EFailure(f"Scratch mount is not tracked: {path}")
+        result = self.run(["umount", "--", str(path)], expected=None)
+        if result.returncode != 0 and self.is_mount_point(path):
+            raise E2EFailure(f"Could not unmount scratch mount: {path}")
+        self._scratch_mounts.remove(path)
+
+    def host_user_command(self, command: Sequence[str]) -> tuple[str, ...]:
+        """Return command wrapped to run as the host user: host_uid, no groups."""
+        return (
+            "setpriv",
+            f"--reuid={self.host_uid}",
+            f"--regid={self.host_uid}",
+            "--clear-groups",
+            "--",
+            *_validate_command(command),
+        )
+
+    def run_as_host_user(
+        self,
+        command: Sequence[str],
+        *,
+        expected: int | None = 0,
+        input_text: str | None = None,
+    ) -> CommandResult:
+        """Run command as the host user, as a user of `sudo sandy` would."""
+        return self.run(
+            self.host_user_command(command),
+            expected=expected,
+            input_text=input_text,
+        )
+
+    def remove_up_temporary_directories(self) -> None:
+        """Remove the directories that up made for its binds and did not remove.
+
+        Preflight proved that none existed, so the ones that exist now belong to
+        this run. A link, or an entry of another owner, is not removed.
+        """
+        errors = []
+        for path in up_temporary_directories():
+            entry = path.lstat()
+            if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid():
+                errors.append(f"unexpected entry {path}")
+                continue
+            shutil.rmtree(path)
+        if errors:
+            raise E2EFailure("Refusing to remove: " + ", ".join(errors))
+
     def register_container(self, name: str, user: str) -> None:
         if not NAME_PATTERN.fullmatch(name):
             raise E2EFailure(f"Refusing unsafe container name: {name!r}")
@@ -981,7 +1191,6 @@ class E2EContext:
             user=user,
             timeout=BUILD_TIMEOUT,
             environment=self.minimal_environment(),
-            input_text=ACL_PROMPT_ANSWERS,
         )
         self.wait_for_machine(name, running=True)
         return result
@@ -1001,7 +1210,6 @@ class E2EContext:
             user=self.main_user,
             timeout=BUILD_TIMEOUT,
             environment=self.minimal_environment(),
-            input_text=ACL_PROMPT_ANSWERS,
         )
         self.wait_for_machine(self.main_name, running=True)
         return result
@@ -1015,7 +1223,6 @@ class E2EContext:
             user=user,
             timeout=BUILD_TIMEOUT,
             environment=self.minimal_environment(),
-            input_text=ACL_PROMPT_ANSWERS,
         )
         self.wait_for_machine(name, running=True)
         return result
@@ -1037,7 +1244,6 @@ class E2EContext:
             name=self.full_name,
             user=self.full_user,
             timeout=FULL_BUILD_TIMEOUT,
-            input_text=ACL_PROMPT_ANSWERS,
         )
         self.wait_for_machine(self.full_name, running=True)
         return result
@@ -1266,6 +1472,12 @@ class E2EContext:
             except Exception as exc:  # cleanup must continue through every target
                 errors.append(f"container {name}: {exc}")
 
+        for mount_path in reversed(tuple(self._scratch_mounts)):
+            try:
+                self.unmount_scratch_filesystem(mount_path)
+            except Exception as exc:
+                errors.append(f"scratch mount {mount_path}: {exc}")
+
         for mount_path in reversed(tuple(self._filesystem_mounts)):
             try:
                 self.unmount_filesystem_file(mount_path)
@@ -1299,6 +1511,11 @@ class E2EContext:
             except Exception as exc:
                 errors.append(f"{SLICE}: {exc}")
 
+            try:
+                self.remove_up_temporary_directories()
+            except Exception as exc:
+                errors.append(f"up temporary directories: {exc}")
+
             if self._ip_forward_original is not None:
                 try:
                     self.run(
@@ -1325,6 +1542,13 @@ class E2EContext:
             except OSError as exc:
                 errors.append(f"install directory {INSTALL_DIR}: {exc}")
 
+        if self._scratch_mounts:
+            # rmtree would descend into a file system that is still mounted.
+            errors.append(
+                f"temporary directory {self.root} kept: mounts remain: "
+                + ", ".join(str(path) for path in self._scratch_mounts)
+            )
+            return errors
         try:
             shutil.rmtree(self.root)
         except FileNotFoundError:

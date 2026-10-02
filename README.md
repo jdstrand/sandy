@@ -18,7 +18,9 @@ wrapper written by Trevor Hilton (@hiltontj).
 - Container lifecycle management
 - OCI or `debootstrap` based bootstrapping
 - Uses ephemeral containers (read-only) by default with opt-in writable root
-- Workspace sharing
+- Workspace and shared directories, mounted with an owner mapping: the host
+  owner of a directory is the container user in the container, and root in
+  the container cannot create files of host root
 - Host (wide-open) or bridged (`sandybr0`) networking (private with lenient
   egress with optional port forwarding)
 
@@ -28,6 +30,11 @@ wrapper written by Trevor Hilton (@hiltontj).
 - Linux host with `systemd-nspawn`, `machinectl`, `systemd-run`, `systemctl`,
   `ip`, ... and the unified cgroup v2 hierarchy with `cgroup.kill` (Linux 5.14
   or later)
+- For the workspace and shared directories: ID-mapped mounts. They need
+  Linux 5.12 or later (the 5.14 above covers it) and a file system that
+  supports them, such as ext4, xfs, or btrfs. `up` checks this before it changes
+  the host
+  (see "Workspace and shared directories")
 - Either `debootstrap` **or** the combination of `skopeo` and `umoci` for image
   creation
 - Firewall tooling: `iptables` or `nftables` as a fallback for NAT rules with
@@ -59,7 +66,9 @@ target.
    (also see the `SANDY_...` environment variables from `--help`)
 3. Ensure `/var/lib/machines` exists as described above.
 4. Run `sandy` as root (`sudo /path/to/sandy ...`). By default it mounts the
-   `workspace` subdirectory for the developer user.
+   `workspace` subdirectory for the developer user. The owner of that
+   directory becomes the developer in the container (see "Workspace and
+   shared directories").
 
 
 ## Usage
@@ -117,8 +126,11 @@ $ sudo /path/to/sandy [GLOBAL OPTIONS] [COMMAND] [COMMAND OPTIONS]
 
 
 ### Global options
-- `-w, --workspace PATH` - relative workspace to bind-mount inside the
-  container (validated to prevent traversal; default: `workspace`).
+- `-w, --workspace PATH` - host directory to mount at `~/workspace` in the
+  container, relative to the current directory (validated to prevent
+  traversal; default: `workspace`). See "Workspace and shared directories".
+- `-s, --shared PATH` - host directory to mount at `~/shared` in the
+  container (same rules as `-w`; default: none).
 - `-c, --container NAME` - container identifier (RFC-compliant hostname;
   default: `ai-dev`).
 - `-u, --user USERNAME` - in-container user (POSIX-compliant name; default:
@@ -159,6 +171,238 @@ with `-u root` (see "Attached sessions" below).
   share. See "Resource limits" below.
 - `list` - Enumerate managed containers and their paths under
   `/var/lib/machines`.
+
+
+### Workspace and shared directories
+
+`-w` and `-s` name two host directories. `up` mounts them in the container at
+`~/workspace` and `~/shared` of the container user (`/home/<user>/workspace`
+and `/home/<user>/shared`). Sandy resolves each path once, at `up`, to its real
+path, so a symbolic link such as `-w link` works. `up` prints the real path:
+`I: Mounting '<real path>' on '<target>'`. A host directory that does not exist
+is skipped with a warning. So is a target that the image does not have.
+
+#### How the mounts work
+
+- nspawn gets no bind for these directories. After the container starts, and
+  as soon as its main process exists, `up` mounts each directory in the mount
+  namespace of the container. It uses the system calls `open_tree`,
+  `mount_setattr`, and `move_mount`. It runs no `mount` command.
+- The mounts exist only inside the container. The host has no new mount while
+  the container runs, and none after `down` or after any other stop (measured
+  on systemd 249, 252, 255, and 257: root in the container ended the main process,
+  and `machinectl terminate`). The image
+  directory (for example `/var/lib/machines/sandy.<name>/home/developer/workspace`)
+  stays empty. Each start mounts the directories again.
+- The mounts are private. A mount that root in the container makes below
+  them (for example a tmpfs) does not appear on the host, and a mount that the
+  host makes below them after `up` does not appear in the container. Without
+  this, the mounts were peers of the host mount: both kinds of mount crossed
+  (measured on Linux 5.15, 6.1, 6.8, and 6.12), and the mount of root in the
+  container stayed on the host after the container stopped. The check of this
+  rule, with the final code, was done on systemd 249, 252, 255, and 257.
+- Until the mounts are done, every attach fails: `bash`, `exec`, `/init.sh`,
+  and the readiness probe of `up`. The message is "Container is still
+  starting; try again" (exit status 125). So no session sees the empty
+  directories of the image. To do this, `up` creates an empty cgroup,
+  `mounts-pending`, in the scope of the container, under the lifecycle lock,
+  right after the start. It removes the cgroup, under the same lock, after the
+  last mount.
+- If `up` ends before it removes the marker (for example, it gets `SIGKILL`),
+  the container keeps running, and the marker stays until the container stops
+  (measured with `SIGKILL` right after the marker was created, on systemd 249,
+  252, and 257). Every attach then fails with
+  `E: Container entry failed: 'Container is still starting; try again (if
+  sandy up has ended, stop the container with sandy down)'`. Stop the
+  container with `sudo sandy down`.
+- A failed mount stops the container. `up` prints the source, the target, the
+  failed step, and the errno, for example `E: Could not mount '<source>' on
+  '<target>': move_mount failed: Invalid argument (errno 22)`. The container
+  also stops, with `E: Container '<name>' did not become ready`, when it has no
+  main process after 60 seconds.
+
+#### Owner mapping
+
+`up` reads the uid and gid of the container user from `/etc/passwd` in the
+image. (In a Debian image, `developer` has uid 1000. In an Ubuntu 26.04 image,
+`ubuntu` has uid 1000, and `developer` has uid 1001.) `up` then maps the uid
+and gid of the owner of the host directory to that user. No other id maps.
+
+- For the files in the directory, the host owner and the container user are
+  the same user. The container user can read, write, rename, and delete files
+  that the host owner made, as the mode bits allow. Files that the container
+  user creates belong to the host owner and to the group of the host
+  directory (measured on systemd 249, 252, 255, and 257: a directory with owner
+  1234 and group 100 gave new files and directories with 1234:100). The host
+  owner can read, write, and delete them.
+- Any host uid works. It does not need to equal the uid of the container user.
+  `up` reads the ids of the container user from the image, so the mapping
+  follows the image. Measured: host uid 1234 with a developer at uid 1000.
+- Files of other owners, host root included, show in the container with the
+  overflow id 65534. The container user can use them only through the "other"
+  mode bits.
+- Root in the container (`sandy -u root`), and every container id other than
+  the container user, gets the error "Value too large for defined data type"
+  (`EOVERFLOW`) when it creates a file or a directory there. So the container
+  cannot create files of host root, such as a setuid-root file.
+- Root in the container can still change the mode of files that belong to the
+  host owner, for example with `chmod 4755`. The host then has a setuid file of
+  the host user. It is never a file of root. See "Running files that the
+  container made".
+
+These facts were measured on systemd 249, 252, 255, and 257 (Linux 5.15, 6.1,
+6.8, and 6.12, x86_64) with the Debian image and a host owner with uid 1234.
+
+#### Mount options
+
+Both mounts, the workspace and the shared directory, are `nosuid`, `nodev`,
+ID-mapped, and private. `/proc/self/mountinfo` in the container shows
+`rw,nosuid,nodev,relatime,idmapped` for `/home/developer/workspace` and for
+`/home/developer/shared` (measured on systemd 249, 252, 255, and 257). `nosuid`
+works: a setuid file of the container user (mode 4755), run by root in the
+container, kept effective uid 0, so the kernel ignored the bit (measured on
+systemd 249, 252, 255, and 257). The `nodev` flag is set; device files on the mounts
+were not tested.
+
+The mounts are not `noexec`. The agent builds and runs programs in the
+workspace.
+
+`nosuid` limits the container user, not root in the container. Root in the
+container can remount the workspace without `nosuid`: `mount -o remount,bind,suid
+/home/developer/workspace` ended with status 0, and `/proc/self/mountinfo` then
+showed `rw,nodev,relatime,idmapped` (measured with the final code on systemd
+249, 252, 255, and 257). The kernel does not lock the flag. The owner mapping, not
+`nosuid`, keeps files of host root out of the directories.
+
+#### Checks before the start
+
+Before `up` changes anything on the host, it checks each directory:
+
+1. The directory must exist and be a directory. If it does not, `up` prints
+   `W: Could not find '<path>' on the host, skipping workspace mount` (or
+   `shared`) and continues without that mount.
+2. Root must not own it, as user or as group (uid 0 or gid 0). A container
+   process that writes there would create files that root owns. `up` exits with
+   status 1 and prints `E: Cannot mount '<path>' as the workspace directory:
+   root owns the workspace directory, so files that the container creates there
+   would belong to root. Use a directory that a regular user and group own`.
+   Change the owner first, for example with `sudo chown USER:GROUP DIR`.
+3. The kernel and the file system must support ID-mapped mounts. `up` makes a
+   test mount that it drops at once. The test changes nothing on the host. If it
+   fails, `up` exits with status 1, for example `E: Cannot mount '<path>' as the
+   workspace directory: mount_setattr failed: Invalid argument (errno 22).
+   ID-mapped mounts need Linux 5.12 or later and a file system that supports
+   them (ext4, xfs, and btrfs do; tmpfs needs Linux 6.3; ramfs does not)`.
+
+4. The host may have mounts below the directory. `up` does not stop. It prints
+   a warning and goes on (see "Mounts below the directory"):
+   `W: The workspace directory '<path>' has mounts below it: '<path>/a',
+   '<path>/b'` and the line `   The container does not see these mounts`. It
+   lists three mounts at most, and the number of the others. If `up` cannot read the mount table, it prints `W:
+   Could not check for mounts below the workspace directory: ...` and goes on.
+
+After the image exists (after `--build`), and before the start, `up` also reads
+the uid and gid of the container user from `/etc/passwd` in the image. If the
+file has no entry for the user, or more than one, `up` exits with status 1 and
+prints `E: Could not read the uid and gid of '<user>' in the container image:
+...`. It stops before it starts the container or sets up the bridge.
+
+Test mounts on x86_64 (the kernel versions are those of the hosts with systemd
+249, 252, 255, and 257):
+
+| File system | Linux 5.15 | Linux 6.1 | Linux 6.8 | Linux 6.12 |
+| --- | --- | --- | --- | --- |
+| ext4 | works | works | works | works |
+| xfs | works | works | works | works |
+| btrfs | works | works | works | works |
+| tmpfs | refused | refused | works | works |
+| ramfs | refused | refused | refused | refused |
+
+"Refused" is `mount_setattr failed: Invalid argument (errno 22)`. xfs and
+btrfs were mounted from loop devices. Not measured: NFS, other file systems, and
+aarch64.
+
+#### Mounts below the directory
+
+A file system that the host has mounted below the workspace directory is not
+visible in the container. The container sees the directory below the mount
+point. That directory is empty when the host mounted over an empty directory.
+This holds for a tmpfs and for a bind mount at `workspace/sub` (measured on
+systemd 249, 252, 255, and 257). It also holds for a mount that the host makes
+after `up`, because the mounts are private. `up` clones the directory without
+the mounts below it (`open_tree` with `OPEN_TREE_CLONE` and without
+`AT_RECURSIVE`). `up` warns when the host has such mounts (see "Checks before
+the start").
+
+Earlier versions behaved in another way (measured with the code before this
+change):
+
+- On systemd 249, the nspawn bind was recursive. The container saw the mounts
+  below the directory, a tmpfs and a bind mount.
+- On systemd 250 or later, the bind was recursive and ID-mapped (`:idmap`). `up`
+  failed when the host had a mount below the directory. systemd-nspawn printed
+  `Failed to map ids for bind mount ...: Device or resource busy` (measured
+  directly with systemd-nspawn 255 and 257, for a tmpfs, for a bind mount, and
+  for both). With Sandy, `up` ended with `Container '<name>' exited before it
+  was ready` (measured on systemd 252, 255, and 257 with a tmpfs and a bind
+  mount below the workspace).
+
+So `up` now starts in both cases. On systemd 250 or later the container starts
+where it did not start before. On systemd 249 the container no longer sees the
+mounts.
+
+Sandy does not include the mounts below the directory. A prototype of the same
+system calls, with `AT_RECURSIVE` on the clone and on the attribute change,
+showed these results on Linux 5.15, 6.1, 6.8, and 6.12:
+
+- The ID map must apply to every mount in the tree. The whole mount fails
+  (`mount_setattr` `EINVAL`) when one mount below does not support it. This
+  happened for ramfs, an autofs mount point, and a FUSE file system (`bindfs`;
+  tested on Linux 6.12 only), and for a tmpfs on Linux 5.15 and 6.1. A tmpfs
+  below works on Linux 6.8 and 6.12. A bind mount of an ext4 directory works on
+  all four kernels.
+- When the recursive mount works, files of other owners below the directory show
+  as 65534. Files of the owner of the directory show as the container user.
+- If only the clone is recursive, and the attribute change is not, the mounts
+  below the directory appear without `nosuid`, `nodev`, and the ID map.
+
+So a recursive mount fails in the cases where people use mounts below a
+workspace, and it needs two flags that must stay together. Not tested: NFS.
+
+The change protects the host: a mount below the workspace, for example a
+secret store or the data of another user, does not enter the container. It is
+also a limit. To use such a file system in the container, name its directory
+with `-s`. A bind mount of a directory works as the source of `-s` (measured
+on systemd 249, 252, 255, and 257: the container saw the files, and a file that the
+container user created belonged to the host owner). Whether a tmpfs works as
+the source depends on the kernel (see the table above). Sandy has no option for
+more than the two mounts.
+
+#### Differences from earlier versions
+
+- On systemd 250 or later, earlier versions bound the directories with
+  `--bind=...:idmap`. That option maps each container id to the same host id.
+  The container user could write only when the host uid was equal to the uid of
+  the image user. With host uid 1234, or with an Ubuntu 26.04 image, the result
+  was "Permission denied" (measured on systemd 252, 255, and 257). Root in the
+  container could create files of host root there (measured on systemd 255 and
+  257: a root-owned file with mode 4755), and the bind was not `nosuid`.
+- On systemd 249, earlier versions used ACLs. Sandy ran `setfacl` and asked for
+  confirmation. Files that the container made belonged to host uid 1000000 plus
+  the container uid, and the host user could not edit or delete them
+  (measured). Sandy now has no ACL step, asks no question in `up`, does not read
+  `SUDO_UID`, and needs neither `setfacl` nor `setpriv`.
+- One method now works on every systemd version, from 249.
+- Mounts below the directory: on systemd 249 the container saw them, and on
+  systemd 250 or later `up` failed when there was one. Now `up` starts, the
+  container does not see them, and `up` warns (see "Mounts below the
+  directory").
+- The directories are `nosuid` and `nodev`. Before, they were neither.
+- Root in the container cannot create files in the directories any more.
+- `up` refuses a directory that root owns, and a file system without support
+  for ID-mapped mounts, before it changes the host.
+- `bash` and `exec` fail with "Container is still starting; try again" until
+  the mounts are done.
 
 
 ### Networking and Port Forwarding
@@ -240,7 +484,10 @@ confinement, it refuses to run the command; there is no unconfined fallback.
 nspawn completes the Leader's confinement during the start, before it starts
 the main process. So the helper reads the Leader only after the main process
 exists. An attach before that fails with "Container is still starting; try
-again" (exit status 125); `up` waits until an attach works.
+again" (exit status 125); `up` waits until an attach works. The same message
+and status apply until `up` has mounted the workspace and shared directories
+(see "Workspace and shared directories"). Only then does an attach work, so no
+session sees the empty directories of the image.
 
 Differences from earlier versions:
 
@@ -281,7 +528,9 @@ same way, but the container keeps running.
 
 The diagram shows a start, an attach, the two ways in which a session ends,
 and the cleanup. `up` without `-d` attaches its console as the first
-session; `up -d` skips the steps marked "without -d".
+session; `up -d` skips the steps marked "without -d". The steps marked
+"directories to mount" happen when `up` has a workspace or shared directory to
+mount (see "Workspace and shared directories").
 
 ```mermaid
 sequenceDiagram
@@ -294,18 +543,28 @@ sequenceDiagram
 
     Note over U,H: Start
     U->>S: sandy up [-d]
+    opt directories to mount
+        S->>S: check each directory before any host change (owner is not root, ID-mapped mount works)
+    end
     S->>S: remove stale port rules of NAME (creates no network)
     S->>C: systemd-run --scope creates the scope
     C->>N: runs systemd-nspawn --keep-unit (supervisor/)
     N->>K: starts the stub init and sandy-keepalive (payload/)
+    opt directories to mount
+        S->>C: mkdir mounts-pending, under the lifecycle lock
+    end
     opt without -d
         S->>C: mkdir up-console, under the lifecycle lock
+    end
+    opt directories to mount
+        S->>K: when the payload exists, mount the directories in the mount namespace of the container, then rmdir mounts-pending (under the lifecycle lock)
     end
     S->>H: readiness probe, then /init.sh if present (both confined)
 
     Note over U,H: Attach (the up console, sandy bash, or sandy exec)
     U->>S: start a session
     S->>H: start the helper (pinned sandy, validated arguments)
+    H->>C: refuse while mounts-pending exists (status 125)
     H->>K: require PID 2, then read the Leader's seccomp filters and CapBnd
     H->>C: create and join attach-RANDOM, under the lifecycle lock
     H->>K: setns, drop to CapBnd, install the filters, execve the session
@@ -354,6 +613,51 @@ remain are removed by the next bridge setup or by `rm --network`.
 Containers that earlier versions of `sandy` started are not in a
 `sandy-<name>.scope` in `sandy.slice`. `bash` and `exec` refuse to attach to
 them; stop them with `down` and start them again with `up`.
+
+### Running files that the container made
+
+The container user writes the workspace and shared directories, and the files
+belong to the host owner. A program on the host that runs, loads, or reads
+those files does so with the rights of the host owner. The content comes from
+an agent that can be wrong or hostile. The owner mapping stops files of host
+root. It does not make the content safe.
+
+These things on the host run or interpret files of the workspace:
+
+- Git hooks (`.git/hooks`), and settings in `.git/config`: `core.hooksPath`,
+  `core.fsmonitor`, and filter and diff drivers.
+- Build and package scripts: `make`, `npm` and `pip` install scripts,
+  `setup.py`, `build.rs`, Gradle and Maven plugins, test runners, and helper
+  scripts of CI.
+- `.envrc` (direnv), and other files that a tool runs when you enter the
+  directory.
+- Editor and IDE tasks and settings, such as `.vscode/tasks.json` and
+  `.idea`.
+- Shell startup files, when the workspace or the shared directory is a home
+  directory.
+- Programs, scripts, and libraries that the agent made, and libraries that a
+  program on the host loads from the directory.
+- Setuid files. Root in the container can set the setuid bit on files of the
+  host owner. Such a file runs with the uid of the host owner, never as root.
+- Symbolic links that point outside the directory. A program on the host
+  follows them with the rights of the host owner. In the container, such a link
+  points to a path of the container.
+
+Sandy sets no size limit on these directories, so the container can fill the
+file system of the host.
+
+To reduce the risk:
+
+- Review what the agent changed before you run anything on the host. Look at
+  hooks and configuration files too: `git diff` does not show `.git`.
+- Run builds, tests, and install scripts of that code inside the container, or
+  in another disposable environment, not on the host.
+- Do not open the workspace in an editor or IDE that runs workspace tasks or
+  loads workspace settings without asking.
+- Use a directory only for this work. Do not use your home directory, and do
+  not use a directory that holds other projects.
+- Keep secrets out of the workspace and the shared directory. The container
+  can read all files there.
 
 ### Resource limits
 
@@ -479,7 +783,9 @@ disposable Linux VM. It creates and removes `/var/lib/machines/sandy.*`,
 `sandybr0`, Sandy firewall rules and caches, and the state of `sandy.slice`,
 and temporarily changes `net.ipv4.ip_forward`. The runner refuses to start if
 it detects pre-existing Sandy machine, bridge, firewall, or `sandy.slice`
-state.
+state, or leftover `/tmp/sandy-keepalive-*` or `/tmp/sandy-init-*` directories.
+(`up` makes these directories for its binds and removes them when it ends. One
+stays when `up` gets `SIGKILL`; remove such a directory by hand.)
 
 Ubuntu 24.04 (Noble) is the minimum tested guest. The VM must support nested
 `systemd-nspawn` containers and user namespaces, have outbound DNS, HTTP, and
@@ -492,7 +798,7 @@ Install the host-side test requirements:
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-    acl ca-certificates curl debootstrap iproute2 iptables make nftables \
+    ca-certificates curl debootstrap iproute2 iptables make nftables \
     python3 skopeo systemd-container uidmap umoci util-linux
 ```
 
@@ -503,11 +809,27 @@ sudo env SANDY_E2E=1 make e2e
 ```
 
 The opt-in variable and root check are intentional safety guards. The fast
-suite uses Sandy's normal default bootstrap method and base image with a
-minimal setup script. It covers cache misses, cache reuse, cache invalidation,
-lifecycle operations, mounts, networking, firewall rules, port forwarding and
-cleanup. Lifecycle and network tests reuse the cache created by the cache
-tests.
+suite uses Sandy's normal default bootstrap method and base image (unless you
+set `SANDY_E2E_BASE_IMAGE`) with a minimal setup script. It covers cache
+misses, cache reuse, cache invalidation, lifecycle operations, mounts,
+networking, firewall rules, port forwarding and cleanup. Lifecycle and network
+tests reuse the cache created by the cache tests.
+
+Two optional environment variables choose the host user and the image:
+
+- `SANDY_E2E_HOST_UID` is the uid and gid that own the E2E workspace and shared
+  directories (default 1000; a number from 1 to 60000). It can differ from the
+  uid of the container user, which the image decides.
+- `SANDY_E2E_BASE_IMAGE` is a base image, for example `ubuntu:26.04`. The
+  runner passes it to Sandy as `SANDY_BOOTSTRAP_BASE`. Without it, the suite
+  uses Sandy's default base image. In the Ubuntu 26.04 image, uid 1000 is
+  `ubuntu`, and `developer` has uid 1001.
+
+The runner rejects a malformed value before it creates anything. For example:
+
+```bash
+sudo env SANDY_E2E=1 SANDY_E2E_HOST_UID=1234 SANDY_E2E_BASE_IMAGE=ubuntu:26.04 make e2e
+```
 
 To run the fast suite and then smoke-test one uncached build with Sandy's
 complete default `setup-container.sh`, run:

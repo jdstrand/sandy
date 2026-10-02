@@ -27,6 +27,10 @@ def test_main(context: E2EContext) -> None:
 
         first_build = context.build_minimal(context.cache_name, context.cache_user)
         assert_contains(first_build, "Using OCI method")
+        if context.base_image is not None:
+            # SANDY_E2E_BASE_IMAGE reached sandy: every later build and the
+            # cache key use this image.
+            assert_contains(first_build, f"to create '{context.base_image}' container")
         assert_contains(first_build, "Minimal sandbox setup complete")
         assert_contains(first_build, "Creating cache")
         assert_not_contains(first_build, "Using cached container")

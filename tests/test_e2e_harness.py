@@ -13,15 +13,20 @@ import tempfile
 import threading
 import unittest
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from typing import cast
+from unittest.mock import ANY, MagicMock, call, patch
 
 from tests.e2e import support
+from tests.e2e import runner, test_mounts
 from tests.e2e.support import (
-    ACL_PROMPT_ANSWERS,
-    CONTAINER_USER_ID,
+    BASE_IMAGE_VARIABLE,
+    DEFAULT_HOST_UID,
     DEFAULT_TIMEOUT,
+    HOST_UID_MAX,
+    HOST_UID_VARIABLE,
     REPO_ROOT,
     SANDY,
     SANDY_SCRIPT_NAMES,
@@ -29,8 +34,12 @@ from tests.e2e.support import (
     E2EContext,
     E2EFailure,
     FilesystemFixtureIdentity,
+    parse_base_image,
+    parse_host_uid,
 )
 from tests.e2e.test_confinement import (
+    ENTRY_FAILURE,
+    MOUNTS_WAIT_TIMEOUT,
     PTRACE_CONT,
     PTRACE_FORK_OPTIONS,
     PTRACE_GETEVENTMSG,
@@ -42,6 +51,7 @@ from tests.e2e.test_confinement import (
     _open_scope_process,
     _Session,
     _StartSampler,
+    _exec_when_mounted,
 )
 from tests.e2e.test_network import _wait_for_public_https
 from tests.e2e.test_scope import _has_new_only_child, _leaves, _read_cgroup_file
@@ -64,6 +74,7 @@ class CleanupProbeContext(E2EContext):
         self.filesystem_image_root = root / "image"
         self.filesystem_host_target = root / "host"
         self._filesystem_mounts = []
+        self._scratch_mounts = []
         self.bridge = False
         self.firewall: list[str] = []
         self.bridge_checks = 0
@@ -92,8 +103,11 @@ class CleanupProbeContext(E2EContext):
         environment: Mapping[str, str] | None = None,
         input_text: str | None = None,
         executable: Path | None = None,
+        workspace: str | None = None,
+        shared: str | None = None,
     ) -> CommandResult:
         del name, user, expected, timeout, environment, input_text, executable
+        del workspace, shared
         self.sandy_calls.append(list(arguments))
         return CommandResult(("sandy", *arguments), 0, "", "")
 
@@ -127,8 +141,11 @@ class RetryContext(E2EContext):
         environment: Mapping[str, str] | None = None,
         input_text: str | None = None,
         executable: Path | None = None,
+        workspace: str | None = None,
+        shared: str | None = None,
     ) -> CommandResult:
         del arguments, name, user, timeout, environment, input_text, executable
+        del workspace, shared
         self.expected_exit_codes.append(expected)
         if not self.results:
             raise AssertionError("HTTPS retry made too many attempts")
@@ -841,6 +858,68 @@ class LeaderHoldTests(unittest.TestCase):
                     self.assertEqual(_has_payload(42), expected)
 
 
+class ExecWhenMountedTests(unittest.TestCase):
+    """A case that attaches while up still starts waits for up's mounts.
+
+    Mocks: the attach (sandy exec), the clock, and the sleep.
+    """
+
+    refusal = CommandResult(
+        ("sandy",),
+        ENTRY_FAILURE,
+        "",
+        "E: Container entry failed: 'Container is still starting; try again'\n",
+    )
+    success = CommandResult(("sandy",), 0, "out", "")
+
+    def run_helper(self, results, **patches):
+        context = SimpleNamespace(main_name="e2e-main-x", main_user="developer")
+        with ExitStack() as stack:
+            attach = stack.enter_context(
+                patch("tests.e2e.test_confinement._exec", side_effect=results)
+            )
+            sleep = stack.enter_context(patch("tests.e2e.test_confinement.time.sleep"))
+            for name, value in patches.items():
+                stack.enter_context(
+                    patch(f"tests.e2e.test_confinement.time.{name}", value)
+                )
+            result = _exec_when_mounted(cast(E2EContext, context), "true")
+        return result, attach, sleep
+
+    def test_returns_at_once_when_the_attach_works(self):
+        result, attach, sleep = self.run_helper([self.success])
+        self.assertIs(result, self.success)
+        attach.assert_called_once_with(ANY, "true", expected=None)
+        sleep.assert_not_called()
+
+    def test_retries_only_the_refusal_for_a_container_that_is_starting(self):
+        result, attach, sleep = self.run_helper(
+            [self.refusal, self.refusal, self.success]
+        )
+        self.assertIs(result, self.success)
+        self.assertEqual(attach.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_any_other_failure_is_reported_at_once(self):
+        for failure in (
+            CommandResult(("sandy",), 1, "", "E: Container not found or not running"),
+            CommandResult(
+                ("sandy",), ENTRY_FAILURE, "", "E: Container entry failed: x"
+            ),
+            CommandResult(("sandy",), 2, "", "still starting"),
+        ):
+            with self.subTest(failure=failure):
+                with self.assertRaisesRegex(E2EFailure, "Unexpected result"):
+                    self.run_helper([failure])
+
+    def test_gives_up_when_the_mounts_do_not_come(self):
+        with self.assertRaisesRegex(E2EFailure, "did not mount the directories"):
+            self.run_helper(
+                [self.refusal, self.refusal],
+                monotonic=MagicMock(side_effect=[0.0, MOUNTS_WAIT_TIMEOUT + 1.0]),
+            )
+
+
 class PayloadForkHoldTests(unittest.TestCase):
     """The S2 case holds the payload at its fork and releases the Leader.
 
@@ -1010,6 +1089,8 @@ class SandyInvocationTests(unittest.TestCase):
         context.workspace = Path("/tmp/sandy-e2e-test/workspace")
         context.shared = Path("/tmp/sandy-e2e-test/shared")
         context.hide_iptables = False
+        context.base_image = None
+        context.host_uid = DEFAULT_HOST_UID
         return context
 
     def test_hidden_iptables_wraps_sandy_in_a_private_mount_namespace(self):
@@ -1057,19 +1138,32 @@ class SandyInvocationTests(unittest.TestCase):
                     with self.assertRaises(E2EFailure):
                         context.without_iptables(["sandy"])
 
-    def test_sandy_passes_the_invoking_user(self):
+    def test_sandy_passes_the_environment_unchanged(self):
+        # Regression test: sandy no longer reads SUDO_UID (the ACL path is
+        # gone), so the harness must not set it. Mocks: run().
         context = self.make_context()
         with patch.object(E2EContext, "run") as run:
             context.sandy(["status"])
             context.sandy(["status"], environment={"PATH": "/usr/bin", "SANDY_X": "1"})
-        default_environment = run.call_args_list[0].kwargs["environment"]
-        self.assertEqual(default_environment["SUDO_UID"], str(CONTAINER_USER_ID))
-        self.assertEqual(
-            default_environment["PATH"], context.safe_environment()["PATH"]
-        )
+        # No environment: run() then uses safe_environment() itself.
+        self.assertIsNone(run.call_args_list[0].kwargs["environment"])
         self.assertEqual(
             run.call_args_list[1].kwargs["environment"],
-            {"PATH": "/usr/bin", "SANDY_X": "1", "SUDO_UID": str(CONTAINER_USER_ID)},
+            {"PATH": "/usr/bin", "SANDY_X": "1"},
+        )
+        self.assertNotIn("SUDO_UID", context.safe_environment())
+
+    def test_sandy_names_the_workspace_and_shared_directories(self):
+        context = self.make_context()
+        with patch.object(E2EContext, "run") as run:
+            context.sandy(["status"])
+            context.sandy(["status"], workspace="linked", shared="other-shared")
+        default, named = (call.args[0] for call in run.call_args_list)
+        self.assertEqual(
+            default[1:5], ["--workspace", "workspace", "--shared", "shared"]
+        )
+        self.assertEqual(
+            named[1:5], ["--workspace", "linked", "--shared", "other-shared"]
         )
 
     def test_sandy_runs_the_selected_executable(self):
@@ -1108,19 +1202,864 @@ class SandyInvocationTests(unittest.TestCase):
         self.assertEqual(SANDY.stat().st_mode, checkout_mode)
         self.assertEqual(SANDY.read_bytes(), checkout_bytes)
 
-    def test_builds_answer_only_the_two_acl_prompts(self):
-        self.assertEqual(ACL_PROMPT_ANSWERS, "y\ny\n")
+    def test_builds_give_up_no_input(self):
+        # Regression test: up asks no question during the start (the ACL
+        # prompts are gone), so a build passes no input. Mocks: sandy().
         context = self.make_context()
         context.main_name = "e2e-main-abc123"
         context.main_user = "developer"
+        context.full_name = "e2e-full-abc123"
+        context.full_user = "developer"
+        context.full_build_started = False
         context.owned_containers = {}
         with patch.object(E2EContext, "sandy") as sandy_call, patch.object(
             E2EContext, "wait_for_machine"
         ), patch.object(E2EContext, "minimal_environment", return_value={}):
             context.build_main()
             context.build_minimal("e2e-cache-abc123", "developer")
+            context.build_lenient("e2e-lenient-abc123", "developer")
+            context.build_full()
+        self.assertEqual(sandy_call.call_count, 4)
         for entry in sandy_call.call_args_list:
-            self.assertEqual(entry.kwargs["input_text"], ACL_PROMPT_ANSWERS)
+            self.assertNotIn("input_text", entry.kwargs)
+
+
+class EnvironmentSettingTests(unittest.TestCase):
+    """SANDY_E2E_HOST_UID and SANDY_E2E_BASE_IMAGE: strict parsing, nothing else."""
+
+    def test_host_uid_defaults_to_1000(self):
+        self.assertEqual(parse_host_uid(None), 1000)
+        self.assertEqual(DEFAULT_HOST_UID, 1000)
+
+    def test_host_uid_accepts_numbers_up_to_the_maximum(self):
+        for value in ("1", "999", "1000", "1234", "60000"):
+            with self.subTest(value=value):
+                self.assertEqual(parse_host_uid(value), int(value))
+        self.assertEqual(HOST_UID_MAX, 60000)
+
+    def test_host_uid_rejects_everything_else(self):
+        for value in (
+            "",
+            "0",
+            "00",
+            "01234",
+            "-1",
+            "+5",
+            "60001",
+            "100000",
+            " 1",
+            "1 ",
+            "1\n",
+            "12a",
+            "1e3",
+            "0x10",
+            "\uff11\uff12",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(E2EFailure, HOST_UID_VARIABLE):
+                    parse_host_uid(value)
+
+    def test_base_image_is_none_when_unset(self):
+        self.assertIsNone(parse_base_image(None))
+
+    def test_base_image_accepts_name_and_tag(self):
+        for value in (
+            "ubuntu:26.04",
+            "ubuntu:noble",
+            "debian:trixie-slim",
+            "docker.io/library/debian:trixie",
+            "a:1",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(parse_base_image(value), value)
+
+    def test_base_image_rejects_everything_else(self):
+        for value in (
+            "",
+            "ubuntu",
+            "ubuntu:",
+            ":26.04",
+            "Ubuntu:26.04",
+            "ubuntu:26.04 ",
+            "ubuntu:26.04\n",
+            "ubuntu:26.04;id",
+            "ubuntu:26.04@sha256:abc",
+            "-ubuntu:1",
+            "ubuntu:-1",
+            "a" * 65 + ":1",
+            "a:" + "1" * 65,
+            "ubuntu:26.04:extra",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(E2EFailure, BASE_IMAGE_VARIABLE):
+                    parse_base_image(value)
+
+    def test_context_reads_the_settings_and_chowns_the_directories(self):
+        # Mocks: os.chown (the test is not root). The run root is real.
+        with patch.dict(
+            os.environ,
+            {HOST_UID_VARIABLE: "1234", BASE_IMAGE_VARIABLE: "ubuntu:26.04"},
+        ), patch.object(support.os, "chown") as chown:
+            context = E2EContext()
+        try:
+            self.assertEqual(context.host_uid, 1234)
+            self.assertEqual(context.base_image, "ubuntu:26.04")
+            self.assertEqual(
+                chown.call_args_list,
+                [
+                    call(context.workspace, 1234, 1234),
+                    call(context.shared, 1234, 1234),
+                ],
+            )
+            self.assertEqual(
+                context.safe_environment()["SANDY_BOOTSTRAP_BASE"], "ubuntu:26.04"
+            )
+        finally:
+            support.shutil.rmtree(context.root)
+
+    def test_context_defaults_without_the_settings(self):
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in (HOST_UID_VARIABLE, BASE_IMAGE_VARIABLE)
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            support.os, "chown"
+        ) as chown:
+            context = E2EContext()
+        try:
+            self.assertEqual(context.host_uid, 1000)
+            self.assertIsNone(context.base_image)
+            self.assertEqual(chown.call_args_list[0].args[1:], (1000, 1000))
+            self.assertNotIn("SANDY_BOOTSTRAP_BASE", context.safe_environment())
+        finally:
+            support.shutil.rmtree(context.root)
+
+    def test_context_validates_the_settings_before_it_creates_anything(self):
+        for name, value in ((HOST_UID_VARIABLE, "0"), (BASE_IMAGE_VARIABLE, "ubuntu")):
+            with self.subTest(name=name):
+                with patch.dict(os.environ, {name: value}), patch.object(
+                    support.tempfile, "mkdtemp"
+                ) as mkdtemp:
+                    with self.assertRaises(E2EFailure):
+                        E2EContext()
+                mkdtemp.assert_not_called()
+
+    def make_context(self, base_image):
+        context = E2EContext.__new__(E2EContext)
+        context.base_image = base_image
+        return context
+
+    def test_safe_environment_passes_the_base_image_to_sandy(self):
+        without = self.make_context(None).safe_environment()
+        self.assertNotIn("SANDY_BOOTSTRAP_BASE", without)
+        selected = self.make_context("ubuntu:26.04").safe_environment()
+        self.assertEqual(selected["SANDY_BOOTSTRAP_BASE"], "ubuntu:26.04")
+        # Only the base image differs.
+        self.assertEqual(
+            {k: v for k, v in selected.items() if k != "SANDY_BOOTSTRAP_BASE"},
+            without,
+        )
+
+    def test_overrides_keep_the_base_image_and_stay_validated(self):
+        context = self.make_context("ubuntu:26.04")
+        environment = context.safe_environment({"SANDY_SETUP_SCRIPT": "/x"})
+        self.assertEqual(environment["SANDY_BOOTSTRAP_BASE"], "ubuntu:26.04")
+        self.assertEqual(environment["SANDY_SETUP_SCRIPT"], "/x")
+        for key, value in (("PATH", "/x"), ("SANDY_X", ""), ("SANDY_X", "a\x00b")):
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(E2EFailure):
+                    context.safe_environment({key: value})
+
+    def test_minimal_environment_carries_the_base_image(self):
+        environment = self.make_context("ubuntu:26.04").minimal_environment()
+        self.assertEqual(environment["SANDY_BOOTSTRAP_BASE"], "ubuntu:26.04")
+        self.assertIn("SANDY_SETUP_SCRIPT", environment)
+
+
+class ScratchMountTests(unittest.TestCase):
+    """The mounts that a case makes below the run root, and their cleanup.
+
+    Mocks: run() (the mount and umount commands) and the check for a mount
+    point. Real temporary directories give the paths. The E2E suite proves
+    the real mounts.
+    """
+
+    @contextmanager
+    def context(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent) / "run"
+            root.mkdir()
+            context = CleanupProbeContext(root, host_state_owned=False)
+            context.host_uid = 1234
+            yield context, root
+
+    @staticmethod
+    def success(command, **kwargs):
+        return CommandResult(tuple(command), 0, "", "")
+
+    def test_each_kind_is_tracked_before_the_command_and_forgotten_after(self):
+        for kind in ("tmpfs", "ramfs"):
+            with self.subTest(kind=kind), self.context() as (context, root):
+                path = root / "mounted"
+                path.mkdir()
+                commands = []
+
+                def run(command, **kwargs):
+                    commands.append((tuple(command), kwargs))
+                    if command[0] == "mount":
+                        self.assertEqual(context.scratch_mounts, (path,))
+                    return self.success(command)
+
+                with patch.object(context, "run", side_effect=run):
+                    context.mount_scratch_filesystem(kind, path)
+                    self.assertEqual(context.scratch_mounts, (path,))
+                    context.unmount_scratch_filesystem(path)
+                self.assertEqual(context.scratch_mounts, ())
+                self.assertEqual(
+                    commands,
+                    [
+                        (("mount", "-t", kind, kind, str(path)), {}),
+                        (("umount", "--", str(path)), {"expected": None}),
+                    ],
+                )
+
+    def test_a_bind_mount_runs_the_exact_command(self):
+        with self.context() as (context, root):
+            source = root / "source"
+            path = root / "target"
+            source.mkdir()
+            path.mkdir()
+            with patch.object(context, "run", side_effect=self.success) as run:
+                context.mount_scratch_bind(source, path)
+            run.assert_called_once_with(
+                ["mount", "--bind", "--", str(source), str(path)]
+            )
+            self.assertEqual(context.scratch_mounts, (path,))
+
+    def test_a_bind_mount_needs_a_safe_source_too(self):
+        with self.context() as (context, root):
+            path = root / "target"
+            path.mkdir()
+            for source in (Path("/etc"), root / "missing", root):
+                with self.subTest(source=source):
+                    with patch.object(context, "run") as run:
+                        with self.assertRaises(E2EFailure):
+                            context.mount_scratch_bind(source, path)
+                    run.assert_not_called()
+            self.assertEqual(context.scratch_mounts, ())
+
+    def test_unsupported_file_systems_run_no_command(self):
+        with self.context() as (context, root):
+            path = root / "mounted"
+            path.mkdir()
+            for kind in ("ext4", "", "tmpfs -o x", "bind", "nfs"):
+                with self.subTest(kind=kind):
+                    with patch.object(context, "run") as run:
+                        with self.assertRaisesRegex(E2EFailure, "Unsupported"):
+                            context.mount_scratch_filesystem(kind, path)
+                    run.assert_not_called()
+            self.assertEqual(context.scratch_mounts, ())
+
+    def test_only_real_directories_below_the_run_root_are_accepted(self):
+        with self.context() as (context, root):
+            link = root / "link"
+            link.symlink_to(root)
+            (root / "file").write_text("x")
+            outside = Path(tempfile.gettempdir())
+            for path in (
+                root,
+                outside,
+                Path("relative"),
+                root / "missing",
+                root / "file",
+                link,
+                root / ".." / root.name,
+            ):
+                with self.subTest(path=path):
+                    with patch.object(context, "run") as run:
+                        with self.assertRaisesRegex(E2EFailure, "Unsafe"):
+                            context.mount_scratch_filesystem("tmpfs", path)
+                    run.assert_not_called()
+            self.assertEqual(context.scratch_mounts, ())
+
+    def test_a_directory_is_tracked_once(self):
+        with self.context() as (context, root):
+            path = root / "mounted"
+            path.mkdir()
+            context.track_scratch_mount(path)
+            with patch.object(context, "run") as run:
+                with self.assertRaisesRegex(E2EFailure, "already tracked"):
+                    context.mount_scratch_filesystem("tmpfs", path)
+                with self.assertRaisesRegex(E2EFailure, "already tracked"):
+                    context.track_scratch_mount(path)
+            run.assert_not_called()
+            self.assertEqual(context.scratch_mounts, (path,))
+
+    def test_a_failed_mount_without_a_mount_point_is_forgotten(self):
+        with self.context() as (context, root):
+            path = root / "mounted"
+            path.mkdir()
+            with patch.object(
+                context, "run", side_effect=E2EFailure("mount failed")
+            ), patch.object(context, "is_mount_point", return_value=False):
+                with self.assertRaisesRegex(E2EFailure, "mount failed"):
+                    context.mount_scratch_filesystem("tmpfs", path)
+            self.assertEqual(context.scratch_mounts, ())
+
+    def test_a_failure_after_the_mount_stays_tracked_for_cleanup(self):
+        # Also an interrupt: the kernel may have made the mount already.
+        for error in (E2EFailure("timed out"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                with self.context() as (context, root):
+                    path = root / "mounted"
+                    path.mkdir()
+                    with patch.object(context, "run", side_effect=error), patch.object(
+                        context, "is_mount_point", return_value=True
+                    ):
+                        with self.assertRaises(type(error)):
+                            context.mount_scratch_filesystem("tmpfs", path)
+                    self.assertEqual(context.scratch_mounts, (path,))
+
+    def test_a_failed_unmount_stays_tracked_while_the_mount_exists(self):
+        with self.context() as (context, root):
+            path = root / "mounted"
+            path.mkdir()
+            context.track_scratch_mount(path)
+            busy = CommandResult(("umount",), 32, "", "busy")
+            with patch.object(context, "run", return_value=busy), patch.object(
+                context, "is_mount_point", return_value=True
+            ):
+                with self.assertRaisesRegex(E2EFailure, "Could not unmount"):
+                    context.unmount_scratch_filesystem(path)
+            self.assertEqual(context.scratch_mounts, (path,))
+
+    def test_a_failed_unmount_of_a_path_that_is_no_mount_is_forgotten(self):
+        with self.context() as (context, root):
+            path = root / "mounted"
+            path.mkdir()
+            context.track_scratch_mount(path)
+            not_mounted = CommandResult(("umount",), 32, "", "not mounted")
+            with patch.object(context, "run", return_value=not_mounted), patch.object(
+                context, "is_mount_point", return_value=False
+            ):
+                context.unmount_scratch_filesystem(path)
+            self.assertEqual(context.scratch_mounts, ())
+
+    def test_an_untracked_path_is_not_unmounted(self):
+        with self.context() as (context, root):
+            path = root / "mounted"
+            path.mkdir()
+            with patch.object(context, "run") as run:
+                with self.assertRaisesRegex(E2EFailure, "not tracked"):
+                    context.unmount_scratch_filesystem(path)
+                with self.assertRaisesRegex(E2EFailure, "not tracked"):
+                    context.forget_scratch_mount(path)
+            run.assert_not_called()
+
+    def test_forget_refuses_a_path_that_is_still_a_mount(self):
+        with self.context() as (context, root):
+            path = root / "mounted"
+            path.mkdir()
+            context.track_scratch_mount(path)
+            with patch.object(context, "is_mount_point", return_value=True):
+                with self.assertRaisesRegex(E2EFailure, "still mounted"):
+                    context.forget_scratch_mount(path)
+            self.assertEqual(context.scratch_mounts, (path,))
+            with patch.object(context, "is_mount_point", return_value=False):
+                context.forget_scratch_mount(path)
+            self.assertEqual(context.scratch_mounts, ())
+
+    def test_cleanup_unmounts_before_it_removes_the_run_root(self):
+        with self.context() as (context, root):
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            context.track_scratch_mount(first)
+            context.track_scratch_mount(second)
+            events = []
+
+            def unmount(path):
+                events.append(path)
+                context._scratch_mounts.remove(path)
+
+            with patch.object(
+                context, "unmount_scratch_filesystem", side_effect=unmount
+            ):
+                self.assertEqual(context.cleanup(), [])
+            # The newest mount first; then the root goes.
+            self.assertEqual(events, [second, first])
+            self.assertFalse(root.exists())
+
+    def test_cleanup_keeps_the_run_root_when_a_mount_remains(self):
+        # rmtree would descend into a file system that is still mounted.
+        with self.context() as (context, root):
+            path = root / "mounted"
+            path.mkdir()
+            (path / "inside").write_text("x")
+            context.track_scratch_mount(path)
+            with patch.object(
+                context,
+                "unmount_scratch_filesystem",
+                side_effect=E2EFailure("busy"),
+            ), patch.object(support.shutil, "rmtree") as rmtree:
+                errors = context.cleanup()
+            rmtree.assert_not_called()
+            self.assertTrue((path / "inside").exists())
+            self.assertEqual(len(errors), 2)
+            self.assertIn(f"scratch mount {path}: busy", errors[0])
+            self.assertIn("kept: mounts remain", errors[1])
+
+    def test_is_mount_point_reads_the_mountinfo(self):
+        with self.context() as (context, root):
+            real = root / "real"
+            real.mkdir()
+            link = root / "link"
+            link.symlink_to(real)
+            spaced = root / "with space"
+            spaced.mkdir()
+            mountinfo = root / "mountinfo"
+            mountinfo.write_text(
+                f"36 35 98:0 / {real} rw,relatime shared:1 - tmpfs tmpfs rw\n"
+                f"37 35 98:1 / {str(spaced).replace(' ', chr(92) + '040')} "
+                "rw - tmpfs tmpfs rw\n",
+                encoding="utf-8",
+            )
+            with patch.object(support, "MOUNTINFO", mountinfo):
+                self.assertTrue(context.is_mount_point(real))
+                # The real path of a link is what the kernel lists.
+                self.assertTrue(context.is_mount_point(link))
+                self.assertTrue(context.is_mount_point(spaced))
+                self.assertFalse(context.is_mount_point(root))
+                # A path that only starts like a mount point is none.
+                (root / "real2").mkdir()
+                self.assertFalse(context.is_mount_point(root / "real2"))
+
+    def test_parse_mountinfo(self):
+        text = (
+            "36 35 98:0 /mnt1 /mnt2 rw,noatime shared:1 - ext3 /dev/root rw\r\n"
+            "37 36 98:0 /a /with\\040space\\011tab ro,nosuid,idmapped - tmpfs x rw\n"
+            "short line\n"
+            "\n"
+        )
+        self.assertEqual(
+            support.parse_mountinfo(text),
+            [
+                ("/mnt2", frozenset({"rw", "noatime"})),
+                ("/with space\ttab", frozenset({"ro", "nosuid", "idmapped"})),
+            ],
+        )
+
+
+class UpTemporaryDirectoryTests(unittest.TestCase):
+    """The directories that up makes for its binds, in /tmp.
+
+    A case that kills a background up leaves them. The next preflight refuses
+    them (a leftover would break the count of a later case), and cleanup removes
+    the ones of this run. Real temporary directories; no host state.
+    """
+
+    @contextmanager
+    def temporary_root(self):
+        with tempfile.TemporaryDirectory() as parent:
+            base = Path(parent)
+            for name in (
+                "sandy-keepalive-abc",
+                "sandy-init-xyz",
+                "sandy-keepalive",
+                "other",
+            ):
+                (base / name).mkdir()
+            (base / "sandy-keepalive-abc" / "keepalive.sh").write_text("x")
+            with patch.object(support, "UP_TEMPORARY_ROOT", base):
+                yield base
+
+    def test_lists_the_directories_of_up_sorted(self):
+        with self.temporary_root() as base:
+            self.assertEqual(
+                support.up_temporary_directories(),
+                [base / "sandy-init-xyz", base / "sandy-keepalive-abc"],
+            )
+
+    def test_lists_nothing_when_there_is_none(self):
+        with tempfile.TemporaryDirectory() as parent:
+            with patch.object(support, "UP_TEMPORARY_ROOT", Path(parent)):
+                self.assertEqual(support.up_temporary_directories(), [])
+
+    def test_preflight_refuses_a_leftover_directory(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            machines = root / "machines"
+            machines.mkdir()
+            context = SliceProbeContext(root / "run", host_state_owned=False)
+            context.filesystem_machine_link = machines / "sandy.e2e-filesystem-x"
+            context.filesystem_image_root = root / "missing-image"
+            context.filesystem_host_target = root / "missing-host"
+            with self.temporary_root() as base, patch.object(
+                support.os, "getuid", return_value=0
+            ), patch.dict(support.os.environ, {"SANDY_E2E": "1"}), patch.object(
+                support, "SYSTEMD_MACHINES", machines
+            ), patch.object(
+                support, "INSTALL_DIR", root / "missing-install"
+            ), patch.object(
+                support.shutil, "which", return_value="/usr/bin/tool"
+            ):
+                with self.assertRaisesRegex(
+                    E2EFailure,
+                    f"pre-existing Sandy temporary directories: "
+                    f"{base / 'sandy-init-xyz'}, {base / 'sandy-keepalive-abc'}",
+                ):
+                    context.preflight()
+            self.assertFalse(context._host_state_owned)
+            self.assertEqual(context.commands, [])
+
+    def test_cleanup_removes_the_directories_of_a_run_that_owns_host_state(self):
+        with tempfile.TemporaryDirectory() as parent:
+            run = Path(parent) / "run"
+            run.mkdir()
+            context = CleanupProbeContext(run, host_state_owned=True)
+            with self.temporary_root() as base:
+                self.assertEqual(context.cleanup(), [])
+                self.assertEqual(
+                    sorted(path.name for path in base.iterdir()),
+                    ["other", "sandy-keepalive"],
+                )
+
+    def test_cleanup_leaves_the_directories_of_a_run_without_host_state(self):
+        with tempfile.TemporaryDirectory() as parent:
+            run = Path(parent) / "run"
+            run.mkdir()
+            context = CleanupProbeContext(run, host_state_owned=False)
+            with self.temporary_root() as base:
+                self.assertEqual(context.cleanup(), [])
+                self.assertEqual(len(support.up_temporary_directories()), 2)
+                self.assertTrue(
+                    (base / "sandy-keepalive-abc" / "keepalive.sh").exists()
+                )
+
+    def test_a_link_or_a_foreign_entry_is_not_removed_and_not_followed(self):
+        with tempfile.TemporaryDirectory() as parent:
+            run = Path(parent) / "run"
+            run.mkdir()
+            victim = Path(parent) / "victim"
+            victim.mkdir()
+            (victim / "keep").write_text("x")
+            context = CleanupProbeContext(run, host_state_owned=True)
+            with self.temporary_root() as base:
+                (base / "sandy-init-link").symlink_to(victim, target_is_directory=True)
+                (base / "sandy-init-file").write_text("x")
+                errors = context.cleanup()
+                # The directories are removed; the entries that are not are kept.
+                self.assertEqual(
+                    sorted(path.name for path in base.iterdir()),
+                    ["other", "sandy-init-file", "sandy-init-link", "sandy-keepalive"],
+                )
+            self.assertTrue((victim / "keep").exists())
+            self.assertEqual(len(errors), 1)
+            self.assertIn("up temporary directories: Refusing to remove", errors[0])
+            self.assertIn("sandy-init-file", errors[0])
+            self.assertIn("sandy-init-link", errors[0])
+
+    def test_an_entry_of_another_owner_is_not_removed(self):
+        with tempfile.TemporaryDirectory() as parent:
+            run = Path(parent) / "run"
+            run.mkdir()
+            context = CleanupProbeContext(run, host_state_owned=True)
+            with self.temporary_root(), patch.object(
+                support.os, "geteuid", return_value=os.geteuid() + 1
+            ):
+                errors = context.cleanup()
+                self.assertEqual(len(support.up_temporary_directories()), 2)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("unexpected entry", errors[0])
+
+
+class HostUserTests(unittest.TestCase):
+    """The commands that run as the host user, as a user of `sudo sandy` would."""
+
+    def make_context(self):
+        context = E2EContext.__new__(E2EContext)
+        context.host_uid = 1234
+        return context
+
+    def test_host_user_command_drops_to_the_numeric_ids_without_groups(self):
+        self.assertEqual(
+            self.make_context().host_user_command(["tee", "-a", "/x"]),
+            (
+                "setpriv",
+                "--reuid=1234",
+                "--regid=1234",
+                "--clear-groups",
+                "--",
+                "tee",
+                "-a",
+                "/x",
+            ),
+        )
+
+    def test_host_user_command_rejects_an_invalid_command(self):
+        for command in ([], [""], ["id", ""], [None]):
+            with self.subTest(command=command):
+                with self.assertRaises(E2EFailure):
+                    self.make_context().host_user_command(cast(Sequence[str], command))
+
+    def test_run_as_host_user_passes_the_wrapped_command_to_run(self):
+        context = self.make_context()
+        with patch.object(E2EContext, "run") as run:
+            context.run_as_host_user(["rm", "--", "/x"], expected=1, input_text="in")
+            context.run_as_host_user(["id"])
+        self.assertEqual(
+            run.call_args_list[0],
+            call(
+                (
+                    "setpriv",
+                    "--reuid=1234",
+                    "--regid=1234",
+                    "--clear-groups",
+                    "--",
+                    "rm",
+                    "--",
+                    "/x",
+                ),
+                expected=1,
+                input_text="in",
+            ),
+        )
+        self.assertEqual(run.call_args_list[1].kwargs["expected"], 0)
+        self.assertIsNone(run.call_args_list[1].kwargs["input_text"])
+
+
+class RunnerTests(unittest.TestCase):
+    def test_the_mount_cases_run_after_lifecycle_and_before_confinement(self):
+        modules = [module.__name__.rsplit(".", 1)[-1] for module in runner.TEST_MODULES]
+        self.assertEqual(
+            modules[modules.index("test_lifecycle") :][:3],
+            ["test_lifecycle", "test_mounts", "test_confinement"],
+        )
+        self.assertEqual(len(modules), len(set(modules)))
+        for module in runner.TEST_MODULES:
+            self.assertTrue(callable(module.test_main))
+
+    @contextmanager
+    def runner_environment(self, **variables):
+        environment = {"SANDY_E2E": "1", **variables}
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            runner.os, "getuid", return_value=0
+        ), patch.object(runner.sys, "argv", ["runner"]):
+            yield
+
+    def test_the_guard_rejects_malformed_settings_before_anything_is_made(self):
+        for variable, value in (
+            (HOST_UID_VARIABLE, "0"),
+            (HOST_UID_VARIABLE, "root"),
+            (BASE_IMAGE_VARIABLE, "ubuntu"),
+            (BASE_IMAGE_VARIABLE, "ubuntu:26.04;id"),
+        ):
+            with self.subTest(variable=variable, value=value):
+                with self.runner_environment(**{variable: value}):
+                    with self.assertRaises(E2EFailure):
+                        runner._guard()
+
+    def test_the_guard_accepts_valid_settings(self):
+        with self.runner_environment(
+            **{HOST_UID_VARIABLE: "1234", BASE_IMAGE_VARIABLE: "ubuntu:26.04"}
+        ):
+            self.assertFalse(runner._guard())
+        with self.runner_environment():
+            self.assertFalse(runner._guard())
+            with patch.object(runner.sys, "argv", ["runner", "--full"]):
+                self.assertTrue(runner._guard())
+
+
+def fake_context(**attributes: object) -> E2EContext:
+    """Return a stand-in with only the attributes that a helper reads."""
+    return cast(E2EContext, SimpleNamespace(**attributes))
+
+
+class MountCaseHelperTests(unittest.TestCase):
+    """The pure helpers of tests/e2e/test_mounts.py."""
+
+    def test_parse_owners_reads_stat_output_with_terminal_line_ends(self):
+        text = "1000:1000 /home/d/workspace\r\n65534:65534 /home/d/w f\r\nnoise\r\n"
+        self.assertEqual(
+            test_mounts._parse_owners(text),
+            {"/home/d/workspace": (1000, 1000)},
+        )
+
+    def test_host_mounts_below_lists_only_mounts_at_or_below_the_root(self):
+        with tempfile.TemporaryDirectory() as parent:
+            mountinfo = Path(parent) / "mountinfo"
+            mountinfo.write_text(
+                "1 0 8:1 / /run/x rw - tmpfs t rw\n"
+                "2 1 8:1 / /run/x/sub rw - tmpfs t rw\n"
+                "3 1 8:1 / /run/xy rw - tmpfs t rw\n"
+                "4 1 8:1 / /run rw - tmpfs t rw\n",
+                encoding="utf-8",
+            )
+            with patch.object(test_mounts, "MOUNTINFO", mountinfo):
+                self.assertEqual(
+                    test_mounts._host_mounts_below(Path("/run/x")),
+                    ["/run/x", "/run/x/sub"],
+                )
+                self.assertEqual(test_mounts._host_mounts_below(Path("/none")), [])
+
+    def test_host_mount_count_counts_the_lines_of_one_mount_point(self):
+        with tempfile.TemporaryDirectory() as parent:
+            target = Path(parent) / "pm"
+            target.mkdir()
+            link = Path(parent) / "link"
+            link.symlink_to(target)
+            mountinfo = Path(parent) / "mountinfo"
+            mountinfo.write_text(
+                f"1 0 8:1 / {target} rw - tmpfs t rw\n"
+                f"2 1 8:1 / {target} rw - tmpfs t rw\n"
+                f"3 1 8:1 / {target}/sub rw - tmpfs t rw\n"
+                f"4 1 8:1 / {target}x rw - tmpfs t rw\n",
+                encoding="utf-8",
+            )
+            with patch.object(test_mounts, "MOUNTINFO", mountinfo):
+                self.assertEqual(test_mounts._host_mount_count(target), 2)
+                # The kernel lists the real path.
+                self.assertEqual(test_mounts._host_mount_count(link), 2)
+                self.assertEqual(test_mounts._host_mount_count(Path(parent)), 0)
+
+    def test_entries_of_root_finds_entries_of_root_as_user_or_group(self):
+        with tempfile.TemporaryDirectory() as parent:
+            base = Path(parent)
+            (base / "dir").mkdir()
+            for name in ("plain", "root-user", "root-group", "dir/inner"):
+                (base / name).write_text("x")
+            real_lstat = os.lstat
+
+            def lstat(path):
+                name = Path(path).name
+                if name == "root-user":
+                    return SimpleNamespace(st_uid=0, st_gid=1000)
+                if name == "root-group":
+                    return SimpleNamespace(st_uid=1000, st_gid=0)
+                if name == "inner":
+                    return SimpleNamespace(st_uid=0, st_gid=0)
+                return real_lstat(path)
+
+            with patch.object(test_mounts.os, "lstat", side_effect=lstat):
+                found = test_mounts._entries_of_root([base])
+        self.assertEqual(
+            found,
+            sorted([base / "root-user", base / "root-group", base / "dir" / "inner"]),
+        )
+
+    def test_remove_all_removes_trees_and_links_without_following(self):
+        with tempfile.TemporaryDirectory() as parent:
+            base = Path(parent)
+            tree = base / "tree"
+            (tree / "sub").mkdir(parents=True)
+            (tree / "sub" / "file").write_text("x")
+            keep = base / "keep"
+            keep.mkdir()
+            (keep / "kept").write_text("x")
+            link = base / "link"
+            link.symlink_to(keep, target_is_directory=True)
+            plain = base / "plain"
+            plain.write_text("x")
+            test_mounts._remove_all([tree, link, plain, base / "missing"])
+            self.assertFalse(tree.exists())
+            self.assertFalse(link.is_symlink())
+            self.assertFalse(plain.exists())
+            self.assertTrue((keep / "kept").exists())
+
+    def test_host_file_belongs_to_the_host_user(self):
+        context = fake_context(host_uid=1234)
+        with tempfile.TemporaryDirectory() as parent:
+            path = Path(parent) / "file"
+            with patch.object(test_mounts.os, "chown") as chown:
+                result = test_mounts._host_file(context, path, "text\n", mode=0o600)
+            self.assertEqual(result, path)
+            self.assertEqual(path.read_text(encoding="utf-8"), "text\n")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            chown.assert_called_once_with(path, 1234, 1234)
+
+    def test_exec_fails_accepts_only_a_failing_command(self):
+        def result(code):
+            return CommandResult(("sandy",), code, "out", "err")
+
+        for code in (1, 2, 126):
+            with patch.object(test_mounts, "_exec", return_value=result(code)):
+                self.assertEqual(
+                    test_mounts._exec_fails(fake_context(), "false").returncode, code
+                )
+        # A success, and a refused attach, are not the failure under test.
+        for code in (0, test_mounts.ENTRY_FAILURE):
+            with patch.object(test_mounts, "_exec", return_value=result(code)):
+                with self.assertRaises(E2EFailure):
+                    test_mounts._exec_fails(fake_context(), "false")
+
+    def test_container_ids_parse_the_id_output(self):
+        for stdout, expected in (
+            ("1000\r\n1000\r\n", (1000, 1000)),
+            ("1001 100", (1001, 100)),
+        ):
+            with patch.object(
+                test_mounts,
+                "_exec",
+                return_value=CommandResult(("sandy",), 0, stdout, ""),
+            ):
+                self.assertEqual(test_mounts._container_ids(fake_context()), expected)
+        for stdout in ("", "1000", "1000 x", "1 2 3", "-1 5"):
+            with patch.object(
+                test_mounts,
+                "_exec",
+                return_value=CommandResult(("sandy",), 0, stdout, ""),
+            ):
+                with self.assertRaises(E2EFailure):
+                    test_mounts._container_ids(fake_context())
+
+    def test_container_owners_requires_an_answer_for_every_path(self):
+        answer = CommandResult(("sandy",), 0, "1:2 /a\r\n", "")
+        with patch.object(test_mounts, "_exec", return_value=answer) as run:
+            self.assertEqual(
+                test_mounts._container_owners(fake_context(), "/a"), {"/a": (1, 2)}
+            )
+            with self.assertRaises(E2EFailure):
+                test_mounts._container_owners(fake_context(), "/a", "/b")
+        self.assertEqual(run.call_args_list[0].args[1], "stat -c '%u:%g %n' /a")
+
+    def test_not_started_checks_the_machine_the_image_and_the_scope(self):
+        with tempfile.TemporaryDirectory() as parent:
+            machines = Path(parent)
+            context = fake_context(machine_running=lambda name: False)
+            with patch.object(test_mounts, "SYSTEMD_MACHINES", machines), patch.object(
+                test_mounts, "_scope_loaded", return_value=False
+            ):
+                test_mounts._assert_not_started(context, "e2e-x")
+                (machines / "sandy.e2e-x").mkdir()
+                with self.assertRaisesRegex(E2EFailure, "exists"):
+                    test_mounts._assert_not_started(context, "e2e-x")
+                (machines / "sandy.e2e-x").rmdir()
+                (machines / "sandy.e2e-x").symlink_to(machines)
+                with self.assertRaisesRegex(E2EFailure, "exists"):
+                    test_mounts._assert_not_started(context, "e2e-x")
+                (machines / "sandy.e2e-x").unlink()
+                with patch.object(test_mounts, "_scope_loaded", return_value=True):
+                    with self.assertRaisesRegex(E2EFailure, "scope"):
+                        test_mounts._assert_not_started(context, "e2e-x")
+            running = fake_context(machine_running=lambda name: True)
+            with self.assertRaisesRegex(E2EFailure, "running"):
+                test_mounts._assert_not_started(running, "e2e-x")
+
+    def test_wait_scope_gone_polls_until_the_scope_is_gone(self):
+        with patch.object(
+            test_mounts, "_scope_loaded", side_effect=[True, True, False]
+        ), patch.object(test_mounts.time, "sleep") as sleep:
+            test_mounts._wait_scope_gone(fake_context(), "e2e-x")
+        self.assertEqual(sleep.call_count, 2)
+        with patch.object(
+            test_mounts, "_scope_loaded", return_value=True
+        ), patch.object(test_mounts.time, "sleep"), patch.object(
+            test_mounts.time, "monotonic", side_effect=[0.0, 1.0, 100.0]
+        ):
+            with self.assertRaisesRegex(E2EFailure, "did not go"):
+                test_mounts._wait_scope_gone(fake_context(), "e2e-x")
 
 
 if __name__ == "__main__":

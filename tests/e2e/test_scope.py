@@ -393,8 +393,6 @@ class _Console:
             *extra,
         ]
         self.output = context.root / f"console-{time.monotonic_ns()}.log"
-        environment = context.safe_environment()
-        environment["SUDO_UID"] = "1000"
         with self.output.open("w", encoding="utf-8") as stream:
             self.process = subprocess.Popen(
                 arguments,
@@ -402,7 +400,7 @@ class _Console:
                 stdout=stream,
                 stderr=subprocess.STDOUT,
                 cwd=context.root,
-                env=environment,
+                env=context.safe_environment(),
             )
 
     def send(self, text: str) -> None:

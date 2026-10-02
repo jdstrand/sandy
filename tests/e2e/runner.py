@@ -15,13 +15,21 @@ from tests.e2e import (
     test_full,
     test_install,
     test_lifecycle,
+    test_mounts,
     test_network,
     test_nftables,
     test_scope,
     test_stale_rules,
     test_unhappy,
 )
-from tests.e2e.support import E2EContext, E2EFailure
+from tests.e2e.support import (
+    BASE_IMAGE_VARIABLE,
+    HOST_UID_VARIABLE,
+    E2EContext,
+    E2EFailure,
+    parse_base_image,
+    parse_host_uid,
+)
 
 TEST_MODULES = (
     test_install,
@@ -29,6 +37,7 @@ TEST_MODULES = (
     test_filesystem,
     test_cache,
     test_lifecycle,
+    test_mounts,
     test_confinement,
     test_scope,
     test_stale_rules,
@@ -45,6 +54,9 @@ def _guard() -> bool:
     arguments = sys.argv[1:]
     if arguments not in ([], ["--full"]):
         raise E2EFailure("The ordered E2E runner accepts only the optional --full flag")
+    # Reject a malformed host uid or base image before anything is created.
+    parse_host_uid(os.environ.get(HOST_UID_VARIABLE))
+    parse_base_image(os.environ.get(BASE_IMAGE_VARIABLE))
     return arguments == ["--full"]
 
 

@@ -25,8 +25,8 @@ from pathlib import Path
 from types import ModuleType
 
 from tests.e2e.support import (
-    CONTAINER_USER_ID,
     SANDY,
+    CommandResult,
     E2EContext,
     E2EFailure,
     assert_contains,
@@ -458,6 +458,31 @@ def _exec(context: E2EContext, command: str, *, user: str | None = None, **kwarg
     )
 
 
+# up mounts the workspace and shared directories as soon as the payload exists,
+# and polls every 0.5 s. Until then an attach fails closed (status 125, "Container
+# is still starting"), also while the payload is held.
+MOUNTS_WAIT_TIMEOUT = 30
+
+
+def _exec_when_mounted(context: E2EContext, command: str) -> CommandResult:
+    """Run a command in the main container as soon as up has mounted its directories.
+
+    Retry only the refusal for a container that is still starting.
+    """
+    deadline = time.monotonic() + MOUNTS_WAIT_TIMEOUT
+    while True:
+        result = _exec(context, command, expected=None)
+        if result.returncode == 0:
+            return result
+        if result.returncode != ENTRY_FAILURE or "still starting" not in result.output:
+            raise E2EFailure(
+                f"Unexpected result {result.returncode}: {result.output[-2000:]}"
+            )
+        if time.monotonic() >= deadline:
+            raise E2EFailure("up did not mount the directories in time")
+        time.sleep(0.1)
+
+
 def _status_via(context: E2EContext, arguments: list[str], user: str) -> dict:
     result = context.sandy(arguments, name=context.main_name, user=user)
     return _parse_status(result.stdout)
@@ -710,7 +735,6 @@ def test_main(context: E2EContext) -> None:
     ]
     up_arguments = common + ["up", "--detach", "--persistent", "--network", "lenient"]
     start_environment = context.safe_environment()
-    start_environment["SUDO_UID"] = str(CONTAINER_USER_ID)
 
     with context.case("attaches while up -d starts the container are refused or final"):
         # Every attach that runs must have the final confinement.
@@ -907,8 +931,9 @@ def test_main(context: E2EContext) -> None:
                 if payload:
                     held_in = attempt
                     try:
-                        # The readiness probe of up is an attach too.
-                        _exec(context, "true")
+                        # The readiness probe of up is an attach too. It needs the
+                        # mounts, which up makes while the payload is held.
+                        _exec_when_mounted(context, "true")
                         time.sleep(KEEPALIVE_HOLD_SECONDS)
                         if up.poll() is not None:
                             raise E2EFailure(

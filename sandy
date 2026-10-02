@@ -2400,16 +2400,39 @@ def _open_existing_managed_text_file(path: str) -> Optional[Any]:
         os.close(parent_fd)
 
 
-# Kernel interfaces for confined container entry. Python 3.10 has no os.setns,
-# and glibc declares ptrace and prctl as variadic, so every call goes through
-# syscall(2) with a fixed argument count. Only 64-bit x86_64 and aarch64 are
-# supported; any other architecture fails closed.
+# Kernel interfaces for confined container entry and for the mounts of the
+# workspace and shared directories. Python 3.10 has no os.setns or
+# os.unshare, glibc declares ptrace and prctl as variadic, and glibc has no
+# wrappers for the mount calls, so every call goes through syscall(2) with a
+# fixed argument count. Only 64-bit x86_64 and aarch64 are supported; any
+# other architecture fails closed.
 # Syscall numbers from the Linux sources: x86_64 from
 # arch/x86/entry/syscalls/syscall_64.tbl, and aarch64 from
-# include/uapi/asm-generic/unistd.h.
+# include/uapi/asm-generic/unistd.h. open_tree, move_mount, openat2, and
+# mount_setattr have the same number on both architectures.
 ENTRY_SYSCALL_NUMBERS: Final[Mapping[str, Mapping[str, int]]] = {
-    "x86_64": {"ptrace": 101, "prctl": 157, "setns": 308, "seccomp": 317},
-    "aarch64": {"ptrace": 117, "prctl": 167, "setns": 268, "seccomp": 277},
+    "x86_64": {
+        "ptrace": 101,
+        "prctl": 157,
+        "setns": 308,
+        "seccomp": 317,
+        "unshare": 272,
+        "open_tree": 428,
+        "move_mount": 429,
+        "openat2": 437,
+        "mount_setattr": 442,
+    },
+    "aarch64": {
+        "ptrace": 117,
+        "prctl": 167,
+        "setns": 268,
+        "seccomp": 277,
+        "unshare": 97,
+        "open_tree": 428,
+        "move_mount": 429,
+        "openat2": 437,
+        "mount_setattr": 442,
+    },
 }
 # syscall(2) passes at most six arguments.
 SYSCALL_ARGUMENT_COUNT: Final = 6
@@ -2462,6 +2485,24 @@ NAMESPACE_ENTRY_ORDER: Final[Tuple[Tuple[str, int], ...]] = (
     ("mnt", CLONE_NEWNS),
     ("user", CLONE_NEWUSER),
 )
+# The values below are part of the kernel ABI and are the same on x86_64 and
+# aarch64. <fcntl.h> and <linux/fcntl.h>: AT_FDCWD and AT_EMPTY_PATH.
+AT_FDCWD: Final = -100
+AT_EMPTY_PATH: Final = 0x1000
+# <linux/mount.h>: open_tree, move_mount, and the mount_setattr attributes.
+OPEN_TREE_CLONE: Final = 1
+OPEN_TREE_CLOEXEC: Final = os.O_CLOEXEC
+MOVE_MOUNT_F_EMPTY_PATH: Final = 0x4
+MOVE_MOUNT_T_EMPTY_PATH: Final = 0x40
+MOUNT_ATTR_NOSUID: Final = 0x2
+MOUNT_ATTR_NODEV: Final = 0x4
+MOUNT_ATTR_IDMAP: Final = 0x100000
+# <linux/mount.h>: the propagation type of mount_attr.propagation. A private
+# mount is not a peer of any other mount.
+MS_PRIVATE: Final = 1 << 18
+# <linux/openat2.h>: openat2 resolve flags.
+RESOLVE_NO_MAGICLINKS: Final = 0x02
+RESOLVE_NO_SYMLINKS: Final = 0x04
 _LIBC: Optional[Any] = None
 
 
@@ -2486,6 +2527,27 @@ class _SockFprog(ctypes.Structure):
 
 
 SOCK_FILTER_SIZE: Final = ctypes.sizeof(_SockFilter)
+
+
+class _MountAttr(ctypes.Structure):
+    """struct mount_attr from linux/mount.h, version 0 (32 bytes)."""
+
+    _fields_ = [
+        ("attr_set", ctypes.c_uint64),
+        ("attr_clr", ctypes.c_uint64),
+        ("propagation", ctypes.c_uint64),
+        ("userns_fd", ctypes.c_uint64),
+    ]
+
+
+class _OpenHow(ctypes.Structure):
+    """struct open_how from linux/openat2.h, version 0 (24 bytes)."""
+
+    _fields_ = [
+        ("flags", ctypes.c_uint64),
+        ("mode", ctypes.c_uint64),
+        ("resolve", ctypes.c_uint64),
+    ]
 
 
 def _libc() -> Any:
@@ -2659,6 +2721,246 @@ def _seccomp_set_mode_filter(program: bytes) -> None:
     )
 
 
+# The mounts of the workspace and shared directories (see _mount_container_dirs)
+# use two kinds of short-lived helper child: one makes a user namespace, and
+# one joins the container's mount namespace. A child reports "ok", or the
+# failed step and its errno, such as "move_mount 22", through a pipe.
+MOUNT_HELPER_TIMEOUT: Final = 5
+HELPER_MESSAGE_MAX_BYTES: Final = 64
+HELPER_FAILURE_PATTERN: Final = re.compile(r"([a-z][a-z0-9_]{0,15}) ([0-9]{1,5})")
+
+
+class _MountError(Exception):
+    """A step that mounts a host directory in the container failed.
+
+    The message names the step and the errno, such as "move_mount failed:
+    Invalid argument (errno 22)". The caller stops the container.
+    """
+
+
+def _mount_step_error(step: str, error: Optional[int]) -> _MountError:
+    """Return the _MountError for a failed step with an errno."""
+    error = errno.EIO if error is None else error
+    return _MountError(f"{step} failed: {os.strerror(error)} (errno {error})")
+
+
+def _openat2_no_links(path: str, flags: int) -> int:
+    """Open an absolute path that has no link in any of its components.
+
+    openat2 with RESOLVE_NO_SYMLINKS rejects a symbolic link in every
+    component, parents included, and RESOLVE_NO_MAGICLINKS rejects the
+    /proc style links. Either gives ELOOP. The path starts at the root of
+    the calling process. Use O_PATH in flags when only a handle is needed.
+    """
+    # The rules for a path in the container also fit a host path: normalized,
+    # absolute, and without control characters. A NUL byte would end the C
+    # string early and make the kernel open another path.
+    if not _validate_container_path(path):
+        raise ValueError("Invalid path")
+    encoded = ctypes.create_string_buffer(os.fsencode(path))
+    how = _OpenHow(flags | os.O_CLOEXEC, 0, RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)
+    return _entry_syscall(
+        "openat2",
+        AT_FDCWD,
+        ctypes.addressof(encoded),
+        ctypes.addressof(how),
+        ctypes.sizeof(how),
+    )
+
+
+def _read_helper_message(fd: int, timeout: float) -> bytes:
+    """Read the short message of a helper child; b"" when none comes in time."""
+    ready, _, _ = select.select([fd], [], [], timeout)
+    if not ready:
+        return b""
+    return os.read(fd, HELPER_MESSAGE_MAX_BYTES)
+
+
+def _end_helper_child(pid: int) -> None:
+    """Kill a helper child of this process and reap it.
+
+    The kill bounds the wait. A child that already exited is a zombie until
+    the wait, so the kill finds it.
+    """
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    os.waitpid(pid, 0)
+
+
+def _check_helper_result(message: bytes) -> None:
+    """Return when a helper child reported success; raise _MountError if not."""
+    if message == b"ok":
+        return
+    match = HELPER_FAILURE_PATTERN.fullmatch(message.decode("ascii", "replace"))
+    if match is None:
+        raise _MountError("helper process gave no result")
+    raise _mount_step_error(match.group(1), int(match.group(2)))
+
+
+def _write_id_map(pid: int, name: str, line: str) -> None:
+    """Write the one map line of a child's new user namespace.
+
+    Host root writes it from the parent namespace, so the second column is a
+    host id. The kernel takes the whole map in one write.
+    """
+    if name not in ("uid_map", "gid_map"):
+        raise ValueError("Invalid map file")
+    data = line.encode("ascii")
+    fd = os.open(f"/proc/{_require_pid(pid)}/{name}", os.O_WRONLY | os.O_CLOEXEC)
+    try:
+        if os.write(fd, data) != len(data):
+            raise OSError(errno.EIO, f"Short write to {name}")
+    finally:
+        os.close(fd)
+
+
+def _new_idmap_userns(uid_line: str, gid_line: str) -> int:
+    """Return a descriptor of a new user namespace with exactly these maps.
+
+    unshare(CLONE_NEWUSER) puts the caller into the namespace, so a helper
+    child does it. This process, as host root, then writes the child's maps
+    and opens its ns/user file. The descriptor keeps the namespace after the
+    child ends. The child also ends when this process does, because the
+    pipe that it waits on then closes.
+    """
+    ready_read, ready_write = os.pipe()
+    done_read, done_write = os.pipe()
+    try:
+        pid = os.fork()
+    except BaseException:
+        _close_fds((ready_read, ready_write, done_read, done_write))
+        raise
+    if pid == 0:
+        code = 1
+        try:
+            _close_fds((ready_read, done_write))
+            try:
+                _entry_syscall("unshare", CLONE_NEWUSER)
+                os.write(ready_write, b"ok")
+                # Wait until the parent has opened the namespace and ends
+                # this process; the read also returns when the parent is gone.
+                os.read(done_read, 1)
+                code = 0
+            except OSError as exc:
+                os.write(ready_write, f"unshare {exc.errno}".encode("ascii"))
+        finally:
+            os._exit(code)
+    _close_fds((ready_write, done_read))
+    try:
+        _check_helper_result(_read_helper_message(ready_read, MOUNT_HELPER_TIMEOUT))
+        for name, line in (("uid_map", uid_line), ("gid_map", gid_line)):
+            try:
+                _write_id_map(pid, name, line)
+            except OSError as exc:
+                raise _mount_step_error(f"write of {name}", exc.errno) from exc
+        try:
+            return os.open(f"/proc/{pid}/ns/user", os.O_RDONLY | os.O_CLOEXEC)
+        except OSError as exc:
+            raise _mount_step_error("open of ns/user", exc.errno) from exc
+    finally:
+        _close_fds((ready_read, done_write))
+        _end_helper_child(pid)
+
+
+def _idmapped_tree(source_fd: int, userns_fd: int) -> int:
+    """Return a detached, ID-mapped, nosuid, nodev, private clone of a directory.
+
+    open_tree with OPEN_TREE_CLONE makes a bind mount of the directory that
+    source_fd holds. The mount is not in any mount namespace yet, so nothing
+    on the host changes until move_mount attaches it. The caller closes the
+    returned descriptor. Mounts below the directory are not included.
+
+    The clone is private. A clone of a shared host mount (the host's root is
+    shared on systemd hosts) is otherwise a peer of it: a mount that root in
+    the container made below the directory then appeared on the host, and a
+    mount that the host made later appeared in the container (measured on
+    Linux 5.15, 6.1, and 6.12). The clone has no mounts below it, so private
+    is enough; the recursive form (rprivate) would change nothing.
+    """
+    empty = ctypes.create_string_buffer(b"")
+    tree_fd = _entry_syscall(
+        "open_tree",
+        source_fd,
+        ctypes.addressof(empty),
+        OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH,
+    )
+    try:
+        attr = _MountAttr(
+            MOUNT_ATTR_IDMAP | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
+            0,
+            MS_PRIVATE,
+            userns_fd,
+        )
+        _entry_syscall(
+            "mount_setattr",
+            tree_fd,
+            ctypes.addressof(empty),
+            AT_EMPTY_PATH,
+            ctypes.addressof(attr),
+            ctypes.sizeof(attr),
+        )
+    except BaseException:
+        os.close(tree_fd)
+        raise
+    return tree_fd
+
+
+def _move_mount_in_namespace(mnt_ns_fd: int, tree_fd: int, target: str) -> None:
+    """Attach a detached mount at target in another mount namespace.
+
+    A child process does the work, because setns changes the mount namespace
+    of the caller for good. The child opens the target with no link in its
+    path, so a link that the container controls cannot lead the mount
+    elsewhere, and it mounts on the descriptor, not on the path.
+    """
+    if not _validate_container_path(target):
+        raise _MountError("Invalid mount target")
+    empty = ctypes.create_string_buffer(b"")
+    result_read, result_write = os.pipe()
+    try:
+        pid = os.fork()
+    except BaseException:
+        _close_fds((result_read, result_write))
+        raise
+    if pid == 0:
+        code = 1
+        try:
+            os.close(result_read)
+            # After setns, an import would load code from the container's
+            # file system. Nothing below imports; make any import fail.
+            sys.meta_path.clear()
+            sys.path.clear()
+            step = "setns"
+            try:
+                _setns(mnt_ns_fd, CLONE_NEWNS)
+                step = "openat2"
+                target_fd = _openat2_no_links(target, os.O_PATH | os.O_DIRECTORY)
+                step = "move_mount"
+                _entry_syscall(
+                    "move_mount",
+                    tree_fd,
+                    ctypes.addressof(empty),
+                    target_fd,
+                    ctypes.addressof(empty),
+                    MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
+                )
+                os.write(result_write, b"ok")
+                code = 0
+            except OSError as exc:
+                os.write(result_write, f"{step} {exc.errno}".encode("ascii"))
+        finally:
+            os._exit(code)
+    os.close(result_write)
+    try:
+        message = _read_helper_message(result_read, MOUNT_HELPER_TIMEOUT)
+    finally:
+        os.close(result_read)
+        _end_helper_child(pid)
+    _check_helper_result(message)
+
+
 @contextmanager  # ensures flock acquisition/release is paired at the call site
 def _lifecycle_lock(timeout: float = LIFECYCLE_LOCK_TIMEOUT) -> Iterator[None]:
     """Hold the global lifecycle lock exclusively, or fail after timeout.
@@ -2711,6 +3013,13 @@ CGROUP_EVENTS_MAX_BYTES: Final = 4096
 UP_CONSOLE_CGROUP: Final = "up-console"
 UP_CONSOLE_TIMEOUT: Final = 5
 UP_CONSOLE_POLL_INTERVAL: Final = 0.01
+# The mounts-pending marker works in the same way: an empty cgroup in the
+# scope of a container whose workspace and shared directories up has not
+# mounted yet. While it exists, the entry helper refuses every attach, so no
+# session sees the empty directories of the image. up creates it under the
+# lifecycle lock before any attach can exist, and removes it, under the same
+# lock, after the last mount.
+MOUNTS_PENDING_CGROUP: Final = "mounts-pending"
 PROC_CGROUP_MAX_BYTES: Final = 4096
 CGROUP_COUNTERS_MAX_BYTES: Final = 4096
 CGROUP_COUNTER_PATTERN: Final = re.compile(r"([a-z_]{1,32}) ([0-9]{1,20})")
@@ -3201,8 +3510,8 @@ def _count_populated_attaches(unit_fd: int) -> int:
     return count
 
 
-def _create_up_console_marker(machine_name: str) -> None:
-    """Create the up-console marker as soon as the scope's cgroup exists.
+def _create_scope_marker(machine_name: str, marker: str) -> None:
+    """Create a marker cgroup as soon as the scope's cgroup exists.
 
     The caller holds the lifecycle lock. Raise TimeoutError when the scope
     does not appear in time.
@@ -3217,28 +3526,69 @@ def _create_up_console_marker(machine_name: str) -> None:
                 raise TimeoutError("The container scope did not appear") from None
             time.sleep(UP_CONSOLE_POLL_INTERVAL)
     try:
-        os.mkdir(UP_CONSOLE_CGROUP, 0o755, dir_fd=unit_fd)
+        os.mkdir(marker, 0o755, dir_fd=unit_fd)
     except FileExistsError:
         pass
     finally:
         os.close(unit_fd)
 
 
-def _remove_up_console_marker(unit_fd: int) -> None:
-    """Remove the up-console marker of an open scope cgroup."""
+def _remove_scope_marker(unit_fd: int, marker: str) -> None:
+    """Remove a marker cgroup of an open scope cgroup."""
     try:
-        os.rmdir(UP_CONSOLE_CGROUP, dir_fd=unit_fd)
+        os.rmdir(marker, dir_fd=unit_fd)
     except FileNotFoundError:
         pass
 
 
-def _up_console_marker_exists(unit_fd: int) -> bool:
-    """Return whether the up-console marker exists."""
+def _scope_marker_exists(unit_fd: int, marker: str) -> bool:
+    """Return whether a marker cgroup exists in an open scope cgroup."""
     try:
-        marker = os.stat(UP_CONSOLE_CGROUP, dir_fd=unit_fd, follow_symlinks=False)
+        entry = os.stat(marker, dir_fd=unit_fd, follow_symlinks=False)
     except FileNotFoundError:
         return False
-    return stat.S_ISDIR(marker.st_mode)
+    return stat.S_ISDIR(entry.st_mode)
+
+
+def _create_up_console_marker(machine_name: str) -> None:
+    """Create the up-console marker as soon as the scope's cgroup exists."""
+    _create_scope_marker(machine_name, UP_CONSOLE_CGROUP)
+
+
+def _remove_up_console_marker(unit_fd: int) -> None:
+    """Remove the up-console marker of an open scope cgroup."""
+    _remove_scope_marker(unit_fd, UP_CONSOLE_CGROUP)
+
+
+def _up_console_marker_exists(unit_fd: int) -> bool:
+    """Return whether the up-console marker exists."""
+    return _scope_marker_exists(unit_fd, UP_CONSOLE_CGROUP)
+
+
+def _create_mounts_pending_marker(machine_name: str) -> None:
+    """Create the mounts-pending marker as soon as the scope's cgroup exists."""
+    _create_scope_marker(machine_name, MOUNTS_PENDING_CGROUP)
+
+
+def _require_no_pending_mounts(machine_name: str) -> None:
+    """Refuse an attach while up has not mounted the container's directories.
+
+    The caller holds the lifecycle lock, as does up when it creates and
+    removes the marker. The error text is the one for a container that has
+    no payload yet, because both mean "still starting". It also says what to
+    do when up ended before it removed the marker; the marker stays until
+    the container stops.
+    """
+    unit_fd = _open_supervisor_cgroup(machine_name)
+    try:
+        pending = _scope_marker_exists(unit_fd, MOUNTS_PENDING_CGROUP)
+    finally:
+        os.close(unit_fd)
+    if pending:
+        raise ProcessLookupError(
+            "Container is still starting; try again "
+            "(if sandy up has ended, stop the container with sandy down)"
+        )
 
 
 def _new_attach_leaf() -> str:
@@ -3357,7 +3707,8 @@ def _extract_leader_confinement(
     before the Leader's namespaces and filters are opened or read, and
     require the payload's filter count and CapBnd to equal the Leader's
     (item 5). Until then the container is still starting, and the attach
-    fails closed.
+    fails closed. It fails closed in the same way while up has not mounted
+    the workspace and shared directories (the mounts-pending marker).
 
     Hold the lifecycle lock for the whole extraction and for the creation of
     the leaf, so that a stop decision cannot interleave with a new attach.
@@ -3383,6 +3734,8 @@ def _extract_leader_confinement(
                 # earlier Sandy started has no payload at PID 2, and it needs
                 # a restart, not a retry.
                 _require_scope_payload_cgroup(_read_process_cgroup(proc_fd), unit)
+                # No session before up has mounted the directories.
+                _require_no_pending_mounts(machine_name)
                 _, payload = _find_payload(proc_fd, pid)
                 namespace_fds = []
                 for name, _ in NAMESPACE_ENTRY_ORDER:
@@ -3421,6 +3774,300 @@ def _extract_leader_confinement(
         attach_kill_fd=attach_kill_fd,
         oom_score_adj=oom_score_adj,
     )
+
+
+# The workspace and shared directories. nspawn starts without them; up mounts
+# each one in the running container's mount namespace (_mount_container_dirs),
+# with the owner of the host directory mapped to the image user. See
+# specs/security-parity.md, item 6.
+# The number of ids in the container's user namespace.
+CONTAINER_ID_COUNT: Final = 65536
+ID_MAP_PATTERN: Final = re.compile(rf" *0 +([1-9][0-9]{{0,9}}) +{CONTAINER_ID_COUNT}\n")
+ID_MAP_MAX_BYTES: Final = 4096
+# The warning about mounts below a directory (see _mounts_below).
+MOUNTINFO_MAX_BYTES: Final = 16 * 1024 * 1024
+MOUNTINFO_ESCAPE_PATTERN: Final = re.compile(r"\\([0-7]{3})")
+SUBMOUNT_LIST_MAX: Final = 3
+IDMAP_MOUNT_HINT: Final = (
+    "ID-mapped mounts need Linux 5.12 or later and a file system that supports "
+    "them (ext4, xfs, and btrfs do; tmpfs needs Linux 6.3; ramfs does not)"
+)
+# The highest valid uid or gid: 4294967295 is (uid_t)-1.
+ID_VALUE_MAX: Final = 0xFFFFFFFE
+
+
+class MountPlan(NamedTuple):
+    """A host directory to mount in the container, checked before the start."""
+
+    # "workspace" or "shared"
+    label: str
+    # The real path on the host, from os.path.realpath
+    source: str
+    # The absolute path in the container
+    target: str
+    # The identity of the directory at the check. The mount requires the
+    # same directory.
+    device: int
+    inode: int
+
+
+def _parse_id_map_shift(text: str, name: str) -> int:
+    """Return the host id that container id 0 maps to, or fail closed.
+
+    The container has one map line, "0 <host id> 65536", which nspawn wrote
+    for --private-users. Any other map, host id 0 included, is not one
+    that Sandy started.
+    """
+    match = ID_MAP_PATTERN.fullmatch(text)
+    if match is None:
+        raise ValueError(f"Unexpected {name} of the container")
+    shift = int(match.group(1))
+    if shift + CONTAINER_ID_COUNT - 1 > ID_VALUE_MAX:
+        raise ValueError(f"Unexpected {name} of the container")
+    return shift
+
+
+def _read_mountinfo() -> str:
+    """Return the mount table of this process, read through its /proc directory."""
+    proc_fd = _open_process_dir(os.getpid())
+    try:
+        data = _read_proc_file(proc_fd, "mountinfo", MOUNTINFO_MAX_BYTES)
+    finally:
+        os.close(proc_fd)
+    return data.decode("utf-8", errors="surrogateescape")
+
+
+def _mounts_below(directory: str, mountinfo: str) -> list:
+    """Return the mount points below a directory, sorted; not the directory.
+
+    mountinfo is the text of /proc/<pid>/mountinfo. The fifth field of a line is
+    the mount point, with a space, tab, newline, and backslash written as an
+    octal escape. A malformed line fails the whole check, so that it cannot
+    hide a mount.
+    """
+    prefix = directory.rstrip("/") + "/"
+    below = set()
+    for line in mountinfo.split("\n"):
+        if not line:
+            continue
+        fields = line.split(" ")
+        if len(fields) < 10 or "-" not in fields[6:]:
+            raise ValueError("Malformed mountinfo line")
+        mount_point = MOUNTINFO_ESCAPE_PATTERN.sub(
+            lambda match: chr(int(match.group(1), 8)), fields[4]
+        )
+        # The root directory is its own prefix; it is not below itself.
+        if mount_point.startswith(prefix) and mount_point != prefix:
+            below.add(mount_point)
+    return sorted(below)
+
+
+def _id_map_line(inside: int, outside: int) -> str:
+    """Return a map line with one id: inside maps to outside."""
+    return f"{inside} {outside} 1\n"
+
+
+def _as_mount_error(exc: OSError) -> _MountError:
+    """Return the _MountError for an OSError of a mount step."""
+    error = errno.EIO if exc.errno is None else exc.errno
+    return _MountError(f"{exc.strerror or os.strerror(error)} (errno {error})")
+
+
+def _check_mount_owner(label: str, source_stat: os.stat_result) -> None:
+    """Refuse a directory that host root owns, as user or as group.
+
+    The container's user maps to the owner of the directory, and its group to
+    the group of the directory. A container process that writes there then
+    creates files of that owner. With root as the owner or the group, it
+    would create files that host root or the root group own, such as a
+    setuid file that runs with those ids on the host.
+    """
+    if source_stat.st_uid == 0 or source_stat.st_gid == 0:
+        raise _MountError(
+            f"root owns the {label} directory, so files that the container "
+            "creates there would belong to root. Use a directory that a "
+            "regular user and group own"
+        )
+
+
+def _open_host_directory(path: str) -> int:
+    """Open a host directory with no link in its path, as a handle (O_PATH)."""
+    try:
+        return _openat2_no_links(path, os.O_PATH | os.O_DIRECTORY)
+    except ValueError as exc:
+        raise _MountError("the path is not valid") from exc
+    except OSError as exc:
+        raise _as_mount_error(exc) from exc
+
+
+def _probe_idmapped_mount(source_fd: int, source_stat: os.stat_result) -> None:
+    """Check that an ID-mapped mount of the directory is possible.
+
+    The probe makes the detached mount that _mount_one makes, with a map of
+    the owner to itself, and drops it. It changes nothing on the host. The
+    kernel needs to be 5.12 or later, and the file system needs to support
+    ID-mapped mounts (measured: ramfs does not, and tmpfs needs Linux 6.3).
+    """
+    userns_fd = _new_idmap_userns(
+        _id_map_line(source_stat.st_uid, source_stat.st_uid),
+        _id_map_line(source_stat.st_gid, source_stat.st_gid),
+    )
+    try:
+        os.close(_idmapped_tree(source_fd, userns_fd))
+    except OSError as exc:
+        raise _MountError(f"{_as_mount_error(exc)}. {IDMAP_MOUNT_HINT}") from exc
+    finally:
+        os.close(userns_fd)
+
+
+def _plan_mount(label: str, source: str, target: str) -> MountPlan:
+    """Check a host directory before any host change; return its plan.
+
+    Raise _MountError when root owns the directory (see _check_mount_owner)
+    or when an ID-mapped mount of it is not possible.
+    """
+    source_fd = _open_host_directory(source)
+    try:
+        try:
+            source_stat = os.fstat(source_fd)
+        except OSError as exc:
+            raise _as_mount_error(exc) from exc
+        _check_mount_owner(label, source_stat)
+        _probe_idmapped_mount(source_fd, source_stat)
+    finally:
+        os.close(source_fd)
+    return MountPlan(label, source, target, source_stat.st_dev, source_stat.st_ino)
+
+
+def _mount_one(
+    plan: MountPlan,
+    uid_shift: int,
+    gid_shift: int,
+    image_ids: Tuple[int, int],
+    mnt_ns_fd: int,
+) -> None:
+    """Mount one planned directory in the container's mount namespace.
+
+    The directory is the one that was checked, and root does not own it. Its
+    owner maps to the image user, and no other id maps: files of the host
+    user belong to the image user in the container, and what the image user
+    creates belongs to the host user. Every other container id, root
+    included, gets EOVERFLOW when it creates a file. The mount is nosuid and
+    nodev. It exists only in the mount namespace of the container.
+    """
+    try:
+        source_fd = _open_host_directory(plan.source)
+        try:
+            source_stat = os.fstat(source_fd)
+            if (source_stat.st_dev, source_stat.st_ino) != (plan.device, plan.inode):
+                raise _MountError(f"the {plan.label} directory changed after the check")
+            _check_mount_owner(plan.label, source_stat)
+            userns_fd = _new_idmap_userns(
+                _id_map_line(
+                    source_stat.st_uid,
+                    _require_int_in_range(
+                        uid_shift + image_ids[0], "uid", 0, ID_VALUE_MAX
+                    ),
+                ),
+                _id_map_line(
+                    source_stat.st_gid,
+                    _require_int_in_range(
+                        gid_shift + image_ids[1], "gid", 0, ID_VALUE_MAX
+                    ),
+                ),
+            )
+            try:
+                tree_fd = _idmapped_tree(source_fd, userns_fd)
+                try:
+                    _move_mount_in_namespace(mnt_ns_fd, tree_fd, plan.target)
+                finally:
+                    os.close(tree_fd)
+            finally:
+                os.close(userns_fd)
+        finally:
+            os.close(source_fd)
+    except OSError as exc:
+        raise _as_mount_error(exc) from exc
+    except ValueError as exc:
+        raise _MountError(str(exc)) from exc
+
+
+def _mount_container_dirs(
+    machine_name: str, plans: Tuple[MountPlan, ...], image_ids: Tuple[int, int]
+) -> None:
+    """Mount the planned directories in the running container; end "pending".
+
+    up calls this until it works. It finds the container as the entry helper
+    does (see _extract_leader_confinement): the Leader pinned and confirmed
+    with machinectl, in the payload cgroup of the scope, and with the payload
+    (PID 2) present. nspawn has completed its mounts when the payload exists,
+    so the mounts of this function stay. It raises ProcessLookupError while
+    the container is still starting. Any other error is final; the caller
+    stops the container. A _MountError names the failed step and its errno.
+
+    The whole step is under the lifecycle lock, and it removes the
+    mounts-pending marker under that lock. So no attach sees a container
+    with only some of its directories.
+    """
+    unit = _supervisor_unit_name(machine_name)
+    opened: list = []
+    with _lifecycle_lock():
+        try:
+            try:
+                leader_pid = _query_machine_leader(machine_name)
+            except (subprocess.SubprocessError, ValueError) as exc:
+                # machined does not report a Leader before the machine exists.
+                raise ProcessLookupError("Container is still starting") from exc
+            pidfd = os.pidfd_open(leader_pid)
+            opened.append(pidfd)
+            # The pidfd pins one process. Confirm that it is the Leader of
+            # the machine now, not a later user of the same PID.
+            if _query_machine_leader(machine_name) != leader_pid:
+                raise PermissionError("Container Leader changed during the mounts")
+            try:
+                proc_fd = _open_process_dir(leader_pid)
+            except FileNotFoundError as exc:
+                raise ProcessLookupError("Container Leader exited") from exc
+            try:
+                _require_scope_payload_cgroup(_read_process_cgroup(proc_fd), unit)
+                _find_payload(proc_fd, leader_pid)
+                uid_shift = _parse_id_map_shift(
+                    _read_proc_file(proc_fd, "uid_map", ID_MAP_MAX_BYTES).decode(
+                        "ascii", errors="replace"
+                    ),
+                    "uid_map",
+                )
+                gid_shift = _parse_id_map_shift(
+                    _read_proc_file(proc_fd, "gid_map", ID_MAP_MAX_BYTES).decode(
+                        "ascii", errors="replace"
+                    ),
+                    "gid_map",
+                )
+                mnt_ns_fd = os.open(
+                    "ns/mnt", os.O_RDONLY | os.O_CLOEXEC, dir_fd=proc_fd
+                )
+                opened.append(mnt_ns_fd)
+            finally:
+                os.close(proc_fd)
+            # The process was alive from pidfd_open to here, so the PID
+            # referred to it for every read above.
+            if not _pidfd_process_alive(pidfd):
+                raise ProcessLookupError("Container Leader exited")
+            for plan in plans:
+                try:
+                    _mount_one(plan, uid_shift, gid_shift, image_ids, mnt_ns_fd)
+                except _MountError as exc:
+                    raise _MountError(
+                        f"'{_strip_control_characters(plan.source)}' on "
+                        f"'{plan.target}': {exc}"
+                    ) from exc
+            unit_fd = _open_supervisor_cgroup(machine_name)
+            try:
+                _remove_scope_marker(unit_fd, MOUNTS_PENDING_CGROUP)
+            finally:
+                os.close(unit_fd)
+        finally:
+            _close_fds(tuple(opened))
 
 
 # Internal mode for confined container entry. The parent starts it as
@@ -3494,16 +4141,8 @@ def _account_file_entries(text: str, field_count: int, label: str) -> list:
     return entries
 
 
-def _resolve_container_identity(
-    user: str, passwd_text: str, group_text: str
-) -> Tuple[int, int, Tuple[int, ...]]:
-    """Return uid, gid, and supplementary groups for user, as nspawn sets them.
-
-    Measured with systemd 249, 255, and 257: nspawn gives root no
-    supplementary groups. For other users it sets exactly the groups that
-    list the user as a member (getent initgroups), without the primary gid
-    unless that group lists the user.
-    """
+def _resolve_container_user_ids(user: str, passwd_text: str) -> Tuple[int, int]:
+    """Return the uid and gid of user from passwd text, or fail closed."""
     matches = [
         fields
         for fields in _account_file_entries(passwd_text, 7, "passwd")
@@ -3515,6 +4154,20 @@ def _resolve_container_identity(
     gid = _parse_container_id(matches[0][3], "gid")
     if (user == "root") != (uid == 0):
         raise ValueError("Container uid 0 must be the root user")
+    return uid, gid
+
+
+def _resolve_container_identity(
+    user: str, passwd_text: str, group_text: str
+) -> Tuple[int, int, Tuple[int, ...]]:
+    """Return uid, gid, and supplementary groups for user, as nspawn sets them.
+
+    Measured with systemd 249, 255, and 257: nspawn gives root no
+    supplementary groups. For other users it sets exactly the groups that
+    list the user as a member (getent initgroups), without the primary gid
+    unless that group lists the user.
+    """
+    uid, gid = _resolve_container_user_ids(user, passwd_text)
     groups: list = []
     for fields in _account_file_entries(group_text, 4, "group"):
         group_id = _parse_container_id(fields[2], "group")
@@ -3527,6 +4180,24 @@ def _resolve_container_identity(
     return uid, gid, tuple(groups)
 
 
+def _read_account_fd(fd: int, path: str) -> str:
+    """Read an open account file; it must be a regular file of bounded size."""
+    file_stat = os.fstat(fd)
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError(f"Container {path} is not a regular file")
+    chunks = []
+    size = 0
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > CONTAINER_ACCOUNT_FILE_MAX_BYTES:
+            raise ValueError(f"Container {path} is too large")
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", "surrogateescape")
+
+
 def _read_container_account_file(path: str) -> str:
     """Read a regular account file inside the container's mount namespace.
 
@@ -3534,22 +4205,24 @@ def _read_container_account_file(path: str) -> str:
     """
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOCTTY)
     try:
-        file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise ValueError(f"Container {path} is not a regular file")
-        chunks = []
-        size = 0
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > CONTAINER_ACCOUNT_FILE_MAX_BYTES:
-                raise ValueError(f"Container {path} is too large")
-            chunks.append(chunk)
+        return _read_account_fd(fd, path)
     finally:
         os.close(fd)
-    return b"".join(chunks).decode("utf-8", "surrogateescape")
+
+
+def _read_image_user_ids(image_root_fd: int, user: str) -> Tuple[int, int]:
+    """Return the uid and gid of user from /etc/passwd of a pinned image root.
+
+    The file opens through the image root without following a link out of
+    it. up reads the ids before the start; the entry helper resolves the
+    same user from the same file at attach time.
+    """
+    fd = _open_image_file(image_root_fd, ("etc", "passwd"))
+    try:
+        text = _read_account_fd(fd, "/etc/passwd")
+    finally:
+        os.close(fd)
+    return _resolve_container_user_ids(user, text)
 
 
 def _validate_container_path(path: str) -> bool:
@@ -6007,11 +6680,6 @@ class Sandy:
             "systemd-run",
         ]
 
-        # Add setfacl for systemd < 250
-        if self.systemd_version < 250:
-            required_tools.append("setfacl")
-            required_tools.append("setpriv")
-
         missing_tools = []
         for tool in required_tools:
             if not shutil.which(tool):
@@ -6126,130 +6794,99 @@ class Sandy:
             print()  # Add newline after Ctrl+C
             return False
 
-    def _get_host_uid(self, container_name):
-        """Get the mapped host UID for the container user"""
-        # For systemd < 250, we use fixed UID mapping: CONTAINER_BASE_UID:65536
-        # So container UID maps directly: container_uid + CONTAINER_BASE_UID = host_uid
+    def _plan_mounts(self) -> list:
+        """Check the workspace and shared directories before any host change.
 
-        # Get the actual UID for self.user from container's /etc/passwd
-        container_uid = None
-        mdir = os.path.join(SYSTEMD_MACHINES, f"sandy.{container_name}")
-        passwd_path = os.path.join(mdir, "etc", "passwd")
+        A directory that does not exist is skipped with a warning. Exit when
+        root owns a directory, or when the kernel or the file system of a
+        directory cannot do an ID-mapped mount.
+        """
+        plans = []
+        for label, host_rel in (("workspace", self.workspace), ("shared", self.shared)):
+            if not host_rel:
+                continue
+            source = os.path.realpath(host_rel)
+            if not os.path.isdir(source):
+                print(
+                    f"W: Could not find '{_strip_control_characters(host_rel)}' "
+                    f"on the host, skipping {label} mount"
+                )
+                continue
+            try:
+                plans.append(_plan_mount(label, source, f"{self.user_home}/{label}"))
+                self._warn_about_submounts(label, source)
+            except _MountError as exc:
+                print(
+                    f"E: Cannot mount '{_strip_control_characters(source)}' as the "
+                    f"{label} directory: {_strip_control_characters(str(exc))}"
+                )
+                sys.exit(1)
+        return plans
 
-        if not os.path.exists(passwd_path):
-            raise ValueError(f"Container passwd file not found at {passwd_path}")
+    def _warn_about_submounts(self, label: str, source: str) -> None:
+        """Warn when the host has mounts below a directory that up will mount.
 
-        with open(passwd_path, "r") as f:
-            for line in f:
-                fields = line.strip().split(":")
-                if len(fields) >= 3 and fields[0] == self.user:
-                    container_uid = int(fields[2])
-                    break
-
-        if container_uid is None:
-            raise ValueError(
-                f"Cannot find user '{self.user}' in container's /etc/passwd at {passwd_path}"
-            )
-
-        # With fixed mapping, host UID = CONTAINER_BASE_UID + container UID
-        return CONTAINER_BASE_UID + container_uid
-
-    def _setfacl(self, path, container_name):
-        """Add ACLs for workspace access when idmap is not available"""
-        if not path or not os.path.exists(path):
-            return
-
-        # For systemd < 250, we use fixed UID mapping
-        if self.systemd_version >= 250:
-            # Shouldn't be called for systemd >= 250, but handle it anyway
-            return
-
+        The container does not see them (see _idmapped_tree): it sees the
+        directories below them. The warning is advice only. If the mount table
+        cannot be read, say so and go on; the mount itself does not depend on it.
+        """
         try:
-            host_uid = self._get_host_uid(container_name)
-        except ValueError as e:
-            print(f"W: {_terminal_safe_repr(str(e))}")
-            return
-
-        # Check if ACLs are already applied to the workspace directory (without -R)
-        check_cmd = ["getfacl", "-n", path]
-        try:
-            result = _run_secure_subprocess(
-                check_cmd, capture_output=True, text=True, check=True
-            )
-            # while we created with 'u:...:rwX', get facl shows 'user:...:rwx'
-            if f"user:{host_uid}:rwx" in result.stdout:
-                # print(f"I: ACLs for uid={host_uid} already in {path}")
-                return
-        except subprocess.CalledProcessError:
-            # getfacl failed, continue with applying ACLs
-            pass
-
-        # Base setfacl commands
-        base_acl_cmd = ["setfacl", "-R", "-m", f"u:{host_uid}:rwX", path]
-        base_acl_default_cmd = ["setfacl", "-R", "-d", "-m", f"u:{host_uid}:rwX", path]
-        remove_acl_cmd = ["setfacl", "-b", "-R", path]
-
-        # Check if SUDO_UID is set and valid
-        sudo_uid = os.environ.get("SUDO_UID", "")
-        try:
-            sudo_uid_int = int(sudo_uid) if sudo_uid else 0
-        except ValueError:
-            sudo_uid_int = 0
-
-        if sudo_uid_int == 0:
-            # SUDO_UID not set properly - show manual instructions
+            below = _mounts_below(source, _read_mountinfo())
+        except (OSError, ValueError) as exc:
             print(
-                f"W: SUDO_UID not set. To properly manage ACLs, run these commands as your regular user:"
+                f"W: Could not check for mounts below the {label} directory: "
+                f"{_terminal_safe_repr(str(exc))}"
             )
-            print()
-            print(f"   {' '.join(base_acl_cmd)}")
-            print(f"   {' '.join(base_acl_default_cmd)}")
-            print()
-            print(f"   Undo with: {' '.join(remove_acl_cmd)}")
             return
-
-        # Build commands with setpriv to drop privileges
-        acl_cmd = [
-            "setpriv",
-            f"--reuid={sudo_uid_int}",
-            f"--regid={sudo_uid_int}",
-            "--clear-groups",
-            "--",
-        ] + base_acl_cmd
-        acl_default_cmd = [
-            "setpriv",
-            f"--reuid={sudo_uid_int}",
-            f"--regid={sudo_uid_int}",
-            "--clear-groups",
-            "--",
-        ] + base_acl_default_cmd
-
-        # Show what will be executed and confirm
-        print(f"I: ACL commands to execute as non-root (uid={sudo_uid_int}):")
-        print(f"   {' '.join(base_acl_cmd)}")
-        print(f"   {' '.join(base_acl_default_cmd)}")
-        print()
-
-        if not self._confirm("Apply ACLs for container workspace access"):
-            print("I: Skipped ACL setup")
+        if not below:
             return
-
-        # Execute ACL commands
-        result = _run_secure_subprocess(acl_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"W: Failed to add ACL: {_terminal_safe_repr(str(result.stderr))}")
-
-        # Set default ACLs for new files
-        result_default = _run_secure_subprocess(
-            acl_default_cmd, capture_output=True, text=True
+        shown = ", ".join(
+            f"'{_strip_control_characters(path)}'" for path in below[:SUBMOUNT_LIST_MAX]
         )
-        if result_default.returncode != 0:
-            print(
-                "W: Failed to add default ACL: "
-                f"{_terminal_safe_repr(str(result_default.stderr))}"
-            )
+        more = (
+            f" and {len(below) - SUBMOUNT_LIST_MAX} more"
+            if len(below) > SUBMOUNT_LIST_MAX
+            else ""
+        )
+        print(
+            f"W: The {label} directory '{_strip_control_characters(source)}' has "
+            f"mounts below it: {shown}{more}"
+        )
+        print("   The container does not see these mounts")
 
-        print(f"I: Finished setting ACLs. Undo with '{' '.join(remove_acl_cmd)}'")
+    def _prepare_image_mounts(
+        self, machine_fd: int, mdir: str, plans: list
+    ) -> Tuple[Tuple[MountPlan, ...], Tuple[int, int]]:
+        """Keep the plans whose target exists in the image; read the user's ids.
+
+        Return the plans to mount and the uid and gid of the container user.
+        Exit when the ids cannot be read. The ids map the owner of each host
+        directory to the user (see _mount_one).
+        """
+        kept = []
+        for plan in plans:
+            if not os.path.isdir(os.path.join(mdir, plan.target[1:])):
+                print(
+                    f"W: Could not find '{plan.target}' in the container. "
+                    f"Skipping {plan.label} mount"
+                )
+                continue
+            print(
+                f"I: Mounting '{_strip_control_characters(plan.source)}' "
+                f"on '{plan.target}'"
+            )
+            kept.append(plan)
+        if not kept:
+            return (), (0, 0)
+        try:
+            image_ids = _read_image_user_ids(machine_fd, self.user)
+        except (OSError, ValueError) as exc:
+            print(
+                f"E: Could not read the uid and gid of '{self.user}' in the "
+                f"container image: {_terminal_safe_repr(str(exc))}"
+            )
+            sys.exit(1)
+        return tuple(kept), image_ids
 
     def _machine_poweroff(self, container_name=None):
         """Stop the container if it's running"""
@@ -7405,6 +8042,49 @@ class Sandy:
             time.sleep(min(CONTAINER_READY_INTERVAL, remaining))
         return False
 
+    def _wait_for_mounts(
+        self,
+        plans: Tuple[MountPlan, ...],
+        image_ids: Tuple[int, int],
+        spinner_line_event: Optional[threading.Event] = None,
+        timeout: int = CONTAINER_READY_TIMEOUT,
+        supervisor: Optional[subprocess.Popen] = None,
+    ) -> bool:
+        """Mount the directories as soon as the container has its payload.
+
+        Return False when the supervisor exits or the wait times out. Raise
+        _MountError when a mount fails; the caller stops the container. Until
+        the mounts are done, the mounts-pending marker refuses every attach.
+        """
+        spinner_active = False
+        if spinner_line_event:
+            spinner_active = not spinner_line_event.is_set()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if supervisor is not None and supervisor.poll() is not None:
+                return False
+            try:
+                _mount_container_dirs(self.container, plans, image_ids)
+                return True
+            except ProcessLookupError:
+                # The container is still starting, or it is gone; the
+                # supervisor check above ends the wait in the second case.
+                pass
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                raise _MountError(
+                    f"the directories in the container: {_terminal_safe_repr(str(exc))}"
+                ) from exc
+            if spinner_active and spinner_line_event:
+                if spinner_line_event.is_set():
+                    spinner_active = False
+                else:
+                    print(".", end="", flush=True)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(CONTAINER_READY_INTERVAL, remaining))
+        return False
+
     def _wait_for_keepalive_open(self, supervisor: subprocess.Popen) -> bool:
         """Wait until the payload has opened the keepalive script.
 
@@ -8127,6 +8807,10 @@ class Sandy:
                 self.port_mappings.append(validated)
             self.port_mappings = self._dedupe_port_mappings(self.port_mappings)
 
+        # Check the directories to mount before any host change. The check
+        # refuses a directory that root owns, and probes ID-mapped mounts.
+        mounts = self._plan_mounts()
+
         # The first host change: the limits that all containers share. No
         # container may start outside them.
         group, saved = self._set_shared_limits(facts)
@@ -8234,6 +8918,10 @@ class Sandy:
         ]
 
         try:
+            # The mount targets and the image user's ids, before any change of
+            # the network.
+            mounts, image_ids = self._prepare_image_mounts(machine_fd, mdir, mounts)
+
             # Bind mount init.sh as read-only to protect it from modification.
             # Open it before port forwarding so IP discovery cannot follow a raw
             # image path or mutate host firewall state before validation.
@@ -8333,7 +9021,10 @@ class Sandy:
             else:
                 print("W: Using host networking (no restrictions)")
 
-            # Use fixed UID range for older systemd to make ACLs predictable
+            # nspawn gets no bind for the workspace and shared directories;
+            # up mounts them after the start (see _wait_for_mounts below).
+            #
+            # systemd < 250 has no --private-users=pick; use a fixed UID range.
             if self.systemd_version >= 250:
                 # XXX: Can this slow startup?
                 cmd.append(
@@ -8373,43 +9064,9 @@ class Sandy:
 
             if not args.persistent:
                 # --ephemeral affects the root namespace and not submounts. When
-                # specified, all changes to the system (excepting bind mounts below)
-                # are discarded.
+                # specified, all changes to the system (excepting the workspace
+                # and shared mounts) are discarded.
                 cmd.append("--ephemeral")
-
-            # Bind mount workspace and shared directories
-            mount_specs = []
-            if self.workspace:
-                mount_specs.append(("workspace", self.workspace, "workspace", True))
-            if self.shared:
-                mount_specs.append(("shared", self.shared, "shared", False))
-
-            for label, host_rel, subdir, _ in mount_specs:
-                realp = os.path.realpath(host_rel)
-                intp = f"{self.user_home}/{subdir}"
-                if not os.path.isdir(realp):
-                    print(
-                        f"W: Could not find '{host_rel}' on the host, skipping {label} mount"
-                    )
-                    continue
-                extp = os.path.join(mdir, intp[1:])
-                if not os.path.isdir(extp):
-                    print(
-                        f"W: Could not find '{intp}' in the container. Skipping {label} mount"
-                    )
-                    continue
-                if self.systemd_version >= 250:
-                    cmd.append(f"--bind={realp}:{intp}:idmap")
-                else:
-                    cmd.append(f"--bind={realp}:{intp}")
-                print(f"I: Mounting '{realp}' on '{intp}'")
-
-            # ACL fallback for systemd < 250
-            if self.systemd_version < 250:
-                for label, host_rel, subdir, do_chdir in mount_specs:
-                    realp = os.path.realpath(host_rel)
-                    if os.path.isdir(realp):
-                        self._setfacl(realp, self.container)
 
             # The payload: the image's bash, named sandy-keepalive, reads the
             # keepalive script.
@@ -8441,13 +9098,16 @@ class Sandy:
             # The supervisor has no terminal and its own session, and runs in
             # its own scope. A closed terminal, or a stop or an OOM kill of the
             # terminal's scope, therefore does not reach it.
-            # Without -d, hold the lifecycle lock until the up-console
-            # marker exists. Every attach joins its leaf under this lock, so
-            # no attach can end, and stop the container, before the console
-            # starts.
-            if not args.detach:
+            # Hold the lifecycle lock until the markers exist: the up-console
+            # marker without -d, and the mounts-pending marker when there are
+            # directories to mount. Every attach joins its leaf under this
+            # lock. So no attach can end, and stop the container, before the
+            # console starts, and no attach can start before the mounts are
+            # done.
+            hold_lock = not args.detach or bool(mounts)
+            if hold_lock:
                 self._ensure_cache_dir()
-            with nullcontext() if args.detach else _lifecycle_lock():
+            with _lifecycle_lock() if hold_lock else nullcontext():
                 try:
                     # The container inherits the OOM score adjustment.
                     with _oom_score_adj_for_children(limits.oom_score_adj):
@@ -8471,9 +9131,12 @@ class Sandy:
                     sys.exit(1)
                 finally:
                     close_runtime_fds()
-                if not args.detach:
+                if hold_lock:
                     try:
-                        _create_up_console_marker(self.container)
+                        if mounts:
+                            _create_mounts_pending_marker(self.container)
+                        if not args.detach:
+                            _create_up_console_marker(self.container)
                     except (OSError, ValueError) as exc:
                         _finish_spinner_line(spinner_line_event)
                         print(
@@ -8486,6 +9149,23 @@ class Sandy:
                         self._stop_failed_start(supervisor)
                         raise
             try:
+                # Mount the workspace and shared directories as soon as the
+                # container has its payload. Until then, no attach works.
+                #
+                # This is one method on all systemd versions. systemd 256 or
+                # later could do the same with --bind=...:owneridmap, which
+                # maps the owner of the directory to the container user and
+                # nothing else (as the mounts here do). Replace this code
+                # with that option when Sandy drops support for systemd < 256.
+                if mounts and not self._wait_for_mounts(
+                    mounts,
+                    image_ids,
+                    spinner_line_event=spinner_line_event,
+                    supervisor=supervisor,
+                ):
+                    _finish_spinner_line(spinner_line_event)
+                    self._report_failed_start(supervisor)
+                    sys.exit(1)
                 ready = self._wait_for_container_ready(
                     spinner_line_event=spinner_line_event, supervisor=supervisor
                 )
@@ -8507,6 +9187,11 @@ class Sandy:
                     "E: Could not prepare the container entry: "
                     f"{_terminal_safe_repr(str(exc))}"
                 )
+                self._stop_failed_start(supervisor)
+                sys.exit(1)
+            except _MountError as exc:
+                _finish_spinner_line(spinner_line_event)
+                print(f"E: Could not mount {_strip_control_characters(str(exc))}")
                 self._stop_failed_start(supervisor)
                 sys.exit(1)
             except BaseException:

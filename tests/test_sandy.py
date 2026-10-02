@@ -10,6 +10,7 @@ import io
 import json
 import os
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -2984,7 +2985,9 @@ class SandyInitializationTests(unittest.TestCase):
                     instance._check_required_tools()
         self.assertIn("Missing required tools", stdout.getvalue())
         self.assertIn("systemd-nspawn", stdout.getvalue())
-        self.assertIn("setfacl", stdout.getvalue())
+        # The workspace mounts need no ACL tools on any systemd version.
+        self.assertNotIn("setfacl", stdout.getvalue())
+        self.assertNotIn("setpriv", stdout.getvalue())
         self.assertNotIn("nsenter", stdout.getvalue())
 
     def test_required_tools_reports_each_missing_systemd_tool(self):
@@ -3172,37 +3175,6 @@ class SystemUtilityTests(unittest.TestCase):
                 self.assertEqual(sandy._check_systemd_version(), 0)
         self.assertIn("assuming older version", stdout.getvalue())
 
-    def test_get_host_uid(self):
-        instance = make_sandy()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            passwd = Path(temp_dir) / "sandy.test" / "etc" / "passwd"
-            passwd.parent.mkdir(parents=True)
-            passwd.write_text(
-                "root:x:0:0::/root:/bin/bash\n"
-                "developer:x:1000:1000::/home/developer:/bin/bash\n"
-            )
-            with patch.object(sandy, "SYSTEMD_MACHINES", temp_dir):
-                self.assertEqual(
-                    instance._get_host_uid("test"),
-                    sandy.CONTAINER_BASE_UID + 1000,
-                )
-
-    def test_get_host_uid_rejects_missing_user(self):
-        instance = make_sandy()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            passwd = Path(temp_dir) / "sandy.test" / "etc" / "passwd"
-            passwd.parent.mkdir(parents=True)
-            passwd.write_text("root:x:0:0::/root:/bin/bash\n")
-            with patch.object(sandy, "SYSTEMD_MACHINES", temp_dir):
-                with self.assertRaises(ValueError):
-                    instance._get_host_uid("test")
-
-    def test_get_host_uid_rejects_missing_passwd_file(self):
-        instance = make_sandy()
-        with patch.object(sandy.os.path, "exists", return_value=False):
-            with self.assertRaisesRegex(ValueError, "passwd file not found"):
-                instance._get_host_uid("test")
-
     def test_machine_and_cache_paths_are_scoped(self):
         instance = make_sandy()
         with patch.object(sandy, "SYSTEMD_MACHINES", "/machines"):
@@ -3354,15 +3326,32 @@ class EntryPrimitiveTests(unittest.TestCase):
         self.assertIs(libc.syscall.restype, sandy.ctypes.c_long)
 
     def test_syscall_table_is_exact(self):
+        # open_tree, move_mount, openat2, and mount_setattr have the same
+        # number on every architecture; unshare does not.
+        mount_calls = {
+            "open_tree": 428,
+            "move_mount": 429,
+            "openat2": 437,
+            "mount_setattr": 442,
+        }
         self.assertEqual(
             sandy.ENTRY_SYSCALL_NUMBERS,
             {
-                "x86_64": {"ptrace": 101, "prctl": 157, "setns": 308, "seccomp": 317},
+                "x86_64": {
+                    "ptrace": 101,
+                    "prctl": 157,
+                    "setns": 308,
+                    "seccomp": 317,
+                    "unshare": 272,
+                    **mount_calls,
+                },
                 "aarch64": {
                     "ptrace": 117,
                     "prctl": 167,
                     "setns": 268,
                     "seccomp": 277,
+                    "unshare": 97,
+                    **mount_calls,
                 },
             },
         )
@@ -3411,7 +3400,7 @@ class EntryPrimitiveTests(unittest.TestCase):
     def test_unknown_syscall_name_is_rejected(self):
         with mocked_entry_syscall() as syscall:
             with self.assertRaises(ValueError):
-                sandy._entry_syscall("unshare", 0)
+                sandy._entry_syscall("fork", 0)
         syscall.assert_not_called()
 
     def test_invalid_syscall_arguments_are_rejected(self):
@@ -4502,13 +4491,22 @@ class LeaderExtractionTests(unittest.TestCase):
         )
         manager.join.return_value = 30
         manager.alive.return_value = overrides.get("alive", True)
+        manager.pending.return_value = None
         manager.payload.return_value = (
             77,
             overrides.get(
                 "payload_confinement", sandy.ProcessConfinement(2, 0xFDECBFFF)
             ),
         )
-        for name in ("filters", "capbnd", "oom", "pidfd_open", "join", "payload"):
+        for name in (
+            "filters",
+            "capbnd",
+            "oom",
+            "pidfd_open",
+            "join",
+            "payload",
+            "pending",
+        ):
             if name in overrides:
                 getattr(manager, name).side_effect = overrides[name]
         if "cgroup_error" in overrides:
@@ -4532,6 +4530,9 @@ class LeaderExtractionTests(unittest.TestCase):
             stack.enter_context(patch.object(sandy, "_read_oom_score_adj", manager.oom))
             stack.enter_context(
                 patch.object(sandy, "_read_process_cgroup", manager.cgroup)
+            )
+            stack.enter_context(
+                patch.object(sandy, "_require_no_pending_mounts", manager.pending)
             )
             stack.enter_context(patch.object(sandy, "_find_payload", manager.payload))
             stack.enter_context(
@@ -4563,6 +4564,8 @@ class LeaderExtractionTests(unittest.TestCase):
                 call.query("ai-dev"),
                 call.open("/proc/42", sandy.DIRECTORY_OPEN_FLAGS, dir_fd=None),
                 call.cgroup(20),
+                # No attach before up has mounted the directories (item 6).
+                call.pending("ai-dev"),
                 # The payload exists before the Leader's namespaces and
                 # filters are opened or read (specs/security-parity.md item 5).
                 call.payload(20, 42),
@@ -4622,11 +4625,33 @@ class LeaderExtractionTests(unittest.TestCase):
                         sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
                 # A container of an earlier Sandy has no payload at PID 2, so
                 # the scope check comes first and asks for a restart.
+                manager.pending.assert_not_called()
                 manager.payload.assert_not_called()
                 manager.filters.assert_not_called()
                 manager.join.assert_not_called()
                 self.assertEqual(manager.close.call_args_list, [call(20), call(10)])
                 manager.lock_exit.assert_called_once_with()
+
+    def test_extract_leader_confinement_refuses_while_mounts_are_pending(self):
+        # Mocks: the marker check. A real marker is a cgroup of the scope; the
+        # marker tests and the E2E suite prove it. Nothing of the Leader is
+        # read or joined while up has not mounted the directories.
+        pending = ProcessLookupError("Container is still starting; try again")
+        with self.extraction_mocks(pending=pending) as manager:
+            with self.assertRaisesRegex(ProcessLookupError, "still starting"):
+                sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
+        manager.pending.assert_called_once_with("ai-dev")
+        manager.payload.assert_not_called()
+        manager.filters.assert_not_called()
+        manager.capbnd.assert_not_called()
+        manager.alive.assert_not_called()
+        manager.join.assert_not_called()
+        self.assertEqual(
+            [entry for entry in manager.mock_calls if entry[0] == "open"],
+            [call.open("/proc/42", sandy.DIRECTORY_OPEN_FLAGS, dir_fd=None)],
+        )
+        self.assertEqual(manager.close.call_args_list, [call(20), call(10)])
+        manager.lock_exit.assert_called_once_with()
 
     def test_extract_leader_confinement_closes_fds_when_join_fails(self):
         with self.extraction_mocks(join=OSError(errno.ENOENT, "x")) as manager:
@@ -5771,143 +5796,1984 @@ class EntryHelperTests(unittest.TestCase):
         parse.assert_not_called()
 
 
-class AclTests(unittest.TestCase):
-    def test_acl_setup_skips_irrelevant_paths_and_new_systemd(self):
-        instance = make_sandy()
-        with patch.object(sandy, "_run_secure_subprocess") as run:
-            instance._setfacl("", "test")
-            with patch.object(sandy.os.path, "exists", return_value=False):
-                instance._setfacl("/missing", "test")
-            instance.systemd_version = 250
-            with patch.object(sandy.os.path, "exists", return_value=True):
-                instance._setfacl("/workspace", "test")
-        run.assert_not_called()
+@contextmanager
+def fake_mount_kernel(failing=None):
+    """Mock libc syscall(2) for the mount calls; yield the recorded calls.
 
-    def test_acl_setup_handles_missing_container_user(self):
-        instance = make_sandy()
-        instance.systemd_version = 249
-        with patch.object(sandy.os.path, "exists", return_value=True):
-            with patch.object(
-                instance,
-                "_get_host_uid",
-                side_effect=ValueError("missing user"),
-            ):
-                with captured_output() as (stdout, _):
-                    instance._setfacl("/workspace", "test")
-        self.assertIn("missing user", stdout.getvalue())
+    Each record holds the syscall name, its arguments, and what the pointer
+    arguments hold at the time of the call. failing maps a syscall name to
+    the errno that the call returns.
+    """
+    failing = failing or {}
+    names = {
+        number: name for name, number in sandy.ENTRY_SYSCALL_NUMBERS["x86_64"].items()
+    }
+    results = {"open_tree": 50, "openat2": 60}
+    calls = []
+    state = {"errno": 0}
 
-    def test_acl_setup_reuses_existing_acl(self):
-        instance = make_sandy()
-        instance.systemd_version = 249
-        existing = SimpleNamespace(stdout="user:1001000:rwx\n")
-        with patch.object(sandy.os.path, "exists", return_value=True):
-            with patch.object(
-                instance,
-                "_get_host_uid",
-                return_value=1001000,
-            ):
-                with patch.object(
-                    sandy,
-                    "_run_secure_subprocess",
-                    return_value=existing,
-                ) as run:
-                    instance._setfacl("/workspace", "test")
-        run.assert_called_once_with(
-            ["getfacl", "-n", "/workspace"],
-            capture_output=True,
-            text=True,
-            check=True,
+    def syscall(number, *args):
+        name = names[number]
+        record = {"name": name, "args": args}
+        if name == "openat2":
+            record["path"] = sandy.ctypes.string_at(args[1])
+            record["how"] = struct.unpack(
+                "<3Q", sandy.ctypes.string_at(args[2], args[3])
+            )
+        elif name == "open_tree":
+            record["path"] = sandy.ctypes.string_at(args[1])
+        elif name == "mount_setattr":
+            record["path"] = sandy.ctypes.string_at(args[1])
+            record["attr"] = struct.unpack(
+                "<4Q", sandy.ctypes.string_at(args[3], args[4])
+            )
+        elif name == "move_mount":
+            record["from_path"] = sandy.ctypes.string_at(args[1])
+            record["to_path"] = sandy.ctypes.string_at(args[3])
+        calls.append(record)
+        if name in failing:
+            state["errno"] = failing[name]
+            return -1
+        return results.get(name, 0)
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                sandy,
+                "_libc",
+                return_value=SimpleNamespace(syscall=MagicMock(side_effect=syscall)),
+            )
+        )
+        stack.enter_context(
+            patch.object(sandy.platform, "machine", return_value="x86_64")
+        )
+        stack.enter_context(
+            patch.object(sandy.ctypes, "get_errno", side_effect=lambda: state["errno"])
+        )
+        yield calls
+
+
+class MountPrimitiveTests(unittest.TestCase):
+    """The system calls that mount a host directory in the container.
+
+    Mocks: libc syscall(2), os.fork, os.kill, os.waitpid, and the /proc map
+    files of a child. The pipes are real. No test calls the kernel: the E2E
+    suite proves the real user namespaces, mounts, and errors.
+    """
+
+    @contextmanager
+    def fake_pipes(self):
+        """Record the pipes that os.pipe makes. A duplicate of each read end
+        stays open, so a test can read what a mocked child wrote."""
+        pairs = []
+        real_pipe = os.pipe
+
+        def pipe():
+            read_fd, write_fd = real_pipe()
+            pairs.append((read_fd, write_fd, os.dup(read_fd)))
+            return read_fd, write_fd
+
+        try:
+            with patch.object(sandy.os, "pipe", side_effect=pipe):
+                yield pairs
+        finally:
+            for pair in pairs:
+                for fd in pair:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+    @staticmethod
+    def is_open(fd):
+        try:
+            os.fstat(fd)
+        except OSError:
+            return False
+        return True
+
+    def test_struct_layouts_match_the_kernel_headers(self):
+        self.assertEqual(sandy.ctypes.sizeof(sandy._MountAttr), 32)
+        for offset, field in enumerate(
+            ("attr_set", "attr_clr", "propagation", "userns_fd")
+        ):
+            self.assertEqual(getattr(sandy._MountAttr, field).offset, 8 * offset)
+        self.assertEqual(sandy.ctypes.sizeof(sandy._OpenHow), 24)
+        for offset, field in enumerate(("flags", "mode", "resolve")):
+            self.assertEqual(getattr(sandy._OpenHow, field).offset, 8 * offset)
+
+    def test_mount_constants_match_the_kernel_headers(self):
+        self.assertEqual(sandy.AT_FDCWD, -100)
+        self.assertEqual(sandy.AT_EMPTY_PATH, 0x1000)
+        self.assertEqual(sandy.OPEN_TREE_CLONE, 1)
+        self.assertEqual(sandy.OPEN_TREE_CLOEXEC, os.O_CLOEXEC)
+        self.assertEqual(sandy.MOVE_MOUNT_F_EMPTY_PATH, 0x4)
+        self.assertEqual(sandy.MOVE_MOUNT_T_EMPTY_PATH, 0x40)
+        self.assertEqual(sandy.MOUNT_ATTR_NOSUID, 0x2)
+        self.assertEqual(sandy.MOUNT_ATTR_NODEV, 0x4)
+        self.assertEqual(sandy.MOUNT_ATTR_IDMAP, 0x100000)
+        self.assertEqual(sandy.MS_PRIVATE, 1 << 18)
+        self.assertEqual(sandy.RESOLVE_NO_MAGICLINKS, 0x02)
+        self.assertEqual(sandy.RESOLVE_NO_SYMLINKS, 0x04)
+
+    def test_openat2_no_links_resolves_with_no_links(self):
+        with fake_mount_kernel() as calls:
+            fd = sandy._openat2_no_links(
+                "/home/developer/workspace", os.O_PATH | os.O_DIRECTORY
+            )
+        self.assertEqual(fd, 60)
+        (record,) = calls
+        self.assertEqual(record["name"], "openat2")
+        self.assertEqual(record["path"], b"/home/developer/workspace")
+        self.assertEqual(
+            record["how"],
+            (os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC, 0, 0x04 | 0x02),
+        )
+        # The directory descriptor is ignored for an absolute path; the size
+        # is the size of struct open_how.
+        self.assertEqual(record["args"][0], sandy.AT_FDCWD)
+        self.assertEqual(record["args"][3], 24)
+
+    def test_openat2_no_links_encodes_the_path_like_the_file_system(self):
+        with fake_mount_kernel() as calls:
+            sandy._openat2_no_links("/tmp/\udcff", os.O_PATH)
+        self.assertEqual(calls[0]["path"], b"/tmp/\xff")
+
+    def test_openat2_no_links_rejects_paths_before_the_syscall(self):
+        for path in (
+            "",
+            "relative/path",
+            "/a/../b",
+            "/a/./b",
+            "//a",
+            "/a//b",
+            "/a\x00b",
+            "/a\nb",
+            "/a\x1b[31m",
+            "/" + "a" * 4100,
+            None,
+            b"/a",
+            7,
+        ):
+            with self.subTest(path=path):
+                with fake_mount_kernel() as calls:
+                    with self.assertRaises(ValueError):
+                        sandy._openat2_no_links(path, os.O_PATH)
+                self.assertEqual(calls, [])
+
+    def test_openat2_no_links_raises_the_errno_of_the_kernel(self):
+        # ELOOP is what the kernel gives for a link in any component.
+        with fake_mount_kernel(failing={"openat2": errno.ELOOP}):
+            with self.assertRaises(OSError) as raised:
+                sandy._openat2_no_links("/home/developer", os.O_PATH)
+        self.assertEqual(raised.exception.errno, errno.ELOOP)
+        self.assertIn("openat2 failed", str(raised.exception))
+
+    def test_idmapped_tree_clones_and_maps_the_directory(self):
+        with fake_mount_kernel() as calls:
+            tree_fd = sandy._idmapped_tree(11, 12)
+        self.assertEqual(tree_fd, 50)
+        clone, setattr_ = calls
+        self.assertEqual(clone["name"], "open_tree")
+        # The descriptor is the tree; the path is empty.
+        self.assertEqual(clone["args"][0], 11)
+        self.assertEqual(clone["path"], b"")
+        self.assertEqual(
+            clone["args"][2],
+            sandy.OPEN_TREE_CLONE | os.O_CLOEXEC | sandy.AT_EMPTY_PATH,
+        )
+        self.assertEqual(setattr_["name"], "mount_setattr")
+        self.assertEqual(setattr_["args"][0], 50)
+        self.assertEqual(setattr_["path"], b"")
+        self.assertEqual(setattr_["args"][2], sandy.AT_EMPTY_PATH)
+        self.assertEqual(setattr_["args"][4], 32)
+        # attr_set, attr_clr, propagation, userns_fd. The mount is private: a
+        # peer of the host mount would let mounts cross in both directions.
+        self.assertEqual(
+            setattr_["attr"],
+            (0x100000 | 0x2 | 0x4, 0, 0x40000, 12),
         )
 
-    def test_acl_setup_prints_manual_commands_without_sudo_uid(self):
-        instance = make_sandy()
-        instance.systemd_version = 249
-        missing_acl = SimpleNamespace(stdout="")
-        with patch.object(sandy.os.path, "exists", return_value=True):
-            with patch.object(
-                instance,
-                "_get_host_uid",
-                return_value=1001000,
+    def test_idmapped_tree_closes_the_tree_when_the_map_fails(self):
+        with fake_mount_kernel(failing={"mount_setattr": errno.EINVAL}):
+            with patch.object(sandy.os, "close") as close:
+                with self.assertRaises(OSError) as raised:
+                    sandy._idmapped_tree(11, 12)
+        self.assertEqual(raised.exception.errno, errno.EINVAL)
+        close.assert_called_once_with(50)
+
+    def test_idmapped_tree_opens_nothing_when_the_clone_fails(self):
+        with fake_mount_kernel(failing={"open_tree": errno.ENOSYS}) as calls:
+            with patch.object(sandy.os, "close") as close:
+                with self.assertRaises(OSError) as raised:
+                    sandy._idmapped_tree(11, 12)
+        self.assertEqual(raised.exception.errno, errno.ENOSYS)
+        self.assertEqual([record["name"] for record in calls], ["open_tree"])
+        close.assert_not_called()
+
+    def test_write_id_map_writes_the_whole_line_once(self):
+        with patch.object(sandy.os, "open", return_value=77) as open_, patch.object(
+            sandy.os, "write", return_value=14
+        ) as write, patch.object(sandy.os, "close") as close:
+            sandy._write_id_map(4242, "uid_map", "1234 525288 1\n")
+        open_.assert_called_once_with("/proc/4242/uid_map", os.O_WRONLY | os.O_CLOEXEC)
+        write.assert_called_once_with(77, b"1234 525288 1\n")
+        close.assert_called_once_with(77)
+
+    def test_write_id_map_rejects_short_writes_and_bad_input(self):
+        with patch.object(sandy.os, "open", return_value=77), patch.object(
+            sandy.os, "write", return_value=3
+        ), patch.object(sandy.os, "close") as close:
+            with self.assertRaises(OSError) as raised:
+                sandy._write_id_map(4242, "gid_map", "1234 525288 1\n")
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        close.assert_called_once_with(77)
+        with patch.object(sandy.os, "open") as open_:
+            with self.assertRaises(ValueError):
+                sandy._write_id_map(4242, "setgroups", "deny\n")
+            with self.assertRaises(ValueError):
+                sandy._write_id_map(0, "uid_map", "1 1 1\n")
+            with self.assertRaises(ValueError):
+                sandy._write_id_map(4242, "../uid_map", "1 1 1\n")
+        open_.assert_not_called()
+
+    def test_read_helper_message(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        # Nothing yet: the timeout gives b"".
+        self.assertEqual(sandy._read_helper_message(read_fd, 0), b"")
+        os.write(write_fd, b"ok")
+        self.assertEqual(sandy._read_helper_message(read_fd, 1), b"ok")
+        # A writer that closes without a message gives EOF, so b"".
+        os.close(write_fd)
+        self.assertEqual(sandy._read_helper_message(read_fd, 1), b"")
+
+    def test_read_helper_message_reads_at_most_the_limit(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        os.write(write_fd, b"x" * (sandy.HELPER_MESSAGE_MAX_BYTES + 10))
+        self.assertEqual(
+            len(sandy._read_helper_message(read_fd, 1)),
+            sandy.HELPER_MESSAGE_MAX_BYTES,
+        )
+
+    def test_end_helper_child_kills_then_reaps(self):
+        manager = MagicMock()
+        with patch.object(sandy.os, "kill", manager.kill), patch.object(
+            sandy.os, "waitpid", manager.waitpid
+        ):
+            sandy._end_helper_child(4242)
+        self.assertEqual(
+            manager.mock_calls,
+            [call.kill(4242, sandy.signal.SIGKILL), call.waitpid(4242, 0)],
+        )
+
+    def test_end_helper_child_reaps_a_child_that_is_gone(self):
+        with patch.object(
+            sandy.os, "kill", side_effect=ProcessLookupError
+        ), patch.object(sandy.os, "waitpid") as waitpid:
+            sandy._end_helper_child(4242)
+        waitpid.assert_called_once_with(4242, 0)
+
+    def test_check_helper_result(self):
+        sandy._check_helper_result(b"ok")
+        with self.assertRaises(sandy._MountError) as raised:
+            sandy._check_helper_result(b"move_mount 22")
+        self.assertEqual(
+            str(raised.exception), "move_mount failed: Invalid argument (errno 22)"
+        )
+        for message in (
+            b"",
+            b"ok ",
+            b"okay",
+            b"move_mount",
+            b"move_mount x",
+            b"move_mount 123456",
+            b"Move_mount 1",
+            b"move mount 1",
+            b"move_mount 1\n",
+            b"\xff\xfe",
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(sandy._MountError, "gave no result"):
+                    sandy._check_helper_result(message)
+
+    def test_mount_step_error_without_an_errno_is_an_io_error(self):
+        self.assertEqual(
+            str(sandy._mount_step_error("step", None)),
+            f"step failed: {os.strerror(errno.EIO)} (errno {errno.EIO})",
+        )
+
+    def test_move_mount_parent_waits_for_the_child_and_ends_it(self):
+        manager = MagicMock()
+        with self.fake_pipes() as pairs:
+
+            def fork():
+                os.write(pairs[0][1], b"ok")
+                return 4242
+
+            with patch.object(sandy.os, "fork", side_effect=fork), patch.object(
+                sandy.os, "kill", manager.kill
+            ), patch.object(sandy.os, "waitpid", manager.waitpid):
+                sandy._move_mount_in_namespace(7, 8, "/home/developer/workspace")
+            self.assertEqual(
+                manager.mock_calls,
+                [call.kill(4242, sandy.signal.SIGKILL), call.waitpid(4242, 0)],
+            )
+            # Both ends of the pipe are closed in the parent.
+            self.assertFalse(self.is_open(pairs[0][0]))
+            self.assertFalse(self.is_open(pairs[0][1]))
+
+    def test_move_mount_parent_reports_the_failed_step(self):
+        for message, text in (
+            (b"setns 1", "setns failed: Operation not permitted (errno 1)"),
+            (
+                b"openat2 40",
+                "openat2 failed: Too many levels of symbolic links (errno 40)",
+            ),
+            (b"move_mount 22", "move_mount failed: Invalid argument (errno 22)"),
+            (b"", "helper process gave no result"),
+        ):
+            with self.subTest(message=message):
+                with self.fake_pipes() as pairs:
+
+                    def fork():
+                        os.write(pairs[0][1], message)
+                        return 4242
+
+                    with patch.object(sandy.os, "fork", side_effect=fork), patch.object(
+                        sandy.os, "kill"
+                    ) as kill, patch.object(sandy.os, "waitpid") as waitpid:
+                        with self.assertRaises(sandy._MountError) as raised:
+                            sandy._move_mount_in_namespace(
+                                7, 8, "/home/developer/workspace"
+                            )
+                self.assertEqual(str(raised.exception), text)
+                kill.assert_called_once_with(4242, sandy.signal.SIGKILL)
+                waitpid.assert_called_once_with(4242, 0)
+
+    def test_move_mount_parent_ends_a_child_that_does_not_answer(self):
+        with self.fake_pipes():
+            with patch.object(sandy.os, "fork", return_value=4242), patch.object(
+                sandy.select, "select", return_value=([], [], [])
+            ) as select, patch.object(sandy.os, "kill") as kill, patch.object(
+                sandy.os, "waitpid"
+            ) as waitpid:
+                with self.assertRaisesRegex(sandy._MountError, "gave no result"):
+                    sandy._move_mount_in_namespace(7, 8, "/home/developer/workspace")
+        self.assertEqual(select.call_args.args[3], sandy.MOUNT_HELPER_TIMEOUT)
+        kill.assert_called_once_with(4242, sandy.signal.SIGKILL)
+        waitpid.assert_called_once_with(4242, 0)
+
+    def test_move_mount_rejects_the_target_before_the_fork(self):
+        for target in ("home/developer", "/a/../b", "/a\x00b", "", "/a\nb"):
+            with self.subTest(target=target):
+                with patch.object(sandy.os, "fork") as fork, patch.object(
+                    sandy.os, "pipe"
+                ) as pipe:
+                    with self.assertRaises(sandy._MountError):
+                        sandy._move_mount_in_namespace(7, 8, target)
+                fork.assert_not_called()
+                pipe.assert_not_called()
+
+    def test_move_mount_closes_the_pipe_when_the_fork_fails(self):
+        with self.fake_pipes() as pairs:
+            with patch.object(sandy.os, "fork", side_effect=BlockingIOError):
+                with self.assertRaises(BlockingIOError):
+                    sandy._move_mount_in_namespace(7, 8, "/home/developer/workspace")
+            self.assertFalse(self.is_open(pairs[0][0]))
+            self.assertFalse(self.is_open(pairs[0][1]))
+
+    @contextmanager
+    def move_mount_child(self, **kernel_failures):
+        """Run the child branch of _move_mount_in_namespace in this process."""
+        meta_path, path = ["finder"], ["/usr/lib/python3"]
+        manager = MagicMock()
+        manager.exit.side_effect = lambda code: (_ for _ in ()).throw(_ExitCalled(code))
+        with self.fake_pipes() as pairs, fake_mount_kernel(
+            failing=kernel_failures
+        ) as calls, patch.object(sandy.os, "fork", return_value=0), patch.object(
+            sandy.os, "_exit", manager.exit
+        ), patch.object(
+            sandy.sys, "meta_path", meta_path
+        ), patch.object(
+            sandy.sys, "path", path
+        ):
+            yield pairs, calls, manager, meta_path, path
+
+    def run_move_mount_child(self, **kernel_failures):
+        """Run the child branch to its os._exit; return what it did.
+
+        The assertions come after the patches end, because the child branch
+        empties sys.meta_path and sys.path, and an import would then fail.
+        """
+        exit_args = None
+        with self.move_mount_child(**kernel_failures) as (
+            pairs,
+            calls,
+            manager,
+            meta_path,
+            path,
+        ):
+            try:
+                sandy._move_mount_in_namespace(7, 8, "/home/developer/workspace")
+            except _ExitCalled as exc:
+                exit_args = exc.args
+            message = os.read(pairs[0][2], 64)
+        return exit_args, message, calls, (meta_path, path)
+
+    def test_move_mount_child_joins_the_namespace_then_mounts_on_the_descriptor(self):
+        exit_args, message, calls, import_state = self.run_move_mount_child()
+        self.assertEqual(exit_args, (0,))
+        self.assertEqual(message, b"ok")
+        # No import can load code from the container's file system.
+        self.assertEqual(import_state, ([], []))
+        setns, openat2, move = calls
+        self.assertEqual(
+            (setns["name"], setns["args"][:2]), ("setns", (7, sandy.CLONE_NEWNS))
+        )
+        self.assertEqual(openat2["path"], b"/home/developer/workspace")
+        self.assertEqual(
+            openat2["how"],
+            (os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC, 0, 0x04 | 0x02),
+        )
+        self.assertEqual(move["name"], "move_mount")
+        # from: the detached tree (empty path); to: the target descriptor.
+        self.assertEqual(move["args"][0], 8)
+        self.assertEqual(move["from_path"], b"")
+        self.assertEqual(move["args"][2], 60)
+        self.assertEqual(move["to_path"], b"")
+        self.assertEqual(move["args"][4], 0x4 | 0x40)
+
+    def test_move_mount_child_reports_each_failed_step(self):
+        for failing, message, calls_made in (
+            ({"setns": errno.EPERM}, b"setns 1", ["setns"]),
+            ({"openat2": errno.ELOOP}, b"openat2 40", ["setns", "openat2"]),
+            (
+                {"move_mount": errno.EINVAL},
+                b"move_mount 22",
+                ["setns", "openat2", "move_mount"],
+            ),
+        ):
+            with self.subTest(failing=failing):
+                exit_args, written, calls, _ = self.run_move_mount_child(**failing)
+                self.assertEqual(exit_args, (1,))
+                self.assertEqual(written, message)
+                self.assertEqual([record["name"] for record in calls], calls_made)
+
+    @contextmanager
+    def userns_parent(self, message=b"ok", maps_fail=None):
+        """Run the parent branch of _new_idmap_userns with a mocked child."""
+        manager = MagicMock()
+        real_open = os.open
+        with self.fake_pipes() as pairs:
+
+            def fork():
+                os.write(pairs[0][1], message)
+                return 4242
+
+            def open_(path, *args, **kwargs):
+                if path == "/proc/4242/ns/user":
+                    manager.open_ns(path, *args)
+                    return 77
+                return real_open(path, *args, **kwargs)
+
+            manager.write_map.side_effect = maps_fail
+            with patch.object(sandy.os, "fork", side_effect=fork), patch.object(
+                sandy.os, "open", side_effect=open_
+            ), patch.object(sandy, "_write_id_map", manager.write_map), patch.object(
+                sandy.os, "kill", manager.kill
+            ), patch.object(
+                sandy.os, "waitpid", manager.waitpid
             ):
-                with patch.object(
-                    sandy,
-                    "_run_secure_subprocess",
-                    return_value=missing_acl,
+                yield pairs, manager
+
+    def test_new_idmap_userns_writes_both_maps_then_opens_the_namespace(self):
+        with self.userns_parent() as (pairs, manager):
+            fd = sandy._new_idmap_userns("1234 525288 1\n", "100 525288 1\n")
+            self.assertEqual(fd, 77)
+            self.assertEqual(
+                manager.mock_calls,
+                [
+                    call.write_map(4242, "uid_map", "1234 525288 1\n"),
+                    call.write_map(4242, "gid_map", "100 525288 1\n"),
+                    call.open_ns("/proc/4242/ns/user", os.O_RDONLY | os.O_CLOEXEC),
+                    call.kill(4242, sandy.signal.SIGKILL),
+                    call.waitpid(4242, 0),
+                ],
+            )
+            # The parent closes every pipe end (the child holds its own).
+            for pair in pairs:
+                self.assertFalse(self.is_open(pair[0]))
+                self.assertFalse(self.is_open(pair[1]))
+
+    def test_new_idmap_userns_reports_a_failed_unshare(self):
+        for message, text in (
+            (b"unshare 1", "unshare failed: Operation not permitted (errno 1)"),
+            (b"unshare 28", "unshare failed: No space left on device (errno 28)"),
+            (b"", "helper process gave no result"),
+        ):
+            with self.subTest(message=message):
+                with self.userns_parent(message) as (pairs, manager):
+                    with self.assertRaises(sandy._MountError) as raised:
+                        sandy._new_idmap_userns("1 1 1\n", "1 1 1\n")
+                self.assertEqual(str(raised.exception), text)
+                # No map is written, and the child is still ended and reaped.
+                self.assertEqual(
+                    manager.mock_calls,
+                    [call.kill(4242, sandy.signal.SIGKILL), call.waitpid(4242, 0)],
+                )
+
+    def test_new_idmap_userns_reports_a_failed_map_write(self):
+        for failing_map, text in (
+            ("uid_map", "write of uid_map failed: Invalid argument (errno 22)"),
+            ("gid_map", "write of gid_map failed: Operation not permitted (errno 1)"),
+        ):
+            error = OSError(
+                errno.EINVAL if failing_map == "uid_map" else errno.EPERM, "x"
+            )
+            maps_fail = [error] if failing_map == "uid_map" else [None, error]
+            with self.subTest(failing_map=failing_map):
+                with self.userns_parent(maps_fail=maps_fail) as (pairs, manager):
+                    with self.assertRaises(sandy._MountError) as raised:
+                        sandy._new_idmap_userns("1 1 1\n", "1 1 1\n")
+                self.assertEqual(str(raised.exception), text)
+                manager.open_ns.assert_not_called()
+                manager.kill.assert_called_once_with(4242, sandy.signal.SIGKILL)
+                manager.waitpid.assert_called_once_with(4242, 0)
+
+    def test_new_idmap_userns_reports_a_failed_namespace_open(self):
+        with self.userns_parent() as (pairs, manager):
+            with patch.object(
+                sandy.os,
+                "open",
+                side_effect=OSError(errno.ENOENT, "gone"),
+            ):
+                with self.assertRaisesRegex(
+                    sandy._MountError,
+                    r"open of ns/user failed: No such file or directory \(errno 2\)",
                 ):
-                    with patch.dict(
-                        sandy.os.environ,
-                        {"SUDO_UID": "invalid"},
-                        clear=True,
+                    sandy._new_idmap_userns("1 1 1\n", "1 1 1\n")
+            manager.kill.assert_called_once_with(4242, sandy.signal.SIGKILL)
+
+    def test_new_idmap_userns_closes_the_pipes_when_the_fork_fails(self):
+        with self.fake_pipes() as pairs:
+            with patch.object(sandy.os, "fork", side_effect=BlockingIOError):
+                with self.assertRaises(BlockingIOError):
+                    sandy._new_idmap_userns("1 1 1\n", "1 1 1\n")
+            for pair in pairs:
+                self.assertFalse(self.is_open(pair[0]))
+                self.assertFalse(self.is_open(pair[1]))
+
+    @contextmanager
+    def userns_child(self, **kernel_failures):
+        manager = MagicMock()
+        manager.exit.side_effect = lambda code: (_ for _ in ()).throw(_ExitCalled(code))
+        with self.fake_pipes() as pairs, fake_mount_kernel(
+            failing=kernel_failures
+        ) as calls, patch.object(sandy.os, "fork", return_value=0), patch.object(
+            sandy.os, "_exit", manager.exit
+        ):
+            yield pairs, calls, manager
+
+    def run_userns_child(self, **kernel_failures):
+        exit_args = None
+        with self.userns_child(**kernel_failures) as (pairs, calls, manager):
+            try:
+                sandy._new_idmap_userns("1 1 1\n", "1 1 1\n")
+            except _ExitCalled as exc:
+                exit_args = exc.args
+            message = os.read(pairs[0][2], 64)
+        return exit_args, message, calls
+
+    def test_new_idmap_userns_child_unshares_and_waits_to_be_ended(self):
+        # The child reports success, then waits on the pipe. Here every copy
+        # of the write end is closed, so the wait ends at once.
+        exit_args, message, calls = self.run_userns_child()
+        self.assertEqual(exit_args, (0,))
+        self.assertEqual(message, b"ok")
+        (record,) = calls
+        self.assertEqual(record["name"], "unshare")
+        self.assertEqual(record["args"][0], sandy.CLONE_NEWUSER)
+
+    def test_new_idmap_userns_child_reports_a_failed_unshare(self):
+        exit_args, message, _ = self.run_userns_child(unshare=errno.EPERM)
+        self.assertEqual(exit_args, (1,))
+        self.assertEqual(message, b"unshare 1")
+
+
+class MountPlanTests(unittest.TestCase):
+    """The checks and steps around the primitives: maps, owners, plans.
+
+    Mocks: the primitives of MountPrimitiveTests, the lifecycle lock, machined,
+    and /proc. Real directories give the identity of a directory. The E2E
+    suite proves the mounts with the kernel.
+    """
+
+    @staticmethod
+    def status(uid=1234, gid=1234, dev=64768, ino=555):
+        return SimpleNamespace(st_uid=uid, st_gid=gid, st_dev=dev, st_ino=ino)
+
+    def test_parse_id_map_shift(self):
+        # The format of /proc/<pid>/uid_map: three right-aligned columns.
+        self.assertEqual(
+            sandy._parse_id_map_shift("         0     524288      65536\n", "uid_map"),
+            524288,
+        )
+        self.assertEqual(
+            sandy._parse_id_map_shift("0 1000000 65536\n", "gid_map"), 1000000
+        )
+        self.assertEqual(
+            sandy._parse_id_map_shift("0 4294901759 65536\n", "uid_map"), 4294901759
+        )
+
+    def test_parse_id_map_shift_fails_closed(self):
+        for text in (
+            "",
+            "\n",
+            # More than one extent, or an extent that is not the whole range.
+            "0 524288 65536\n0 1000 1\n",
+            "0 524288 1\n",
+            "0 524288 65535\n",
+            "0 524288 65537\n",
+            # The map of the host itself, and a map that does not start at 0.
+            "0 0 4294967295\n",
+            "0 0 65536\n",
+            "1 524288 65536\n",
+            # Malformed.
+            "0 00524288 65536\n",
+            "0 -1 65536\n",
+            "0 524288 65536",
+            "0\t524288\t65536\n",
+            "0 524288 65536 \n",
+            "0 5242880000000 65536\n",
+            # The last id of the range would not be a valid id.
+            "0 4294901760 65536\n",
+            "0 4294967295 65536\n",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(ValueError, "Unexpected uid_map"):
+                    sandy._parse_id_map_shift(text, "uid_map")
+
+    def test_id_map_line(self):
+        self.assertEqual(sandy._id_map_line(1234, 525288), "1234 525288 1\n")
+
+    def test_as_mount_error_names_the_errno(self):
+        self.assertEqual(
+            str(sandy._as_mount_error(OSError(errno.ENOENT, "No such file"))),
+            "No such file (errno 2)",
+        )
+        self.assertEqual(
+            str(sandy._as_mount_error(OSError("no errno"))),
+            f"{os.strerror(errno.EIO)} (errno {errno.EIO})",
+        )
+
+    def test_check_mount_owner_refuses_root_as_user_or_group(self):
+        sandy._check_mount_owner("workspace", self.status())
+        sandy._check_mount_owner("workspace", self.status(uid=1, gid=1))
+        for uid, gid in ((0, 1000), (1000, 0), (0, 0)):
+            with self.subTest(uid=uid, gid=gid):
+                with self.assertRaisesRegex(
+                    sandy._MountError, "root owns the shared directory"
+                ):
+                    sandy._check_mount_owner("shared", self.status(uid=uid, gid=gid))
+
+    def test_open_host_directory_opens_a_handle_without_links(self):
+        with patch.object(sandy, "_openat2_no_links", return_value=9) as opened:
+            self.assertEqual(sandy._open_host_directory("/srv/work"), 9)
+        opened.assert_called_once_with("/srv/work", os.O_PATH | os.O_DIRECTORY)
+
+    def test_open_host_directory_reports_errors_as_mount_errors(self):
+        with patch.object(sandy, "_openat2_no_links", side_effect=ValueError("x")):
+            with self.assertRaisesRegex(sandy._MountError, "path is not valid"):
+                sandy._open_host_directory("relative")
+        with patch.object(
+            sandy,
+            "_openat2_no_links",
+            side_effect=OSError(errno.ELOOP, "openat2 failed: loop"),
+        ):
+            with self.assertRaisesRegex(sandy._MountError, r"loop \(errno 40\)"):
+                sandy._open_host_directory("/srv/link")
+
+    def test_probe_makes_the_detached_mount_and_drops_it(self):
+        manager = MagicMock()
+        manager.tree.return_value = 31
+        with patch.object(sandy, "_new_idmap_userns", manager.userns), patch.object(
+            sandy, "_idmapped_tree", manager.tree
+        ), patch.object(sandy.os, "close", manager.close):
+            manager.userns.return_value = 30
+            sandy._probe_idmapped_mount(12, self.status(uid=1234, gid=100))
+        # The owner maps to itself: the probe needs only a valid map.
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                call.userns("1234 1234 1\n", "100 100 1\n"),
+                call.tree(12, 30),
+                call.close(31),
+                call.close(30),
+            ],
+        )
+
+    def test_probe_reports_an_unsupported_mount_with_a_hint(self):
+        with patch.object(sandy, "_new_idmap_userns", return_value=30), patch.object(
+            sandy,
+            "_idmapped_tree",
+            side_effect=OSError(errno.EINVAL, "mount_setattr failed: Invalid argument"),
+        ), patch.object(sandy.os, "close") as close:
+            with self.assertRaises(sandy._MountError) as raised:
+                sandy._probe_idmapped_mount(12, self.status())
+        self.assertEqual(
+            str(raised.exception),
+            "mount_setattr failed: Invalid argument (errno 22). "
+            + sandy.IDMAP_MOUNT_HINT,
+        )
+        close.assert_called_once_with(30)
+
+    def test_probe_closes_nothing_it_did_not_open(self):
+        with patch.object(
+            sandy, "_new_idmap_userns", side_effect=sandy._MountError("unshare failed")
+        ), patch.object(sandy, "_idmapped_tree") as tree, patch.object(
+            sandy.os, "close"
+        ) as close:
+            with self.assertRaisesRegex(sandy._MountError, "unshare failed"):
+                sandy._probe_idmapped_mount(12, self.status())
+        tree.assert_not_called()
+        close.assert_not_called()
+
+    def test_plan_mount_returns_the_identity_of_the_directory(self):
+        manager = MagicMock()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            real = os.stat(temp_dir)
+            fd = os.open(temp_dir, os.O_RDONLY | os.O_DIRECTORY)
+            manager.open.return_value = fd
+            with patch.object(
+                sandy, "_open_host_directory", manager.open
+            ), patch.object(sandy, "_check_mount_owner", manager.owner), patch.object(
+                sandy, "_probe_idmapped_mount", manager.probe
+            ):
+                plan = sandy._plan_mount(
+                    "workspace", temp_dir, "/home/developer/workspace"
+                )
+            self.assertEqual(
+                plan,
+                sandy.MountPlan(
+                    "workspace",
+                    temp_dir,
+                    "/home/developer/workspace",
+                    real.st_dev,
+                    real.st_ino,
+                ),
+            )
+            # The owner check comes before the probe, and the descriptor is
+            # closed.
+            self.assertEqual(
+                [entry[0] for entry in manager.mock_calls],
+                ["open", "owner", "probe"],
+            )
+            self.assertEqual(manager.owner.call_args.args[0], "workspace")
+            self.assertEqual(manager.probe.call_args.args[0], fd)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_plan_mount_refuses_a_root_directory_before_the_probe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fd = os.open(temp_dir, os.O_RDONLY | os.O_DIRECTORY)
+            with patch.object(
+                sandy, "_open_host_directory", return_value=fd
+            ), patch.object(
+                sandy.os, "fstat", return_value=self.status(uid=0)
+            ), patch.object(
+                sandy, "_probe_idmapped_mount"
+            ) as probe:
+                with self.assertRaisesRegex(sandy._MountError, "root owns"):
+                    sandy._plan_mount(
+                        "workspace", temp_dir, "/home/developer/workspace"
+                    )
+            probe.assert_not_called()
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_plan_mount_closes_the_descriptor_on_every_failure(self):
+        for failure in (
+            {"fstat": OSError(errno.EIO, "x")},
+            {"probe": sandy._MountError("no")},
+        ):
+            with self.subTest(failure=failure):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    fd = os.open(temp_dir, os.O_RDONLY | os.O_DIRECTORY)
+                    real_fstat = os.fstat
+                    with patch.object(
+                        sandy, "_open_host_directory", return_value=fd
+                    ), patch.object(
+                        sandy.os,
+                        "fstat",
+                        side_effect=failure.get("fstat") or real_fstat,
+                    ), patch.object(
+                        sandy,
+                        "_check_mount_owner",
+                    ), patch.object(
+                        sandy,
+                        "_probe_idmapped_mount",
+                        side_effect=failure.get("probe"),
                     ):
+                        with self.assertRaises((sandy._MountError, OSError)):
+                            sandy._plan_mount("workspace", temp_dir, "/home/x/w")
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
+
+    @contextmanager
+    def mount_one_mocks(self, source_stat=None, **failures):
+        manager = MagicMock()
+        manager.open.return_value = 20
+        manager.userns.return_value = 21
+        manager.tree.return_value = 22
+        manager.fstat.return_value = source_stat or self.status()
+        for name, error in failures.items():
+            getattr(manager, name).side_effect = error
+        with patch.object(sandy, "_open_host_directory", manager.open), patch.object(
+            sandy.os, "fstat", manager.fstat
+        ), patch.object(sandy, "_new_idmap_userns", manager.userns), patch.object(
+            sandy, "_idmapped_tree", manager.tree
+        ), patch.object(
+            sandy, "_move_mount_in_namespace", manager.move
+        ), patch.object(
+            sandy.os, "close", manager.close
+        ):
+            yield manager
+
+    plan = sandy.MountPlan(
+        "workspace", "/srv/work", "/home/developer/workspace", 64768, 555
+    )
+
+    def test_mount_one_maps_the_owner_to_the_image_user(self):
+        # The host owner 1234:1234 maps to container id 1000 of a container
+        # whose ids start at 524288, so the map is 1234 -> 525288.
+        with self.mount_one_mocks() as manager:
+            sandy._mount_one(self.plan, 524288, 524288, (1000, 1000), 40)
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                call.open("/srv/work"),
+                call.fstat(20),
+                call.userns("1234 525288 1\n", "1234 525288 1\n"),
+                call.tree(20, 21),
+                call.move(40, 22, "/home/developer/workspace"),
+                call.close(22),
+                call.close(21),
+                call.close(20),
+            ],
+        )
+
+    def test_mount_one_maps_user_and_group_separately(self):
+        # Host owner 1234:100, image user 1001:1002, shifts of 1000000.
+        with self.mount_one_mocks(
+            source_stat=self.status(uid=1234, gid=100)
+        ) as manager:
+            sandy._mount_one(self.plan, 1000000, 2000000, (1001, 1002), 40)
+        manager.userns.assert_called_once_with("1234 1001001 1\n", "100 2001002 1\n")
+
+    def test_mount_one_refuses_a_directory_that_changed(self):
+        for source_stat in (
+            self.status(dev=1),
+            self.status(ino=1),
+        ):
+            with self.subTest(source_stat=source_stat):
+                with self.mount_one_mocks(source_stat=source_stat) as manager:
+                    with self.assertRaisesRegex(
+                        sandy._MountError,
+                        "the workspace directory changed after the check",
+                    ):
+                        sandy._mount_one(self.plan, 524288, 524288, (1000, 1000), 40)
+                manager.userns.assert_not_called()
+                manager.move.assert_not_called()
+                manager.close.assert_called_once_with(20)
+
+    def test_mount_one_refuses_a_directory_that_root_owns_now(self):
+        # The owner can change between the plan and the mount.
+        for owner in (self.status(uid=0), self.status(gid=0)):
+            with self.subTest(owner=owner):
+                with self.mount_one_mocks(source_stat=owner) as manager:
+                    with self.assertRaisesRegex(
+                        sandy._MountError, "root owns the workspace directory"
+                    ):
+                        sandy._mount_one(self.plan, 524288, 524288, (1000, 1000), 40)
+                manager.userns.assert_not_called()
+                manager.move.assert_not_called()
+                manager.close.assert_called_once_with(20)
+
+    def test_mount_one_closes_every_descriptor_on_failure(self):
+        for failure, closed in (
+            ({"userns": sandy._MountError("no userns")}, [20]),
+            ({"tree": OSError(errno.EINVAL, "mount_setattr failed: x")}, [21, 20]),
+            ({"move": sandy._MountError("no move")}, [22, 21, 20]),
+        ):
+            with self.subTest(failure=failure):
+                with self.mount_one_mocks(**failure) as manager:
+                    with self.assertRaises(sandy._MountError):
+                        sandy._mount_one(self.plan, 524288, 524288, (1000, 1000), 40)
+                self.assertEqual(
+                    manager.close.call_args_list, [call(fd) for fd in closed]
+                )
+
+    def test_mount_one_turns_os_errors_into_mount_errors(self):
+        for failure in (
+            {"open": OSError(errno.ELOOP, "openat2 failed: x")},
+            {"fstat": OSError(errno.EIO, "x")},
+        ):
+            with self.subTest(failure=failure):
+                with self.mount_one_mocks(**failure):
+                    with self.assertRaises(sandy._MountError):
+                        sandy._mount_one(self.plan, 524288, 524288, (1000, 1000), 40)
+
+    def test_mount_one_rejects_an_id_beyond_the_valid_range(self):
+        for shifts, ids in (
+            ((0xFFFFFFFE, 524288), (1, 1000)),
+            ((524288, 0xFFFFFFFE), (1000, 1)),
+        ):
+            with self.subTest(shifts=shifts):
+                with self.mount_one_mocks() as manager:
+                    with self.assertRaisesRegex(sandy._MountError, "Invalid (uid|gid)"):
+                        sandy._mount_one(self.plan, *shifts, ids, 40)
+                manager.userns.assert_not_called()
+                manager.close.assert_called_once_with(20)
+
+
+class MountContainerDirsTests(unittest.TestCase):
+    """_mount_container_dirs finds the container as the entry helper does.
+
+    Mocks: the lifecycle lock, machined, the /proc reads, the descriptors,
+    and the mounts themselves. The E2E suite proves the mounts on a real
+    container.
+    """
+
+    PLANS = (
+        sandy.MountPlan("workspace", "/srv/work", "/home/developer/workspace", 1, 2),
+        sandy.MountPlan("shared", "/srv/share", "/home/developer/shared", 1, 3),
+    )
+    ID_MAP = b"         0     524288      65536\n"
+
+    @contextmanager
+    def mocks(self, **overrides):
+        """Mock every host boundary; overrides set a side effect by name."""
+        manager = MagicMock()
+        manager.query.return_value = 42
+        manager.pidfd_open.return_value = 10
+        manager.proc_dir.return_value = 20
+        manager.cgroup.return_value = "/sandy.slice/sandy-ai-dev.scope/payload"
+        manager.payload.return_value = (77, sandy.ProcessConfinement(2, 0))
+        manager.read_file.return_value = self.ID_MAP
+        manager.alive.return_value = True
+        manager.unit.return_value = 31
+
+        @contextmanager
+        def lock():
+            manager.lock_enter()
+            try:
+                yield
+            finally:
+                manager.lock_exit()
+
+        def open_fd(path, flags, dir_fd=None):
+            manager.open(path, flags, dir_fd=dir_fd)
+            if "open" in overrides:
+                raise overrides["open"]
+            return 21
+
+        for name, error in overrides.items():
+            if name != "open":
+                getattr(manager, name).side_effect = error
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(sandy, "_lifecycle_lock", lock))
+            stack.enter_context(
+                patch.object(sandy, "_query_machine_leader", manager.query)
+            )
+            stack.enter_context(
+                patch.object(sandy.os, "pidfd_open", manager.pidfd_open, create=True)
+            )
+            stack.enter_context(
+                patch.object(sandy, "_open_process_dir", manager.proc_dir)
+            )
+            stack.enter_context(
+                patch.object(sandy, "_read_process_cgroup", manager.cgroup)
+            )
+            stack.enter_context(patch.object(sandy, "_find_payload", manager.payload))
+            stack.enter_context(
+                patch.object(sandy, "_read_proc_file", manager.read_file)
+            )
+            stack.enter_context(patch.object(sandy.os, "open", side_effect=open_fd))
+            stack.enter_context(patch.object(sandy.os, "close", manager.close))
+            stack.enter_context(
+                patch.object(sandy, "_pidfd_process_alive", manager.alive)
+            )
+            stack.enter_context(patch.object(sandy, "_mount_one", manager.mount))
+            stack.enter_context(
+                patch.object(sandy, "_open_supervisor_cgroup", manager.unit)
+            )
+            stack.enter_context(
+                patch.object(sandy, "_remove_scope_marker", manager.remove_marker)
+            )
+            yield manager
+
+    def mount(self, plans=None):
+        sandy._mount_container_dirs("ai-dev", plans or self.PLANS, (1000, 1000))
+
+    def test_mounts_each_directory_then_removes_the_pending_marker(self):
+        with self.mocks() as manager:
+            self.mount()
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                call.lock_enter(),
+                call.query("ai-dev"),
+                call.pidfd_open(42),
+                # The pidfd pins one process; confirm that it is the Leader.
+                call.query("ai-dev"),
+                call.proc_dir(42),
+                call.cgroup(20),
+                call.payload(20, 42),
+                call.read_file(20, "uid_map", sandy.ID_MAP_MAX_BYTES),
+                call.read_file(20, "gid_map", sandy.ID_MAP_MAX_BYTES),
+                call.open("ns/mnt", os.O_RDONLY | os.O_CLOEXEC, dir_fd=20),
+                call.close(20),
+                call.alive(10),
+                call.mount(self.PLANS[0], 524288, 524288, (1000, 1000), 21),
+                call.mount(self.PLANS[1], 524288, 524288, (1000, 1000), 21),
+                call.unit("ai-dev"),
+                call.remove_marker(31, sandy.MOUNTS_PENDING_CGROUP),
+                call.close(31),
+                call.close(10),
+                call.close(21),
+                call.lock_exit(),
+            ],
+        )
+
+    def test_uses_the_shifts_of_the_two_maps(self):
+        maps = {
+            "uid_map": b"0 1000000 65536\n",
+            "gid_map": b"0 2000000 65536\n",
+        }
+        with self.mocks() as manager:
+            manager.read_file.side_effect = lambda fd, name, limit: maps[name]
+            self.mount(self.PLANS[:1])
+        manager.mount.assert_called_once_with(
+            self.PLANS[0], 1000000, 2000000, (1000, 1000), 21
+        )
+
+    def test_a_container_that_is_not_registered_yet_is_still_starting(self):
+        for error in (
+            subprocess.CalledProcessError(1, ["machinectl"]),
+            subprocess.TimeoutExpired(["machinectl"], 5),
+            ValueError("Invalid container Leader PID"),
+        ):
+            with self.subTest(error=error):
+                with self.mocks(query=error) as manager:
+                    with self.assertRaisesRegex(ProcessLookupError, "still starting"):
+                        self.mount()
+                manager.pidfd_open.assert_not_called()
+                manager.mount.assert_not_called()
+                manager.remove_marker.assert_not_called()
+                manager.lock_exit.assert_called_once_with()
+
+    def test_a_leader_that_is_gone_is_retried(self):
+        with self.mocks(pidfd_open=ProcessLookupError("gone")) as manager:
+            with self.assertRaises(ProcessLookupError):
+                self.mount()
+        manager.mount.assert_not_called()
+        with self.mocks(proc_dir=FileNotFoundError("/proc/42")) as manager:
+            with self.assertRaisesRegex(ProcessLookupError, "Leader exited"):
+                self.mount()
+        manager.mount.assert_not_called()
+        # The pidfd is closed.
+        manager.close.assert_called_once_with(10)
+
+    def test_a_changed_leader_is_refused(self):
+        with self.mocks() as manager:
+            manager.query.side_effect = [42, 43]
+            with self.assertRaisesRegex(PermissionError, "Leader changed"):
+                self.mount()
+        manager.proc_dir.assert_not_called()
+        manager.mount.assert_not_called()
+        manager.close.assert_called_once_with(10)
+
+    def test_a_container_that_is_still_starting_mounts_nothing(self):
+        # Mocks: _find_payload (item 5 of specs/security-parity.md proves the
+        # search) and the cgroup of the Leader.
+        for override, message in (
+            (
+                {"payload": ProcessLookupError("Container is still starting")},
+                "starting",
+            ),
+            ({"cgroup": "/sandy.slice/sandy-ai-dev.scope"}, "starting"),
+        ):
+            with self.subTest(override=override):
+                with self.mocks() as manager:
+                    if "cgroup" in override:
+                        manager.cgroup.return_value = override["cgroup"]
+                    else:
+                        manager.payload.side_effect = override["payload"]
+                    with self.assertRaisesRegex(ProcessLookupError, message):
+                        self.mount()
+                manager.read_file.assert_not_called()
+                manager.mount.assert_not_called()
+                manager.remove_marker.assert_not_called()
+                self.assertEqual(manager.close.call_args_list, [call(20), call(10)])
+                manager.lock_exit.assert_called_once_with()
+
+    def test_a_leader_outside_the_scope_is_refused(self):
+        for cgroup in (
+            "/machine.slice/machine-ai-dev.scope/payload",
+            "/sandy.slice/sandy-other.scope/payload",
+            "/sandy.slice/sandy-ai-dev.scope/supervisor",
+        ):
+            with self.subTest(cgroup=cgroup):
+                with self.mocks() as manager:
+                    manager.cgroup.return_value = cgroup
+                    with self.assertRaisesRegex(PermissionError, "restart it"):
+                        self.mount()
+                manager.payload.assert_not_called()
+                manager.mount.assert_not_called()
+
+    def test_an_unexpected_map_is_refused_before_any_mount(self):
+        for name in ("uid_map", "gid_map"):
+            with self.subTest(name=name):
+                with self.mocks() as manager:
+                    manager.read_file.side_effect = lambda fd, file, limit: (
+                        b"0 0 4294967295\n" if file == name else self.ID_MAP
+                    )
+                    with self.assertRaisesRegex(ValueError, f"Unexpected {name}"):
+                        self.mount()
+                manager.mount.assert_not_called()
+                manager.remove_marker.assert_not_called()
+                self.assertEqual(manager.close.call_args_list, [call(20), call(10)])
+
+    def test_a_failed_namespace_open_is_final(self):
+        with self.mocks(open=FileNotFoundError("ns/mnt")) as manager:
+            with self.assertRaises(FileNotFoundError):
+                self.mount()
+        manager.mount.assert_not_called()
+        self.assertEqual(manager.close.call_args_list, [call(20), call(10)])
+
+    def test_a_leader_that_exited_during_the_reads_is_retried(self):
+        with self.mocks(alive=None) as manager:
+            manager.alive.return_value = False
+            with self.assertRaisesRegex(ProcessLookupError, "Leader exited"):
+                self.mount()
+        manager.mount.assert_not_called()
+        manager.remove_marker.assert_not_called()
+        self.assertEqual(manager.close.call_args_list, [call(20), call(10), call(21)])
+
+    def test_a_failed_mount_names_the_directory_and_keeps_the_marker(self):
+        for index, plan in enumerate(self.PLANS):
+            with self.subTest(label=plan.label):
+                errors = [None] * len(self.PLANS)
+                errors[index] = sandy._MountError("move_mount failed: x (errno 22)")
+                with self.mocks() as manager:
+                    manager.mount.side_effect = errors
+                    with self.assertRaises(sandy._MountError) as raised:
+                        self.mount()
+                self.assertEqual(
+                    str(raised.exception),
+                    f"'{plan.source}' on '{plan.target}': move_mount failed: x (errno 22)",
+                )
+                # Later directories are not mounted, the marker stays (the
+                # caller stops the container), and every descriptor closes.
+                self.assertEqual(manager.mount.call_count, index + 1)
+                manager.remove_marker.assert_not_called()
+                self.assertEqual(
+                    manager.close.call_args_list[-2:], [call(10), call(21)]
+                )
+                manager.lock_exit.assert_called_once_with()
+
+    def test_control_characters_of_the_source_are_not_reported(self):
+        plan = sandy.MountPlan(
+            "workspace", "/srv/\x1b[31mwork", "/home/developer/workspace", 1, 2
+        )
+        with self.mocks() as manager:
+            manager.mount.side_effect = sandy._MountError("x")
+            with self.assertRaises(sandy._MountError) as raised:
+                self.mount((plan,))
+        self.assertNotIn("\x1b", str(raised.exception))
+        self.assertIn("/srv/[31mwork", str(raised.exception))
+
+    def test_validates_the_name_and_takes_the_lock_first(self):
+        with self.mocks() as manager:
+            with self.assertRaises(ValueError):
+                sandy._mount_container_dirs("Bad Name", self.PLANS, (1000, 1000))
+        manager.lock_enter.assert_not_called()
+        with patch.object(
+            sandy, "_lifecycle_lock", side_effect=TimeoutError("busy")
+        ), patch.object(sandy.os, "pidfd_open", create=True) as pidfd_open:
+            with self.assertRaises(TimeoutError):
+                self.mount()
+        pidfd_open.assert_not_called()
+
+
+class WaitForMountsTests(unittest.TestCase):
+    """Sandy._wait_for_mounts: retry until the container has its payload.
+
+    Mocks: the mount step, the supervisor, the clock, and the sleep.
+    """
+
+    plans = (
+        sandy.MountPlan("workspace", "/srv/work", "/home/developer/workspace", 1, 2),
+    )
+
+    def wait(self, supervisor=None, event=None, timeout=60):
+        instance = make_sandy()
+        return instance._wait_for_mounts(
+            self.plans,
+            (1000, 1000),
+            spinner_line_event=event,
+            timeout=timeout,
+            supervisor=supervisor,
+        )
+
+    def test_mounts_at_once(self):
+        supervisor = MagicMock()
+        supervisor.poll.return_value = None
+        with patch.object(sandy, "_mount_container_dirs") as mount, patch.object(
+            sandy.time, "sleep"
+        ) as sleep:
+            self.assertTrue(self.wait(supervisor))
+        mount.assert_called_once_with("ai-dev", self.plans, (1000, 1000))
+        sleep.assert_not_called()
+
+    def test_retries_while_the_container_is_still_starting(self):
+        supervisor = MagicMock()
+        supervisor.poll.return_value = None
+        event = threading.Event()
+        with patch.object(
+            sandy,
+            "_mount_container_dirs",
+            side_effect=[ProcessLookupError("starting")] * 2 + [None],
+        ) as mount, patch.object(sandy.time, "sleep") as sleep, patch.object(
+            sandy.time, "monotonic", return_value=0.0
+        ):
+            with captured_output() as (stdout, _):
+                self.assertTrue(self.wait(supervisor, event))
+        self.assertEqual(mount.call_count, 3)
+        self.assertEqual(
+            sleep.call_args_list, [call(sandy.CONTAINER_READY_INTERVAL)] * 2
+        )
+        # One spinner dot for each retry.
+        self.assertEqual(stdout.getvalue(), "..")
+
+    def test_the_spinner_stops_when_its_line_is_finished(self):
+        supervisor = MagicMock()
+        supervisor.poll.return_value = None
+        event = threading.Event()
+        event.set()
+        with patch.object(
+            sandy,
+            "_mount_container_dirs",
+            side_effect=[ProcessLookupError("starting"), None],
+        ), patch.object(sandy.time, "sleep"), patch.object(
+            sandy.time, "monotonic", return_value=0.0
+        ):
+            with captured_output() as (stdout, _):
+                self.assertTrue(self.wait(supervisor, event))
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_the_spinner_stops_when_the_line_ends_during_the_wait(self):
+        supervisor = MagicMock()
+        supervisor.poll.return_value = None
+        event = threading.Event()
+        calls = []
+
+        def mount(*_):
+            calls.append(1)
+            if len(calls) == 1:
+                # Something else finished the spinner line during this try.
+                event.set()
+                raise ProcessLookupError("starting")
+
+        with patch.object(
+            sandy, "_mount_container_dirs", side_effect=mount
+        ), patch.object(sandy.time, "sleep"), patch.object(
+            sandy.time, "monotonic", return_value=0.0
+        ):
+            with captured_output() as (stdout, _):
+                self.assertTrue(self.wait(supervisor, event))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_gives_up_when_the_supervisor_has_exited(self):
+        supervisor = MagicMock()
+        supervisor.poll.return_value = 1
+        with patch.object(sandy, "_mount_container_dirs") as mount:
+            self.assertFalse(self.wait(supervisor))
+        mount.assert_not_called()
+
+    def test_gives_up_when_the_container_does_not_start_in_time(self):
+        supervisor = MagicMock()
+        supervisor.poll.return_value = None
+        with patch.object(
+            sandy, "_mount_container_dirs", side_effect=ProcessLookupError("starting")
+        ) as mount, patch.object(sandy.time, "sleep") as sleep, patch.object(
+            sandy.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 59.8, 59.8, 61.0]
+        ):
+            self.assertFalse(self.wait(supervisor, timeout=60))
+        self.assertEqual(mount.call_count, 2)
+        # The last sleep does not pass the deadline.
+        self.assertAlmostEqual(sleep.call_args_list[-1].args[0], 0.2)
+
+    def test_a_deadline_that_passed_during_a_try_ends_the_wait_at_once(self):
+        supervisor = MagicMock()
+        supervisor.poll.return_value = None
+        with patch.object(
+            sandy, "_mount_container_dirs", side_effect=ProcessLookupError("starting")
+        ), patch.object(sandy.time, "sleep") as sleep, patch.object(
+            sandy.time, "monotonic", side_effect=[0.0, 0.0, 60.0]
+        ):
+            self.assertFalse(self.wait(supervisor, timeout=60))
+        sleep.assert_not_called()
+
+    def test_a_failed_mount_is_final(self):
+        supervisor = MagicMock()
+        supervisor.poll.return_value = None
+        error = sandy._MountError("'/srv/work' on '/h/w': move_mount failed: x")
+        with patch.object(sandy, "_mount_container_dirs", side_effect=error):
+            with self.assertRaises(sandy._MountError) as raised:
+                self.wait(supervisor)
+        self.assertIs(raised.exception, error)
+
+    def test_other_errors_become_mount_errors(self):
+        supervisor = MagicMock()
+        supervisor.poll.return_value = None
+        for error in (
+            PermissionError("Container Leader changed during the mounts"),
+            ValueError("Unexpected uid_map of the container"),
+            OSError(errno.EIO, "read failed"),
+            subprocess.SubprocessError("machinectl"),
+        ):
+            with self.subTest(error=error):
+                with patch.object(sandy, "_mount_container_dirs", side_effect=error):
+                    with self.assertRaisesRegex(
+                        sandy._MountError, "^the directories in the container: "
+                    ):
+                        self.wait(supervisor)
+
+    def test_without_a_supervisor_the_wait_is_bounded_by_the_timeout(self):
+        with patch.object(sandy, "_mount_container_dirs") as mount:
+            self.assertTrue(self.wait(None))
+        mount.assert_called_once()
+        with patch.object(sandy, "_mount_container_dirs") as mount:
+            self.assertFalse(self.wait(None, timeout=0))
+        mount.assert_not_called()
+
+
+class PlanMountsTests(unittest.TestCase):
+    """Sandy._plan_mounts and Sandy._prepare_image_mounts.
+
+    Mocks: the check of a directory (_plan_mount) and the image user's ids.
+    Real temporary directories give the paths and the images.
+    """
+
+    def setUp(self):
+        # Mock the mount table of the host; SubmountWarningTests cover it.
+        patcher = patch.object(sandy, "_read_mountinfo", return_value="")
+        self.read_mountinfo = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def fake_plan(label, source, target):
+        return sandy.MountPlan(label, source, target, 1, 2)
+
+    def test_plans_warn_about_mounts_below_each_directory(self):
+        instance = make_sandy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "work").mkdir()
+            (root / "share").mkdir()
+            work = os.path.realpath(root / "work")
+            share = os.path.realpath(root / "share")
+            instance.workspace = str(root / "work")
+            instance.shared = str(root / "share")
+            self.read_mountinfo.return_value = (
+                f"36 35 98:0 / {work}/sub rw - ext4 /dev/sda rw\n"
+                f"37 35 98:0 / {share}/a rw - tmpfs tmpfs rw\n"
+            )
+            with patch.object(sandy, "_plan_mount", side_effect=self.fake_plan):
+                with captured_output() as (stdout, _):
+                    plans = instance._plan_mounts()
+        self.assertEqual(len(plans), 2)
+        self.assertEqual(
+            stdout.getvalue(),
+            f"W: The workspace directory '{work}' has mounts below it: '{work}/sub'\n"
+            "   The container does not see these mounts\n"
+            f"W: The shared directory '{share}' has mounts below it: '{share}/a'\n"
+            "   The container does not see these mounts\n",
+        )
+
+    def test_a_refused_directory_gets_no_warning(self):
+        instance = make_sandy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            instance.workspace = temp_dir
+            instance.shared = None
+            with patch.object(
+                sandy, "_plan_mount", side_effect=sandy._MountError("no")
+            ):
+                with captured_output():
+                    with self.assertRaises(SystemExit):
+                        instance._plan_mounts()
+        self.read_mountinfo.assert_not_called()
+
+    def test_no_directory_gives_no_plan(self):
+        instance = make_sandy()
+        instance.workspace = None
+        instance.shared = None
+        with patch.object(sandy, "_plan_mount") as plan:
+            self.assertEqual(instance._plan_mounts(), [])
+        plan.assert_not_called()
+
+    def test_plans_each_existing_directory_by_its_real_path(self):
+        instance = make_sandy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "real").mkdir()
+            (root / "link").symlink_to(root / "real")
+            (root / "shared").mkdir()
+            instance.workspace = str(root / "link")
+            instance.shared = str(root / "shared")
+            with patch.object(sandy, "_plan_mount", side_effect=self.fake_plan) as plan:
+                plans = instance._plan_mounts()
+            real = os.path.realpath(root / "real")
+            shared = os.path.realpath(root / "shared")
+        self.assertEqual(
+            plan.call_args_list,
+            [
+                call("workspace", real, "/home/developer/workspace"),
+                call("shared", shared, "/home/developer/shared"),
+            ],
+        )
+        self.assertEqual([item.source for item in plans], [real, shared])
+
+    def test_the_target_follows_the_user_of_the_container(self):
+        instance = make_sandy()
+        instance.user = "other"
+        instance.user_home = "/home/other"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            instance.workspace = temp_dir
+            with patch.object(sandy, "_plan_mount", side_effect=self.fake_plan) as plan:
+                instance._plan_mounts()
+        self.assertEqual(plan.call_args.args[2], "/home/other/workspace")
+
+    def test_skips_a_missing_directory_and_a_file_with_a_warning(self):
+        instance = make_sandy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "file").write_text("x")
+            instance.workspace = str(root / "missing")
+            instance.shared = str(root / "file")
+            with patch.object(sandy, "_plan_mount") as plan:
+                with captured_output() as (stdout, _):
+                    self.assertEqual(instance._plan_mounts(), [])
+        plan.assert_not_called()
+        self.assertEqual(
+            stdout.getvalue(),
+            f"W: Could not find '{root / 'missing'}' on the host, skipping workspace mount\n"
+            f"W: Could not find '{root / 'file'}' on the host, skipping shared mount\n",
+        )
+
+    def test_control_characters_are_not_printed(self):
+        instance = make_sandy()
+        instance.workspace = "missing\x1b[31m"
+        instance.shared = None
+        with captured_output() as (stdout, _):
+            instance._plan_mounts()
+        self.assertNotIn("\x1b", stdout.getvalue())
+        self.assertIn("'missing[31m'", stdout.getvalue())
+
+    def test_a_refused_directory_ends_the_command(self):
+        instance = make_sandy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "ws\x1b[0m").mkdir()
+            (root / "shared").mkdir()
+            instance.workspace = str(root / "ws\x1b[0m")
+            instance.shared = str(root / "shared")
+            with patch.object(
+                sandy,
+                "_plan_mount",
+                side_effect=sandy._MountError("root owns the workspace directory"),
+            ) as plan:
+                with captured_output() as (stdout, _):
+                    with self.assertRaises(SystemExit) as exited:
+                        instance._plan_mounts()
+            source = os.path.realpath(root / "ws\x1b[0m")
+        self.assertEqual(exited.exception.code, 1)
+        # The second directory is not checked.
+        plan.assert_called_once()
+        self.assertEqual(
+            stdout.getvalue(),
+            f"E: Cannot mount '{source.replace(chr(27), '')}' as the workspace "
+            "directory: root owns the workspace directory\n",
+        )
+
+    @contextmanager
+    def image(self, directories):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            for directory in directories:
+                (machine / directory).mkdir(parents=True)
+            yield machine
+
+    plans = [
+        sandy.MountPlan("workspace", "/srv/work", "/home/developer/workspace", 1, 2),
+        sandy.MountPlan("shared", "/srv/share", "/home/developer/shared", 1, 3),
+    ]
+
+    def test_prepare_keeps_the_targets_that_the_image_has(self):
+        instance = make_sandy()
+        with self.image(["home/developer/workspace"]) as machine:
+            with patch.object(
+                sandy, "_read_image_user_ids", return_value=(1001, 1002)
+            ) as read:
+                with captured_output() as (stdout, _):
+                    kept, ids = instance._prepare_image_mounts(
+                        9, str(machine), self.plans
+                    )
+        self.assertEqual(kept, (self.plans[0],))
+        self.assertEqual(ids, (1001, 1002))
+        read.assert_called_once_with(9, "developer")
+        self.assertEqual(
+            stdout.getvalue(),
+            "I: Mounting '/srv/work' on '/home/developer/workspace'\n"
+            "W: Could not find '/home/developer/shared' in the container. "
+            "Skipping shared mount\n",
+        )
+
+    def test_prepare_reads_the_user_of_the_container(self):
+        instance = make_sandy()
+        instance.user = "other"
+        instance.user_home = "/home/other"
+        plan = sandy.MountPlan("workspace", "/srv/work", "/home/other/workspace", 1, 2)
+        with self.image(["home/other/workspace"]) as machine:
+            with patch.object(
+                sandy, "_read_image_user_ids", return_value=(1000, 1000)
+            ) as read:
+                with captured_output():
+                    instance._prepare_image_mounts(9, str(machine), [plan])
+        read.assert_called_once_with(9, "other")
+
+    def test_prepare_reads_nothing_when_no_target_is_left(self):
+        instance = make_sandy()
+        with self.image([]) as machine:
+            with patch.object(sandy, "_read_image_user_ids") as read:
+                with captured_output():
+                    result = instance._prepare_image_mounts(9, str(machine), self.plans)
+        self.assertEqual(result, ((), (0, 0)))
+        read.assert_not_called()
+
+    def test_prepare_ends_the_command_when_the_ids_cannot_be_read(self):
+        instance = make_sandy()
+        for error in (
+            ValueError("Container user must have exactly one passwd entry"),
+            FileNotFoundError("passwd"),
+            PermissionError("Unsafe image file path component 'passwd'"),
+        ):
+            with self.subTest(error=error):
+                with self.image(["home/developer/workspace"]) as machine:
+                    with patch.object(sandy, "_read_image_user_ids", side_effect=error):
                         with captured_output() as (stdout, _):
-                            instance._setfacl("/workspace", "test")
-        self.assertIn("SUDO_UID not set", stdout.getvalue())
-        self.assertIn("setfacl -R -m u:1001000:rwX", stdout.getvalue())
+                            with self.assertRaises(SystemExit) as exited:
+                                instance._prepare_image_mounts(
+                                    9, str(machine), self.plans[:1]
+                                )
+                self.assertEqual(exited.exception.code, 1)
+                self.assertIn(
+                    "E: Could not read the uid and gid of 'developer' in the "
+                    "container image: ",
+                    stdout.getvalue(),
+                )
 
-    def test_acl_setup_decline_does_not_modify_acl(self):
+
+class SubmountWarningTests(unittest.TestCase):
+    """The warning about mounts below a directory that up mounts.
+
+    Mocks: only the read of the mount table. The text is a real mountinfo
+    sample. The E2E suite proves that the container does not see the mounts.
+    """
+
+    MOUNTINFO = (
+        "22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n"
+        "36 22 98:0 / /srv/work rw,noatime master:1 - ext3 /dev/root rw,errors=continue\n"
+        "37 36 0:30 / /srv/work/tmp\\040dir rw,nosuid shared:5 - tmpfs tmpfs rw\n"
+        "38 36 0:31 /other /srv/work/b rw - ext4 /dev/sdb rw\n"
+        "39 38 0:32 / /srv/work/b/deeper rw - tmpfs tmpfs rw\n"
+        "40 22 0:33 / /srv/work-extra rw - ext4 /dev/sdc rw\n"
+        "41 22 0:34 / /srv/workx rw master:1 shared:2 - ext4 /dev/sdd rw\n"
+        "42 22 0:35 / /srv rw - ext4 /dev/sde rw\n"
+    )
+
+    def test_lists_the_mount_points_below_the_directory(self):
+        self.assertEqual(
+            sandy._mounts_below("/srv/work", self.MOUNTINFO),
+            ["/srv/work/b", "/srv/work/b/deeper", "/srv/work/tmp dir"],
+        )
+
+    def test_does_not_list_the_directory_itself_or_a_similar_name(self):
+        for directory, expected in (
+            ("/srv/work/b", ["/srv/work/b/deeper"]),
+            ("/srv/work/b/deeper", []),
+            ("/srv/work-extra", []),
+            ("/srv/wor", []),
+            # A trailing slash does not change the result.
+            ("/srv/work/b/", ["/srv/work/b/deeper"]),
+        ):
+            with self.subTest(directory=directory):
+                self.assertEqual(
+                    sandy._mounts_below(directory, self.MOUNTINFO), expected
+                )
+
+    def test_every_mount_is_below_the_root_directory(self):
+        self.assertEqual(
+            sandy._mounts_below(
+                "/",
+                "22 1 8:2 / / rw - ext4 /dev/sda2 rw\n"
+                "23 22 0:3 / /a rw - tmpfs tmpfs rw\n",
+            ),
+            ["/a"],
+        )
+
+    def test_decodes_the_octal_escapes_of_the_kernel(self):
+        line = "50 22 0:40 / /srv/work/a\\040b\\011c\\012d\\134e rw - tmpfs tmpfs rw\n"
+        self.assertEqual(
+            sandy._mounts_below("/srv/work", line), ["/srv/work/a b\tc\nd\\e"]
+        )
+
+    def test_skips_empty_lines_and_lists_each_mount_point_once(self):
+        text = (
+            "\n"
+            "50 22 0:40 / /srv/work/a rw - tmpfs tmpfs rw\n"
+            "\n"
+            "51 50 0:41 / /srv/work/a rw - tmpfs tmpfs rw\n"
+        )
+        self.assertEqual(sandy._mounts_below("/srv/work", text), ["/srv/work/a"])
+
+    def test_a_malformed_line_fails_the_whole_check(self):
+        for line in (
+            "50 22 0:40 / /srv/work/a rw tmpfs tmpfs rw",
+            "50 22 0:40 / /srv/work/a",
+            "garbage",
+            "50 22 0:40 / /srv/work/a rw - tmpfs",
+        ):
+            with self.subTest(line=line):
+                with self.assertRaisesRegex(ValueError, "Malformed mountinfo line"):
+                    sandy._mounts_below("/srv/work", self.MOUNTINFO + line + "\n")
+
+    def test_reads_the_mount_table_through_the_proc_directory(self):
+        manager = MagicMock()
+        manager.proc_dir.return_value = 9
+        manager.read.return_value = b"22 1 8:2 / /\xff rw - ext4 /dev/sda2 rw\n"
+        with patch.object(sandy, "_open_process_dir", manager.proc_dir), patch.object(
+            sandy, "_read_proc_file", manager.read
+        ), patch.object(sandy.os, "close", manager.close):
+            text = sandy._read_mountinfo()
+        # A file name that is not UTF-8 stays as it is.
+        self.assertEqual(text, "22 1 8:2 / /\udcff rw - ext4 /dev/sda2 rw\n")
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                call.proc_dir(os.getpid()),
+                call.read(9, "mountinfo", sandy.MOUNTINFO_MAX_BYTES),
+                call.close(9),
+            ],
+        )
+
+    def test_reading_closes_the_proc_directory_on_failure(self):
+        with patch.object(sandy, "_open_process_dir", return_value=9), patch.object(
+            sandy, "_read_proc_file", side_effect=ValueError("too large")
+        ), patch.object(sandy.os, "close") as close:
+            with self.assertRaises(ValueError):
+                sandy._read_mountinfo()
+        close.assert_called_once_with(9)
+
+    def warn(self, mountinfo, source="/srv/work", label="workspace"):
         instance = make_sandy()
-        instance.systemd_version = 249
-        getfacl_error = subprocess.CalledProcessError(1, ["getfacl"])
-        with patch.object(sandy.os.path, "exists", return_value=True):
-            with patch.object(
-                instance,
-                "_get_host_uid",
-                return_value=1001000,
-            ):
-                with patch.object(
-                    sandy,
-                    "_run_secure_subprocess",
-                    side_effect=getfacl_error,
-                ) as run:
-                    with patch.object(instance, "_confirm", return_value=False):
-                        with patch.dict(
-                            sandy.os.environ,
-                            {"SUDO_UID": "1000"},
-                            clear=True,
-                        ):
-                            with captured_output():
-                                instance._setfacl("/workspace", "test")
-        self.assertEqual(run.call_count, 1)
+        with patch.object(sandy, "_read_mountinfo", return_value=mountinfo):
+            with captured_output() as (stdout, _):
+                instance._warn_about_submounts(label, source)
+        return stdout.getvalue()
 
-    def test_acl_setup_drops_privileges_for_both_acl_commands(self):
+    def test_warns_with_the_mounts_below_the_directory(self):
+        self.assertEqual(
+            self.warn(self.MOUNTINFO),
+            "W: The workspace directory '/srv/work' has mounts below it: "
+            "'/srv/work/b', '/srv/work/b/deeper', '/srv/work/tmp dir'\n"
+            "   The container does not see these mounts\n",
+        )
+
+    def test_says_nothing_without_mounts_below(self):
+        self.assertEqual(self.warn(self.MOUNTINFO, "/srv/work/b/deeper"), "")
+        self.assertEqual(self.warn(""), "")
+
+    def test_lists_at_most_three_mounts_and_counts_the_rest(self):
+        lines = "".join(
+            f"{50 + number} 22 0:{40 + number} / /srv/work/m{number} rw - tmpfs tmpfs rw\n"
+            for number in range(5)
+        )
+        output = self.warn(lines, label="shared")
+        self.assertEqual(
+            output.splitlines()[0],
+            "W: The shared directory '/srv/work' has mounts below it: "
+            "'/srv/work/m0', '/srv/work/m1', '/srv/work/m2' and 2 more",
+        )
+        self.assertEqual(sandy.SUBMOUNT_LIST_MAX, 3)
+
+    def test_does_not_print_control_characters(self):
+        output = self.warn("50 22 0:40 / /srv/work/\x1b[31mred rw - tmpfs tmpfs rw\n")
+        self.assertNotIn("\x1b", output)
+        self.assertIn("'/srv/work/[31mred'", output)
+
+    def test_reports_an_unreadable_mount_table_and_goes_on(self):
         instance = make_sandy()
-        instance.systemd_version = 249
-        getfacl = SimpleNamespace(stdout="")
-        failed = SimpleNamespace(returncode=1, stderr="denied")
-        succeeded = SimpleNamespace(returncode=0, stderr="")
-        with patch.object(sandy.os.path, "exists", return_value=True):
-            with patch.object(
-                instance,
-                "_get_host_uid",
-                return_value=1001000,
-            ):
-                with patch.object(
-                    sandy,
-                    "_run_secure_subprocess",
-                    side_effect=[getfacl, failed, succeeded],
-                ) as run:
-                    with patch.object(instance, "_confirm", return_value=True):
-                        with patch.dict(
-                            sandy.os.environ,
-                            {"SUDO_UID": "1000"},
-                            clear=True,
-                        ):
-                            with captured_output() as (stdout, _):
-                                instance._setfacl("/workspace", "test")
+        for error in (
+            OSError(errno.EACCES, "Permission denied"),
+            ValueError("Malformed mountinfo line"),
+        ):
+            with self.subTest(error=error):
+                with patch.object(sandy, "_read_mountinfo", side_effect=error):
+                    with captured_output() as (stdout, _):
+                        instance._warn_about_submounts("workspace", "/srv/work")
+                self.assertTrue(
+                    stdout.getvalue().startswith(
+                        "W: Could not check for mounts below the workspace "
+                        "directory: "
+                    )
+                )
 
-        self.assertEqual(run.call_count, 3)
-        recursive = run.call_args_list[1].args[0]
-        default = run.call_args_list[2].args[0]
-        privilege_prefix = [
-            "setpriv",
-            "--reuid=1000",
-            "--regid=1000",
-            "--clear-groups",
-            "--",
-        ]
-        self.assertEqual(recursive[:5], privilege_prefix)
-        self.assertEqual(default[:5], privilege_prefix)
-        self.assertIn("Failed to add ACL", stdout.getvalue())
+
+class ImageUserIdsTests(unittest.TestCase):
+    """The uid and gid of the container user, read from the image's passwd.
+
+    Mocks: only the check that the image's directories belong to root.
+    """
+
+    PASSWD = (
+        "root:x:0:0:root:/root:/bin/bash\n"
+        "ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n"
+        "developer:x:1001:100::/home/developer:/bin/bash\n"
+    )
+
+    def test_resolve_container_user_ids(self):
+        self.assertEqual(
+            sandy._resolve_container_user_ids("developer", self.PASSWD), (1001, 100)
+        )
+        self.assertEqual(
+            sandy._resolve_container_user_ids("ubuntu", self.PASSWD), (1000, 1000)
+        )
+        self.assertEqual(sandy._resolve_container_user_ids("root", self.PASSWD), (0, 0))
+
+    def test_resolve_container_user_ids_fails_closed(self):
+        for user, text in (
+            ("missing", self.PASSWD),
+            ("developer", self.PASSWD + "developer:x:1002:1002::/h:/s\n"),
+            ("developer", self.PASSWD + "broken:x:1\n"),
+            ("developer", self.PASSWD.replace(":1001:100:", ":01001:100:")),
+            ("developer", self.PASSWD.replace(":1001:100:", ":1001:65535:")),
+            ("developer", self.PASSWD.replace(":1001:100:", ":0:100:")),
+            ("root", self.PASSWD.replace("root:x:0:0", "root:x:5:0")),
+        ):
+            with self.subTest(user=user, text=text):
+                with self.assertRaises(ValueError):
+                    sandy._resolve_container_user_ids(user, text)
+
+    @contextmanager
+    def image(self, passwd=None):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            machine = Path(temp_dir)
+            (machine / "etc").mkdir(mode=0o755)
+            if passwd is not None:
+                file = machine / "etc" / "passwd"
+                file.write_text(passwd)
+                file.chmod(0o644)
+            machine_fd = os.open(machine, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                with patch.object(sandy, "_verify_owned_directory"):
+                    yield machine, machine_fd
+            finally:
+                os.close(machine_fd)
+
+    def test_reads_the_ids_through_the_pinned_image_root(self):
+        with self.image(self.PASSWD) as (_, machine_fd):
+            self.assertEqual(
+                sandy._read_image_user_ids(machine_fd, "developer"), (1001, 100)
+            )
+            self.assertEqual(
+                sandy._read_image_user_ids(machine_fd, "ubuntu"), (1000, 1000)
+            )
+
+    def test_fails_closed_on_an_unsafe_or_missing_passwd(self):
+        with self.image() as (machine, machine_fd):
+            with self.assertRaises(FileNotFoundError):
+                sandy._read_image_user_ids(machine_fd, "developer")
+            # A link is not followed out of the image, and a directory is not
+            # a regular file.
+            (machine / "etc" / "passwd").symlink_to("/etc/passwd")
+            with self.assertRaises(PermissionError):
+                sandy._read_image_user_ids(machine_fd, "developer")
+            (machine / "etc" / "passwd").unlink()
+            (machine / "etc" / "passwd").mkdir()
+            with self.assertRaises(PermissionError):
+                sandy._read_image_user_ids(machine_fd, "developer")
+
+    def test_fails_closed_on_malformed_or_large_passwd_text(self):
+        with self.image("developer:x:1001\n") as (_, machine_fd):
+            with self.assertRaisesRegex(ValueError, "Malformed container passwd"):
+                sandy._read_image_user_ids(machine_fd, "developer")
+        with self.image(self.PASSWD) as (_, machine_fd):
+            with patch.object(sandy, "CONTAINER_ACCOUNT_FILE_MAX_BYTES", 10):
+                with self.assertRaisesRegex(ValueError, "is too large"):
+                    sandy._read_image_user_ids(machine_fd, "developer")
+
+    def test_closes_the_file_it_opened(self):
+        with self.image(self.PASSWD) as (_, machine_fd):
+            opened = []
+            real_open_image_file = sandy._open_image_file
+
+            def open_image_file(*args):
+                fd = real_open_image_file(*args)
+                opened.append(fd)
+                return fd
+
+            with patch.object(sandy, "_open_image_file", side_effect=open_image_file):
+                sandy._read_image_user_ids(machine_fd, "developer")
+            with patch.object(sandy, "_open_image_file", side_effect=open_image_file):
+                with self.assertRaises(ValueError):
+                    sandy._read_image_user_ids(machine_fd, "missing")
+        for fd in opened:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_read_account_fd_reads_a_regular_file_of_bounded_size(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "passwd"
+            path.write_bytes(b"a:x:1:\xff\n")
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                self.assertEqual(
+                    sandy._read_account_fd(fd, "/etc/passwd"), "a:x:1:\udcff\n"
+                )
+            finally:
+                os.close(fd)
+            directory = os.open(temp_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaisesRegex(ValueError, "not a regular file"):
+                    sandy._read_account_fd(directory, "/etc/passwd")
+            finally:
+                os.close(directory)
+
+
+class ScopeMarkerTests(unittest.TestCase):
+    """The mounts-pending marker, and the marker helpers that it shares.
+
+    Tests use plain directories in place of cgroupfs, as AttachCgroupTests
+    does. The E2E suite proves the real marker in a real scope.
+    """
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.unit = Path(self.tempdir.name) / "sandy-ai-dev.scope"
+        self.unit.mkdir()
+
+    def open_unit(self):
+        return os.open(self.unit, sandy.DIRECTORY_OPEN_FLAGS)
+
+    def test_the_marker_is_not_an_attach_leaf(self):
+        self.assertIsNone(
+            sandy.ATTACH_LEAF_PATTERN.fullmatch(sandy.MOUNTS_PENDING_CGROUP)
+        )
+        self.assertNotEqual(sandy.MOUNTS_PENDING_CGROUP, sandy.UP_CONSOLE_CGROUP)
+        # An attach count ignores the marker and does not remove it.
+        unit_fd = self.open_unit()
+        self.addCleanup(os.close, unit_fd)
+        (self.unit / sandy.MOUNTS_PENDING_CGROUP).mkdir()
+        self.assertEqual(sandy._count_populated_attaches(unit_fd), 0)
+        self.assertTrue((self.unit / sandy.MOUNTS_PENDING_CGROUP).is_dir())
+
+    def test_marker_lifecycle(self):
+        unit_fd = self.open_unit()
+        self.addCleanup(os.close, unit_fd)
+        marker = sandy.MOUNTS_PENDING_CGROUP
+        self.assertFalse(sandy._scope_marker_exists(unit_fd, marker))
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
+        ):
+            sandy._create_mounts_pending_marker("ai-dev")
+            # Creating it twice is not an error.
+            sandy._create_mounts_pending_marker("ai-dev")
+        self.assertTrue((self.unit / marker).is_dir())
+        self.assertTrue(sandy._scope_marker_exists(unit_fd, marker))
+        # The other marker is separate.
+        self.assertFalse(sandy._up_console_marker_exists(unit_fd))
+        sandy._remove_scope_marker(unit_fd, marker)
+        sandy._remove_scope_marker(unit_fd, marker)
+        self.assertFalse(sandy._scope_marker_exists(unit_fd, marker))
+        # A file of that name is not the marker, and a link is not followed.
+        (self.unit / marker).write_text("")
+        self.assertFalse(sandy._scope_marker_exists(unit_fd, marker))
+        (self.unit / marker).unlink()
+        (self.unit / marker).symlink_to(self.unit)
+        self.assertFalse(sandy._scope_marker_exists(unit_fd, marker))
+
+    def test_create_waits_for_the_scope_then_times_out(self):
+        opens = [FileNotFoundError(), None]
+
+        def open_unit(_name):
+            result = opens.pop(0)
+            if result is not None:
+                raise result
+            return self.open_unit()
+
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=open_unit
+        ), patch.object(sandy.time, "sleep") as sleep:
+            sandy._create_mounts_pending_marker("ai-dev")
+        sleep.assert_called_once_with(sandy.UP_CONSOLE_POLL_INTERVAL)
+        self.assertTrue((self.unit / sandy.MOUNTS_PENDING_CGROUP).is_dir())
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=FileNotFoundError
+        ), patch.object(sandy.time, "sleep"), patch.object(
+            sandy.time, "monotonic", side_effect=[0, 1, 10]
+        ):
+            with self.assertRaisesRegex(TimeoutError, "did not appear"):
+                sandy._create_mounts_pending_marker("ai-dev")
+
+    def test_an_attach_is_refused_while_the_marker_exists(self):
+        unit_fd = self.open_unit()
+        self.addCleanup(os.close, unit_fd)
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
+        ), patch.object(sandy.os, "close", wraps=os.close) as close:
+            sandy._require_no_pending_mounts("ai-dev")
+            (self.unit / sandy.MOUNTS_PENDING_CGROUP).mkdir()
+            with self.assertRaisesRegex(
+                ProcessLookupError,
+                r"^Container is still starting; try again "
+                r"\(if sandy up has ended, stop the container with sandy down\)$",
+            ):
+                sandy._require_no_pending_mounts("ai-dev")
+            (self.unit / sandy.MOUNTS_PENDING_CGROUP).rmdir()
+            sandy._require_no_pending_mounts("ai-dev")
+        # Each call closed the descriptor that it opened.
+        self.assertEqual(close.call_count, 3)
+
+    def test_the_up_console_marker_does_not_refuse_an_attach(self):
+        (self.unit / sandy.UP_CONSOLE_CGROUP).mkdir()
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
+        ):
+            sandy._require_no_pending_mounts("ai-dev")
+
+    def test_a_missing_scope_is_not_hidden(self):
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=FileNotFoundError
+        ):
+            with self.assertRaises(FileNotFoundError):
+                sandy._require_no_pending_mounts("ai-dev")
 
 
 class NetworkCoreTests(unittest.TestCase):
@@ -10732,7 +12598,27 @@ class RunUpTests(unittest.TestCase):
         self.create_marker.side_effect = lambda name: self.lock_events.append(
             f"marker {name}"
         )
-        self.start_patch(sandy.Sandy, "_ensure_cache_dir", None)
+        self.ensure_cache_dir = self.start_patch(sandy.Sandy, "_ensure_cache_dir", None)
+        # The mounts of the workspace and shared directories: the check of a
+        # host directory (it needs root and the kernel), the wait that mounts
+        # them in the container, the pending marker, and the ids of the image
+        # user. MountPlanTests, MountContainerDirsTests, and WaitForMountsTests
+        # cover them.
+        self.start_patch(sandy, "_read_mountinfo", "")
+        self.plan_mount = self.start_patch(sandy, "_plan_mount", None)
+        self.plan_mount.side_effect = lambda label, source, target: sandy.MountPlan(
+            label, source, target, 1, 2
+        )
+        self.wait_for_mounts = self.start_patch(sandy.Sandy, "_wait_for_mounts", True)
+        self.read_image_user_ids = self.start_patch(
+            sandy, "_read_image_user_ids", (1000, 1000)
+        )
+        self.pending_marker = self.start_patch(
+            sandy, "_create_mounts_pending_marker", None
+        )
+        self.pending_marker.side_effect = lambda name: self.lock_events.append(
+            f"pending {name}"
+        )
         # The stale port rule cleanup at the start of up.
         self.stale_cleanup = self.start_patch(
             sandy.Sandy, "_cleanup_port_mappings_for_container", None
@@ -11463,57 +13349,49 @@ class RunUpTests(unittest.TestCase):
             instance.workspace = str(host_workspace)
             instance.shared = str(host_shared)
 
-            with patch.object(instance, "_is_container_running", return_value=None):
-                with patch.object(
-                    instance,
-                    "_remove_port_mappings_from_state",
-                ) as remove_state:
-                    with patch.object(
-                        instance,
-                        "_get_machine_dir",
-                        return_value=str(machine),
-                    ):
-                        with patch.object(
-                            instance,
-                            "_setup_port_forwarding_rules",
-                        ) as setup_forwarding:
-                            with patch.object(instance, "_setfacl") as setfacl:
-                                with patch.object(
-                                    instance,
-                                    "_run_init_script",
-                                    return_value=True,
-                                ) as init:
-                                    with patch.object(
-                                        sandy,
-                                        "_run_secure_subprocess_popen",
-                                    ) as popen:
-                                        with patch.object(
-                                            instance,
-                                            "_cleanup_port_forwarding_rules",
-                                        ) as cleanup:
-                                            with patch.object(
-                                                sandy.platform,
-                                                "machine",
-                                                return_value="unknown-cpu",
-                                            ):
-                                                with patch.object(
-                                                    sandy.os,
-                                                    "fchown",
-                                                ) as fchown:
-                                                    with captured_output() as (
-                                                        stdout,
-                                                        _,
-                                                    ):
-                                                        instance.run_up(args)
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(instance, "_is_container_running", return_value=None)
+                )
+                remove_state = stack.enter_context(
+                    patch.object(instance, "_remove_port_mappings_from_state")
+                )
+                stack.enter_context(
+                    patch.object(
+                        instance, "_get_machine_dir", return_value=str(machine)
+                    )
+                )
+                setup_forwarding = stack.enter_context(
+                    patch.object(instance, "_setup_port_forwarding_rules")
+                )
+                init = stack.enter_context(
+                    patch.object(instance, "_run_init_script", return_value=True)
+                )
+                popen = stack.enter_context(
+                    patch.object(sandy, "_run_secure_subprocess_popen")
+                )
+                cleanup = stack.enter_context(
+                    patch.object(instance, "_cleanup_port_forwarding_rules")
+                )
+                stack.enter_context(
+                    patch.object(sandy.platform, "machine", return_value="unknown-cpu")
+                )
+                fchown = stack.enter_context(patch.object(sandy.os, "fchown"))
+                with captured_output() as (stdout, _):
+                    instance.run_up(args)
+            workspace = os.path.realpath(host_workspace)
+            shared = os.path.realpath(host_shared)
 
         setup_forwarding.assert_called_once_with("10.200.1.10")
-        self.assertEqual(setfacl.call_count, 2)
         init.assert_called_once_with(network_mode="lenient")
         # The console is an attach. _exec applies the last-attach rule, and
         # the stop removes the port forwarding rules.
         self.exec.assert_called_once_with(None, login_shell=True, console=True)
-        # The marker exists before the lock is released.
-        self.assertEqual(self.lock_events, ["enter", "marker ai-dev", "exit"])
+        # The pending marker and the console marker exist before the lock is
+        # released, in that order.
+        self.assertEqual(
+            self.lock_events, ["enter", "pending ai-dev", "marker ai-dev", "exit"]
+        )
         self.machine_poweroff.assert_not_called()
         cleanup.assert_not_called()
         # up removes this name's stale rules and state once, at its start.
@@ -11537,13 +13415,25 @@ class RunUpTests(unittest.TestCase):
             command,
         )
         self.assertIn("--private-users-ownership=auto", command)
-        self.assertIn(
-            f"--bind={host_workspace}:/home/developer/workspace",
-            command,
+        # No nspawn bind for the directories: up mounts them after the start.
+        self.assertFalse(any(item.startswith("--bind=") for item in command))
+        self.assertEqual(
+            self.plan_mount.call_args_list,
+            [
+                call("workspace", workspace, "/home/developer/workspace"),
+                call("shared", shared, "/home/developer/shared"),
+            ],
         )
-        self.assertIn(
-            f"--bind={host_shared}:/home/developer/shared",
-            command,
+        self.wait_for_mounts.assert_called_once_with(
+            (
+                sandy.MountPlan(
+                    "workspace", workspace, "/home/developer/workspace", 1, 2
+                ),
+                sandy.MountPlan("shared", shared, "/home/developer/shared", 1, 2),
+            ),
+            (1000, 1000),
+            spinner_line_event=ANY,
+            supervisor=popen.return_value,
         )
         self.assertFalse(any(item.startswith("--chdir") for item in command))
         self.assertRegex(command[1], r"^--directory=/proc/self/fd/[0-9]+$")
@@ -11695,6 +13585,240 @@ class RunUpTests(unittest.TestCase):
         self.assertFalse(any(item.startswith("--bind=") for item in command))
         self.assertIn("skipping workspace mount", stdout.getvalue())
         self.assertIn("Skipping shared mount", stdout.getvalue())
+
+    @contextmanager
+    def up_mocks(self, instance, machine):
+        """Mock the host boundaries of up; yield its popen and stop mocks."""
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(instance, "_is_container_running", return_value=None)
+            )
+            stack.enter_context(
+                patch.object(instance, "_remove_port_mappings_from_state")
+            )
+            stack.enter_context(
+                patch.object(instance, "_get_machine_dir", return_value=str(machine))
+            )
+            popen = stack.enter_context(
+                patch.object(sandy, "_run_secure_subprocess_popen")
+            )
+            stack.enter_context(
+                patch.object(instance, "_run_init_script", return_value=False)
+            )
+            stop = stack.enter_context(patch.object(instance, "_stop_failed_start"))
+            yield SimpleNamespace(popen=popen, stop=stop)
+
+    @contextmanager
+    def mount_dirs(self, instance):
+        """Make host directories and an image that has both mount targets.
+
+        Yield the machine directory and the real paths of the host directories.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            machine = root / "machine"
+            for name in ("workspace", "shared"):
+                (machine / "home" / "developer" / name).mkdir(parents=True)
+            host_workspace = root / "host-workspace"
+            host_shared = root / "host-shared"
+            host_workspace.mkdir()
+            host_shared.mkdir()
+            instance.workspace = str(host_workspace)
+            instance.shared = str(host_shared)
+            yield (
+                machine,
+                os.path.realpath(host_workspace),
+                os.path.realpath(host_shared),
+            )
+
+    def test_mounts_are_checked_before_any_host_change(self):
+        # The check of a directory comes before the first host change, the
+        # shared limits.
+        instance = make_sandy()
+        manager = MagicMock()
+        manager.attach_mock(self.plan_mount, "plan")
+        manager.attach_mock(self.set_shared_limits, "limits")
+        with self.mount_dirs(instance) as (machine, _, _):
+            with self.up_mocks(instance, machine):
+                with captured_output():
+                    instance.run_up(self.arguments())
+        self.assertEqual(
+            [entry[0] for entry in manager.mock_calls], ["plan", "plan", "limits"]
+        )
+
+    def test_a_refused_directory_stops_up_before_any_host_change(self):
+        instance = make_sandy()
+        self.plan_mount.side_effect = sandy._MountError(
+            "root owns the workspace directory"
+        )
+        with self.mount_dirs(instance) as (machine, workspace, _):
+            with self.up_mocks(instance, machine) as mocks:
+                with captured_output() as (stdout, _):
+                    with self.assertRaises(SystemExit) as exited:
+                        instance.run_up(self.arguments())
+        self.assertEqual(exited.exception.code, 1)
+        self.assertEqual(
+            stdout.getvalue(),
+            f"E: Cannot mount '{workspace}' as the workspace directory: "
+            "root owns the workspace directory\n",
+        )
+        self.set_shared_limits.assert_not_called()
+        self.stale_cleanup.assert_not_called()
+        mocks.popen.assert_not_called()
+
+    def test_detached_up_with_mounts_holds_the_lock_for_the_pending_marker(self):
+        instance = make_sandy()
+        events = []
+        self.wait_for_mounts.side_effect = (
+            lambda *a, **k: events.append("mounts") or True
+        )
+        self.wait_for_container_ready.side_effect = (
+            lambda *a, **k: events.append("ready") or True
+        )
+        with self.mount_dirs(instance) as (machine, workspace, shared):
+            with self.up_mocks(instance, machine) as mocks:
+                with captured_output() as (stdout, _):
+                    instance.run_up(self.arguments(detach=True))
+        # No console, so no up-console marker; the pending marker still needs
+        # the lock, and the cache directory holds the lock file.
+        self.assertEqual(self.lock_events, ["enter", "pending ai-dev", "exit"])
+        self.ensure_cache_dir.assert_called_once_with()
+        # The mounts come before the readiness probe, which needs them.
+        self.assertEqual(events, ["mounts", "ready"])
+        self.wait_for_mounts.assert_called_once_with(
+            (
+                sandy.MountPlan(
+                    "workspace", workspace, "/home/developer/workspace", 1, 2
+                ),
+                sandy.MountPlan("shared", shared, "/home/developer/shared", 1, 2),
+            ),
+            (1000, 1000),
+            spinner_line_event=ANY,
+            supervisor=mocks.popen.return_value,
+        )
+        self.read_image_user_ids.assert_called_once_with(ANY, "developer")
+        command = self.nspawn_command(mocks.popen.call_args.args[0])
+        self.assertFalse(any(item.startswith("--bind=") for item in command))
+        self.assertIn("--private-users=pick", command)
+        self.assertIn(
+            f"I: Mounting '{workspace}' on '/home/developer/workspace'",
+            stdout.getvalue(),
+        )
+        self.assertIn(
+            f"I: Mounting '{shared}' on '/home/developer/shared'", stdout.getvalue()
+        )
+
+    def test_detached_up_without_mounts_takes_no_lock(self):
+        instance = make_sandy()
+        instance.workspace = None
+        with tempfile.TemporaryDirectory() as machine:
+            with self.up_mocks(instance, machine):
+                with captured_output():
+                    instance.run_up(self.arguments(detach=True))
+        self.assertEqual(self.lock_events, [])
+        self.ensure_cache_dir.assert_not_called()
+        self.wait_for_mounts.assert_not_called()
+        self.read_image_user_ids.assert_not_called()
+
+    def test_no_bind_for_the_directories_on_any_systemd_version(self):
+        for version, private_users in (
+            (249, f"--private-users={sandy.CONTAINER_BASE_UID}:65536"),
+            (255, "--private-users=pick"),
+        ):
+            with self.subTest(version=version):
+                instance = make_sandy()
+                instance.systemd_version = version
+                with self.mount_dirs(instance) as (machine, _, _):
+                    with self.up_mocks(instance, machine) as mocks:
+                        with captured_output():
+                            instance.run_up(self.arguments())
+                command = self.nspawn_command(mocks.popen.call_args.args[0])
+                self.assertFalse(any(item.startswith("--bind=") for item in command))
+                self.assertIn(private_users, command)
+
+    def test_a_failed_mount_stops_the_container_and_reports_the_step(self):
+        message = (
+            "'/srv/w' on '/home/developer/workspace': "
+            "move_mount failed: Invalid argument (errno 22)"
+        )
+        for detach in (True, False):
+            with self.subTest(detach=detach):
+                instance = make_sandy()
+                self.wait_for_mounts.side_effect = sandy._MountError(message)
+                self.wait_for_container_ready.reset_mock()
+                self.exec.reset_mock()
+                with self.mount_dirs(instance) as (machine, _, _):
+                    with self.up_mocks(instance, machine) as mocks:
+                        with captured_output() as (stdout, _):
+                            with self.assertRaises(SystemExit) as exited:
+                                instance.run_up(self.arguments(detach=detach))
+                self.assertEqual(exited.exception.code, 1)
+                mocks.stop.assert_called_once_with(mocks.popen.return_value)
+                self.wait_for_container_ready.assert_not_called()
+                self.exec.assert_not_called()
+                self.assertIn(f"E: Could not mount {message}\n", stdout.getvalue())
+
+    def test_mounts_that_do_not_finish_stop_the_container(self):
+        for detach in (True, False):
+            with self.subTest(detach=detach):
+                instance = make_sandy()
+                self.wait_for_mounts.return_value = False
+                self.wait_for_container_ready.reset_mock()
+                self.exec.reset_mock()
+                with self.mount_dirs(instance) as (machine, _, _):
+                    with self.up_mocks(instance, machine) as mocks:
+                        mocks.popen.return_value.poll.return_value = None
+                        with captured_output() as (stdout, _):
+                            with self.assertRaises(SystemExit) as exited:
+                                instance.run_up(self.arguments(detach=detach))
+                self.assertEqual(exited.exception.code, 1)
+                mocks.stop.assert_called_once_with(mocks.popen.return_value)
+                self.wait_for_container_ready.assert_not_called()
+                self.exec.assert_not_called()
+                self.assertIn(
+                    "E: Container 'ai-dev' did not become ready\n", stdout.getvalue()
+                )
+
+    def test_a_pending_marker_failure_stops_the_container(self):
+        for detach in (True, False):
+            with self.subTest(detach=detach):
+                instance = make_sandy()
+                self.pending_marker.side_effect = TimeoutError(
+                    "The container scope did not appear"
+                )
+                self.create_marker.reset_mock()
+                self.wait_for_mounts.reset_mock()
+                with self.mount_dirs(instance) as (machine, _, _):
+                    with self.up_mocks(instance, machine) as mocks:
+                        with captured_output() as (stdout, _):
+                            with self.assertRaises(SystemExit):
+                                instance.run_up(self.arguments(detach=detach))
+                mocks.stop.assert_called_once_with(mocks.popen.return_value)
+                # The console marker comes after the pending marker.
+                self.create_marker.assert_not_called()
+                self.wait_for_mounts.assert_not_called()
+                self.assertIn("did not start", stdout.getvalue())
+
+    def test_unreadable_image_user_ends_up_before_the_network_and_the_start(self):
+        instance = make_sandy()
+        self.read_image_user_ids.side_effect = ValueError(
+            "Container user must have exactly one passwd entry"
+        )
+        with self.mount_dirs(instance) as (machine, _, _):
+            with self.up_mocks(instance, machine) as mocks:
+                with patch.object(sandy, "SandyNet") as network:
+                    with captured_output() as (stdout, _):
+                        with self.assertRaises(SystemExit) as exited:
+                            instance.run_up(self.arguments(network="lenient"))
+        self.assertEqual(exited.exception.code, 1)
+        self.assertIn(
+            "E: Could not read the uid and gid of 'developer' in the container "
+            "image: ",
+            stdout.getvalue(),
+        )
+        network.assert_not_called()
+        mocks.popen.assert_not_called()
+        self.assertEqual(self.lock_events, [])
 
     def test_build_and_missing_machine_are_reported(self):
         instance = make_sandy()

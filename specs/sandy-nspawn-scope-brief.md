@@ -427,6 +427,11 @@ systemd-run --scope --quiet --unit=sandy-<name>.scope --slice=system.slice \
   The entry helper refuses an attach until the payload exists
   (`security-parity.md` item 5), and the probe tries again every 0.5 s, for
   up to 60 s.
+- The workspace and shared directories are not nspawn binds. When `up` has
+  directories to mount, it mounts them in the running container as soon as the
+  payload exists, before the readiness probe (`security-parity.md` item 6).
+  Until then, the mounts-pending marker makes the entry helper refuse every
+  attach, so the probe cannot work before the mounts are done.
 - Rejected: a transient service (loses the fd; needs `-G`), `machinectl start`
   or `systemd-nspawn@.service` (fixed `--boot` in `ExecStart=`, per-run
   options would need persistent `.nspawn` files and drop-ins, no fd passing),
@@ -567,6 +572,19 @@ systemd-run --scope --quiet --unit=sandy-<name>.scope --slice=system.slice \
   scope's cgroup. So no attach can exit, and stop the container, before the
   console starts. The console's own exit removes the marker before the count,
   and a console hangup removes it without a count.
+- The mounts-pending marker is a second marker of the same kind, for the
+  workspace and shared directories. When `up` has directories to mount (with
+  or without `-d`), it holds the lifecycle lock while it starts the scope and
+  creates the marker, an empty cgroup `mounts-pending` in the scope's cgroup,
+  and then the up-console marker. The entry helper refuses every attach while
+  the marker exists ("Container is still starting; try again (if sandy up has
+  ended, stop the container with sandy down)", status 125). The check is
+  under the lifecycle lock, after the scope check and before the payload
+  check. `up` waits until the payload exists. Then, under the lifecycle lock,
+  it mounts the directories and removes the marker. A failed mount stops the
+  container. If `up` ends before it removes the marker (for example, with
+  SIGKILL), the marker stays until the container stops, and `sandy down`
+  stops it. The marker is not an attach leaf, so the attach count ignores it.
 - A new attach creates its leaf under the same lock, so a concurrent start
   and stop cannot both succeed.
 - Loss of a terminal (SIGHUP or SIGTERM) runs only the attach cleanup
@@ -726,7 +744,8 @@ Helper flow as built (steps 1 and 2):
    with `machinectl show -p Leader` that the PID is still the Leader; check
    that the Leader's cgroup is below the scope's `payload` (a Leader still in
    the scope's own cgroup means that the container is still starting);
-   require the payload (container PID 2) among the Leader's children, or
+   refuse while the mounts-pending marker exists (`security-parity.md`
+   item 6); require the payload (container PID 2) among the Leader's children, or
    fail closed because the container is still starting (`security-parity.md`
    item 5); open the `/proc/<leader>/ns/*` fds; `PTRACE_SEIZE` and
    `PTRACE_INTERRUPT` the Leader (the stub PID 1) and `waitpid(__WALL)`; read
