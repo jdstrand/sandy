@@ -7,14 +7,20 @@ processes, so unit mocks cannot prove them.
 from __future__ import annotations
 
 import errno
+import fcntl
 import os
 import re
+import shlex
 import signal
 import subprocess
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from tests.e2e.support import (
+    LIFECYCLE_LOCK,
+    PORT_STATE,
     SANDY,
     SHARED_LIMITS,
     SLICE,
@@ -35,6 +41,10 @@ GIB = 1024 * MIB
 DEFAULT_TMP_SIZE = 512 * MIB
 KEEPALIVE_COMM = "sandy-keepalive"
 WAIT_TIMEOUT = 30
+# The markers that up makes in the scope of the container that it starts.
+SCOPE_MARKERS = ("mounts-pending", "up-console")
+# The host port that an up publishes when a check under the lock refuses it.
+REFUSED_UP_PORT = 18089
 
 
 def _unit(name: str) -> str:
@@ -433,6 +443,88 @@ def _wait_stopped(context: E2EContext, name: str) -> None:
     )
 
 
+@contextmanager
+def _up_while_its_scope_appears(
+    context: E2EContext, name: str, user: str, arguments: list[str]
+) -> Iterator[tuple[int, str]]:
+    """Run up of name so that the scope of name appears while up waits for the lock.
+
+    up checks for a running container and for its scope first, makes other
+    host changes, and then waits for the lifecycle lock. Hold the lock until
+    up waits for it ("Limits of this container" is its last line before the
+    lock), make a scope of the name in sandy.slice, and release the lock.
+    Yield the exit status and the output of up, while the scope still exists;
+    then stop the scope. up waits for the lock for at most 10 seconds
+    (LIFECYCLE_LOCK_TIMEOUT of sandy); this needs about one.
+    """
+    log_path = context.root / f"lock-wait-{name}.log"
+    command = [
+        str(SANDY),
+        "--workspace",
+        context.workspace.name,
+        "--shared",
+        context.shared.name,
+        "--user",
+        user,
+        "--container",
+        name,
+        *arguments,
+    ]
+    up: subprocess.Popen[bytes] | None = None
+    blocker: subprocess.Popen[bytes] | None = None
+    try:
+        with LIFECYCLE_LOCK.open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            print(f"    $ {shlex.join(command)} &", flush=True)
+            with log_path.open("w", encoding="utf-8") as stream:
+                up = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=context.root,
+                    env=context.safe_environment(),
+                )
+            _wait_for(
+                "up waits for the lifecycle lock",
+                lambda: "I: Limits of this container"
+                in log_path.read_text(encoding="utf-8", errors="replace"),
+            )
+            blocker = subprocess.Popen(
+                [
+                    "systemd-run",
+                    "--scope",
+                    "--quiet",
+                    f"--unit={_unit(name)}",
+                    f"--slice={SLICE}",
+                    "--",
+                    "sleep",
+                    "300",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _wait_for(
+                "the blocking scope exists",
+                lambda: _show(context, name, "ActiveState") == "active",
+            )
+        # The close released the lock; up takes it now.
+        returncode = up.wait(timeout=WAIT_TIMEOUT)
+        yield returncode, log_path.read_text(encoding="utf-8", errors="replace")
+    finally:
+        if up is not None and up.poll() is None:
+            up.kill()
+            up.wait(timeout=10)
+        if blocker is not None:
+            context.run(["systemctl", "stop", _unit(name)], expected=None)
+            blocker.wait(timeout=30)
+    _wait_for(
+        "the blocking scope is gone",
+        lambda: _show(context, name, "LoadState") == "not-found",
+    )
+
+
 def test_main(context: E2EContext) -> None:
     """Prove the scope, keepalive, attach, and lifecycle design."""
     name = context.main_name
@@ -772,6 +864,27 @@ def test_main(context: E2EContext) -> None:
             lambda: _show(context, second, "LoadState") == "not-found",
         )
 
+    with context.case("an up that waited for the lock leaves a scope of its name"):
+        # Another start can make the scope of the name while up waits for the
+        # lock. up must then refuse: no marker in that scope, and no mount
+        # into it.
+        with _up_while_its_scope_appears(
+            context,
+            second,
+            "developer",
+            ["up", "--detach", "--persistent", "--network", "host"],
+        ) as (returncode, output):
+            for marker in SCOPE_MARKERS:
+                if (_unit_dir(second) / marker).exists():
+                    raise E2EFailure(
+                        f"up made {marker} in a scope that it did not start"
+                    )
+            if returncode != 1:
+                raise E2EFailure(f"up exited {returncode}: {output[-2000:]}")
+            assert_contains_text(output, f"Unit '{_unit(second)}' already exists")
+            if context.machine_running(second):
+                raise E2EFailure("up started the container anyway")
+
     with context.case("the console is an attach, and its exit stops the container"):
         console = _Console(context, second)
         _wait_for_console(context, second)
@@ -1103,6 +1216,35 @@ def test_main(context: E2EContext) -> None:
         context.remove_container(second, context.cache_user)
         if _show(context, second, "LoadState") != "not-found":
             raise E2EFailure("The scope remains after rm")
+
+    with context.case("an up that the check under the lock refuses publishes no port"):
+        # The refused up must also leave no port rule and no port state. It
+        # had published its ports before it waited for the lock, so they
+        # forwarded to the container of the other start until it stopped. The
+        # main container has a lenient network and the address in /init.sh.
+        context.stop_container(name, context.main_user)
+        _wait_stopped(context, name)
+        port = f"tcp:{REFUSED_UP_PORT}:80"
+        with _up_while_its_scope_appears(
+            context,
+            name,
+            context.main_user,
+            ["up", "--detach", "--persistent", "--network", "lenient", "--port", port],
+        ) as (returncode, output):
+            if returncode != 1:
+                raise E2EFailure(f"up exited {returncode}: {output[-2000:]}")
+            assert_contains_text(output, f"Unit '{_unit(name)}' already exists")
+            rules = context.run(["iptables", "-t", "nat", "-S", "sandy-nat-out"])
+            assert_not_contains(rules, f"--dport {REFUSED_UP_PORT}")
+            key = f"tcp:{REFUSED_UP_PORT}"
+            if PORT_STATE.exists() and key in context.port_state():
+                raise E2EFailure("The refused up left its port state")
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=context.main_user,
+        )
+        context.wait_for_machine(name, running=True)
 
     with context.case("update --shared works before the first container"):
         context.stop_container(name, context.main_user)

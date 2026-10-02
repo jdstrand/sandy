@@ -47,6 +47,8 @@ def _load_sandy_module():
 
 
 sandy = _load_sandy_module()
+# A supervisor pinned by up, for tests that mock the checks that use it.
+PINNED_SUPERVISOR = sandy.PinnedSupervisor(pidfd=-1, pid=4242)
 
 
 def make_sandy():
@@ -6839,6 +6841,7 @@ class MountContainerDirsTests(unittest.TestCase):
         manager.payload.return_value = (77, sandy.ProcessConfinement(2, 0))
         manager.read_file.return_value = self.ID_MAP
         manager.alive.return_value = True
+        manager.own_scope.return_value = True
         manager.unit.return_value = 31
 
         @contextmanager
@@ -6881,6 +6884,9 @@ class MountContainerDirsTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(sandy, "_pidfd_process_alive", manager.alive)
             )
+            stack.enter_context(
+                patch.object(sandy, "_supervisor_in_scope", manager.own_scope)
+            )
             stack.enter_context(patch.object(sandy, "_mount_one", manager.mount))
             stack.enter_context(
                 patch.object(sandy, "_open_supervisor_cgroup", manager.unit)
@@ -6891,7 +6897,9 @@ class MountContainerDirsTests(unittest.TestCase):
             yield manager
 
     def mount(self, plans=None):
-        sandy._mount_container_dirs("ai-dev", plans or self.PLANS, (1000, 1000))
+        sandy._mount_container_dirs(
+            "ai-dev", plans or self.PLANS, (1000, 1000), PINNED_SUPERVISOR
+        )
 
     def test_mounts_each_directory_then_removes_the_pending_marker(self):
         with self.mocks() as manager:
@@ -6912,6 +6920,8 @@ class MountContainerDirsTests(unittest.TestCase):
                 call.open("ns/mnt", os.O_RDONLY | os.O_CLOEXEC, dir_fd=20),
                 call.close(20),
                 call.alive(10),
+                # The scope also holds the supervisor of this up.
+                call.own_scope("ai-dev", PINNED_SUPERVISOR),
                 call.mount(self.PLANS[0], 524288, 524288, (1000, 1000), 21),
                 call.mount(self.PLANS[1], 524288, 524288, (1000, 1000), 21),
                 call.unit("ai-dev"),
@@ -7009,6 +7019,25 @@ class MountContainerDirsTests(unittest.TestCase):
                 manager.payload.assert_not_called()
                 manager.mount.assert_not_called()
 
+    def test_a_scope_without_the_supervisor_of_this_up_gets_no_mount(self):
+        # Regression test: a second up of a name whose systemd-run failed
+        # found the Leader of the first up's container by its name, mounted
+        # its own directories there, and removed the marker of that up.
+        with self.mocks() as manager:
+            manager.own_scope.return_value = False
+            with self.assertRaisesRegex(PermissionError, "that this up started"):
+                self.mount()
+        manager.mount.assert_not_called()
+        manager.remove_marker.assert_not_called()
+        self.assertEqual(manager.close.call_args_list, [call(20), call(10), call(21)])
+        manager.lock_exit.assert_called_once_with()
+        # A supervisor that has exited: the container is gone; up retries,
+        # sees the exit, and fails.
+        with self.mocks(own_scope=ProcessLookupError("exited")) as manager:
+            with self.assertRaises(ProcessLookupError):
+                self.mount()
+        manager.mount.assert_not_called()
+
     def test_an_unexpected_map_is_refused_before_any_mount(self):
         for name in ("uid_map", "gid_map"):
             with self.subTest(name=name):
@@ -7074,7 +7103,9 @@ class MountContainerDirsTests(unittest.TestCase):
     def test_validates_the_name_and_takes_the_lock_first(self):
         with self.mocks() as manager:
             with self.assertRaises(ValueError):
-                sandy._mount_container_dirs("Bad Name", self.PLANS, (1000, 1000))
+                sandy._mount_container_dirs(
+                    "Bad Name", self.PLANS, (1000, 1000), PINNED_SUPERVISOR
+                )
         manager.lock_enter.assert_not_called()
         with patch.object(
             sandy, "_lifecycle_lock", side_effect=TimeoutError("busy")
@@ -7099,6 +7130,7 @@ class WaitForMountsTests(unittest.TestCase):
         return instance._wait_for_mounts(
             self.plans,
             (1000, 1000),
+            PINNED_SUPERVISOR,
             spinner_line_event=event,
             timeout=timeout,
             supervisor=supervisor,
@@ -7111,7 +7143,9 @@ class WaitForMountsTests(unittest.TestCase):
             sandy.time, "sleep"
         ) as sleep:
             self.assertTrue(self.wait(supervisor))
-        mount.assert_called_once_with("ai-dev", self.plans, (1000, 1000))
+        mount.assert_called_once_with(
+            "ai-dev", self.plans, (1000, 1000), PINNED_SUPERVISOR
+        )
         sleep.assert_not_called()
 
     def test_retries_while_the_container_is_still_starting(self):
@@ -7741,11 +7775,94 @@ class ImageUserIdsTests(unittest.TestCase):
                 os.close(directory)
 
 
+class PinnedSupervisorTests(unittest.TestCase):
+    """The pinned supervisor of up, and the check that the scope holds it.
+
+    _pin_supervisor uses a real pidfd of this process. The scope check mocks
+    the /proc reads and the pidfd; the E2E suite proves both with a real
+    systemd-run scope.
+    """
+
+    def test_pin_supervisor_pins_a_live_process(self):
+        pinned = sandy._pin_supervisor(os.getpid())
+        try:
+            self.assertEqual(pinned.pid, os.getpid())
+            self.assertTrue(sandy._pidfd_process_alive(pinned.pidfd))
+        finally:
+            os.close(pinned.pidfd)
+        for pid in (0, -1, True, "1"):
+            with self.subTest(pid=pid):
+                with self.assertRaises(ValueError):
+                    sandy._pin_supervisor(pid)
+
+    @contextmanager
+    def proc(self, cgroup, alive=True):
+        """Mock the /proc reads of the supervisor; cgroup may be an error."""
+        with patch.object(
+            sandy, "_open_process_dir", return_value=55
+        ) as open_dir, patch.object(
+            sandy, "_read_process_cgroup", side_effect=[cgroup]
+        ) as read, patch.object(
+            sandy.os, "close"
+        ) as close, patch.object(
+            sandy, "_pidfd_process_alive", return_value=alive
+        ) as alive_check:
+            yield open_dir, read, close, alive_check
+
+    def test_the_scope_and_a_cgroup_below_it_hold_the_supervisor(self):
+        for cgroup, expected in (
+            # systemd-run joins the scope; nspawn can move below it.
+            ("/sandy.slice/sandy-ai-dev.scope", True),
+            ("/sandy.slice/sandy-ai-dev.scope/supervisor", True),
+            # A failed systemd-run stays in the cgroup of its caller.
+            ("/user.slice/user-1000.slice/session-3.scope", False),
+            ("/sandy.slice/sandy-other.scope", False),
+            ("/sandy.slice/sandy-ai-dev.scope2", False),
+            ("/system.slice/sandy-ai-dev.scope", False),
+        ):
+            with self.subTest(cgroup=cgroup):
+                with self.proc(cgroup) as (open_dir, read, close, alive):
+                    self.assertIs(
+                        sandy._supervisor_in_scope("ai-dev", PINNED_SUPERVISOR),
+                        expected,
+                    )
+                open_dir.assert_called_once_with(4242)
+                read.assert_called_once_with(55)
+                close.assert_called_once_with(55)
+                # The read refers to the supervisor only while it is alive.
+                alive.assert_called_once_with(-1)
+
+    def test_a_supervisor_that_exited_is_not_checked(self):
+        with self.proc("/sandy.slice/sandy-ai-dev.scope", alive=False):
+            with self.assertRaisesRegex(ProcessLookupError, "supervisor exited"):
+                sandy._supervisor_in_scope("ai-dev", PINNED_SUPERVISOR)
+        # A failed read of a supervisor that exited is that exit.
+        for error in (FileNotFoundError("gone"), ValueError("Malformed")):
+            with self.subTest(error=error):
+                with self.proc(error, alive=False):
+                    with self.assertRaisesRegex(
+                        ProcessLookupError, "supervisor exited"
+                    ):
+                        sandy._supervisor_in_scope("ai-dev", PINNED_SUPERVISOR)
+                # A failed read of a live supervisor is an error of its own.
+                with self.proc(error):
+                    with self.assertRaises(type(error)):
+                        sandy._supervisor_in_scope("ai-dev", PINNED_SUPERVISOR)
+
+    def test_the_name_is_validated_before_any_read(self):
+        with self.proc("/sandy.slice/sandy-ai-dev.scope") as (open_dir, _, _, _):
+            with self.assertRaises(ValueError):
+                sandy._supervisor_in_scope("Bad Name", PINNED_SUPERVISOR)
+        open_dir.assert_not_called()
+
+
 class ScopeMarkerTests(unittest.TestCase):
     """The mounts-pending marker, and the marker helpers that it shares.
 
     Tests use plain directories in place of cgroupfs, as AttachCgroupTests
-    does. The E2E suite proves the real marker in a real scope.
+    does. Mocks: the check that the scope holds the supervisor of this up,
+    and its pidfd (PinnedSupervisorTests cover them). The E2E suite proves the
+    real marker in a real scope.
     """
 
     def setUp(self):
@@ -7753,6 +7870,12 @@ class ScopeMarkerTests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         self.unit = Path(self.tempdir.name) / "sandy-ai-dev.scope"
         self.unit.mkdir()
+        in_scope = patch.object(sandy, "_supervisor_in_scope", return_value=True)
+        self.in_scope = in_scope.start()
+        self.addCleanup(in_scope.stop)
+        alive = patch.object(sandy, "_pidfd_process_alive", return_value=True)
+        self.alive = alive.start()
+        self.addCleanup(alive.stop)
 
     def open_unit(self):
         return os.open(self.unit, sandy.DIRECTORY_OPEN_FLAGS)
@@ -7777,9 +7900,9 @@ class ScopeMarkerTests(unittest.TestCase):
         with patch.object(
             sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
         ):
-            sandy._create_mounts_pending_marker("ai-dev")
+            sandy._create_mounts_pending_marker("ai-dev", PINNED_SUPERVISOR)
             # Creating it twice is not an error.
-            sandy._create_mounts_pending_marker("ai-dev")
+            sandy._create_mounts_pending_marker("ai-dev", PINNED_SUPERVISOR)
         self.assertTrue((self.unit / marker).is_dir())
         self.assertTrue(sandy._scope_marker_exists(unit_fd, marker))
         # The other marker is separate.
@@ -7806,7 +7929,7 @@ class ScopeMarkerTests(unittest.TestCase):
         with patch.object(
             sandy, "_open_supervisor_cgroup", side_effect=open_unit
         ), patch.object(sandy.time, "sleep") as sleep:
-            sandy._create_mounts_pending_marker("ai-dev")
+            sandy._create_mounts_pending_marker("ai-dev", PINNED_SUPERVISOR)
         sleep.assert_called_once_with(sandy.UP_CONSOLE_POLL_INTERVAL)
         self.assertTrue((self.unit / sandy.MOUNTS_PENDING_CGROUP).is_dir())
         with patch.object(
@@ -7815,7 +7938,68 @@ class ScopeMarkerTests(unittest.TestCase):
             sandy.time, "monotonic", side_effect=[0, 1, 10]
         ):
             with self.assertRaisesRegex(TimeoutError, "did not appear"):
-                sandy._create_mounts_pending_marker("ai-dev")
+                sandy._create_mounts_pending_marker("ai-dev", PINNED_SUPERVISOR)
+
+    def test_no_marker_in_a_scope_that_another_up_started(self):
+        # Regression test: a second up of a name that waited for the lock
+        # found the scope of the first up, made its marker there, and failed.
+        # Every attach to the first container then failed until sandy down.
+        # Its systemd-run fails and exits without joining that scope.
+        self.in_scope.side_effect = [False, ProcessLookupError("exited")]
+        before = sandy._open_fds()
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
+        ), patch.object(sandy.time, "sleep"):
+            with self.assertRaisesRegex(ProcessLookupError, "exited"):
+                sandy._create_mounts_pending_marker("ai-dev", PINNED_SUPERVISOR)
+        self.assertFalse((self.unit / sandy.MOUNTS_PENDING_CGROUP).exists())
+        self.assertEqual(sandy._open_fds(), before)
+        self.assertEqual(
+            self.in_scope.call_args_list, [call("ai-dev", PINNED_SUPERVISOR)] * 2
+        )
+
+    def test_the_marker_waits_until_the_scope_holds_the_supervisor(self):
+        # systemd makes the cgroup of the scope, then moves systemd-run in.
+        self.in_scope.side_effect = [False, False, True]
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
+        ), patch.object(sandy.time, "sleep") as sleep:
+            sandy._create_mounts_pending_marker("ai-dev", PINNED_SUPERVISOR)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertTrue((self.unit / sandy.MOUNTS_PENDING_CGROUP).is_dir())
+
+    def test_a_supervisor_that_exits_before_any_scope_exists_fails(self):
+        self.alive.return_value = False
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=FileNotFoundError
+        ), patch.object(sandy.time, "sleep") as sleep:
+            with self.assertRaisesRegex(ProcessLookupError, "supervisor exited"):
+                sandy._create_mounts_pending_marker("ai-dev", PINNED_SUPERVISOR)
+        sleep.assert_not_called()
+        self.alive.assert_called_once_with(-1)
+
+    def test_a_scope_that_never_holds_the_supervisor_times_out(self):
+        self.in_scope.return_value = False
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
+        ), patch.object(sandy.time, "sleep"), patch.object(
+            sandy.time, "monotonic", side_effect=[0, 1, 10]
+        ):
+            with self.assertRaisesRegex(TimeoutError, "did not appear"):
+                sandy._create_mounts_pending_marker("ai-dev", PINNED_SUPERVISOR)
+        self.assertFalse((self.unit / sandy.MOUNTS_PENDING_CGROUP).exists())
+
+    def test_a_marker_of_another_up_stays_where_this_up_cannot_mark(self):
+        # The first up made its marker; the second up's check fails, and it
+        # leaves that marker alone (the first up removes it after its mounts).
+        (self.unit / sandy.MOUNTS_PENDING_CGROUP).mkdir()
+        self.in_scope.side_effect = ProcessLookupError("exited")
+        with patch.object(
+            sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
+        ):
+            with self.assertRaises(ProcessLookupError):
+                sandy._create_mounts_pending_marker("ai-dev", PINNED_SUPERVISOR)
+        self.assertTrue((self.unit / sandy.MOUNTS_PENDING_CGROUP).is_dir())
 
     def test_an_attach_is_refused_while_the_marker_exists(self):
         unit_fd = self.open_unit()
@@ -12670,8 +12854,8 @@ class RunUpTests(unittest.TestCase):
 
         self.start_patch(sandy, "_lifecycle_lock", None).side_effect = lock
         self.create_marker = self.start_patch(sandy, "_create_up_console_marker", None)
-        self.create_marker.side_effect = lambda name: self.lock_events.append(
-            f"marker {name}"
+        self.create_marker.side_effect = lambda name, supervisor: (
+            self.lock_events.append(f"marker {name}")
         )
         self.ensure_cache_dir = self.start_patch(sandy.Sandy, "_ensure_cache_dir", None)
         # The mounts of the workspace and shared directories: the check of a
@@ -12691,9 +12875,21 @@ class RunUpTests(unittest.TestCase):
         self.pending_marker = self.start_patch(
             sandy, "_create_mounts_pending_marker", None
         )
-        self.pending_marker.side_effect = lambda name: self.lock_events.append(
-            f"pending {name}"
+        self.pending_marker.side_effect = lambda name, supervisor: (
+            self.lock_events.append(f"pending {name}")
         )
+        # The pidfd of the started supervisor: a real descriptor of
+        # /dev/null, which up closes when it returns. PinnedSupervisorTests
+        # cover the pin and the scope check.
+        self.pinned: list = []
+
+        def pin_supervisor(pid):
+            pinned = sandy.PinnedSupervisor(os.open(os.devnull, os.O_RDONLY), pid)
+            self.pinned.append(pinned)
+            return pinned
+
+        self.pin_supervisor = self.start_patch(sandy, "_pin_supervisor", None)
+        self.pin_supervisor.side_effect = pin_supervisor
         # The stale port rule cleanup at the start of up.
         self.stale_cleanup = self.start_patch(
             sandy.Sandy, "_cleanup_port_mappings_for_container", None
@@ -12963,7 +13159,7 @@ class RunUpTests(unittest.TestCase):
         events = self.oom_events
         args = self.arguments(pids_limit=512, tmp_size=64 * MIB, oom_score_adj=-500)
         popen, output = self.run_up_with_mocks(
-            instance, args, lambda *a, **k: events.append(("popen",))
+            instance, args, lambda *a, **k: events.append(("popen",)) or MagicMock()
         )
         scope_command = popen.call_args.args[0]
         self.assertEqual(
@@ -13052,7 +13248,7 @@ class RunUpTests(unittest.TestCase):
         ), patch.object(
             sandy,
             "_run_secure_subprocess_popen",
-            side_effect=lambda *args, **kwargs: events.append("popen"),
+            side_effect=lambda *args, **kwargs: events.append("popen") or MagicMock(),
         ), patch.object(
             instance, "_run_init_script", return_value=False
         ):
@@ -13507,6 +13703,7 @@ class RunUpTests(unittest.TestCase):
                 sandy.MountPlan("shared", shared, "/home/developer/shared", 1, 2),
             ),
             (1000, 1000),
+            self.pinned[0],
             spinner_line_event=ANY,
             supervisor=popen.return_value,
         )
@@ -13768,6 +13965,7 @@ class RunUpTests(unittest.TestCase):
                 sandy.MountPlan("shared", shared, "/home/developer/shared", 1, 2),
             ),
             (1000, 1000),
+            self.pinned[0],
             spinner_line_event=ANY,
             supervisor=mocks.popen.return_value,
         )
@@ -13782,6 +13980,183 @@ class RunUpTests(unittest.TestCase):
         self.assertIn(
             f"I: Mounting '{shared}' on '/home/developer/shared'", stdout.getvalue()
         )
+
+    def test_up_checks_the_name_again_under_the_lock(self):
+        # Regression test: an up of a name passed the first checks while
+        # another up started a container of that name, and then waited for
+        # the lock. It started its own systemd-run, which failed, and still
+        # made its marker in the other container's scope. Now it checks
+        # again under the lock and starts nothing. Mocks: machined, systemd,
+        # the start, and the lock.
+        for label, running, loaded, message in (
+            ("running", "123", False, "E: Container 'ai-dev' is already running"),
+            ("scope", None, True, "E: Unit 'sandy-ai-dev.scope' already exists"),
+        ):
+            with self.subTest(label=label):
+                self.lock_events.clear()
+                self.pin_supervisor.reset_mock()
+                self.pending_marker.reset_mock()
+                self.supervisor_unit_loaded.side_effect = lambda name: (
+                    loaded and "enter" in self.lock_events
+                )
+                instance = make_sandy()
+                with self.mount_dirs(instance) as (machine, _, _):
+                    with self.up_mocks(instance, machine) as mocks, patch.object(
+                        instance,
+                        "_is_container_running",
+                        side_effect=lambda: (
+                            running if "enter" in self.lock_events else None
+                        ),
+                    ):
+                        with captured_output() as (stdout, _):
+                            with self.assertRaises(SystemExit) as exited:
+                                instance.run_up(self.arguments(detach=True))
+                self.assertEqual(exited.exception.code, 1)
+                # up refuses on a line of its own, before "Starting".
+                self.assertTrue(
+                    stdout.getvalue().endswith("\n" + message + "\n"),
+                    stdout.getvalue(),
+                )
+                self.assertNotIn("I: Starting", stdout.getvalue())
+                self.assertEqual(self.lock_events, ["enter", "exit"])
+                mocks.popen.assert_not_called()
+                mocks.stop.assert_not_called()
+                self.pin_supervisor.assert_not_called()
+                self.pending_marker.assert_not_called()
+        self.supervisor_unit_loaded.side_effect = None
+
+    def test_a_refused_up_publishes_no_port(self):
+        # Regression test: an up that the check under the lock refused had
+        # already published its ports, to the container of the other start.
+        # The rules and the state stayed until that container stopped. Now
+        # the ports come after the check, just before the start. Mocks:
+        # machined, the start, the lock, and the port setup (the port
+        # forwarding tests cover the rules themselves).
+        events = self.lock_events
+        for label, running, expected in (
+            ("refused", "123", ["enter", "exit"]),
+            (
+                "started",
+                None,
+                ["enter", "ports 10.200.1.10", "popen", "pending ai-dev", "exit"],
+            ),
+        ):
+            with self.subTest(label=label):
+                events.clear()
+                instance = make_sandy()
+                instance.network = make_network()
+                instance.port_mappings = [("tcp", 8080, 80)]
+                with self.mount_dirs(instance) as (machine, _, _):
+                    init_script = Path(machine) / "init.sh"
+                    init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+                    init_script.chmod(0o644)
+                    with self.up_mocks(instance, machine) as mocks, patch.object(
+                        instance,
+                        "_setup_port_forwarding_rules",
+                        side_effect=lambda ip: events.append(f"ports {ip}"),
+                    ) as publish, patch.object(sandy.os, "fchown"), patch.object(
+                        instance,
+                        "_is_container_running",
+                        side_effect=lambda: (running if "enter" in events else None),
+                    ):
+                        mocks.popen.side_effect = lambda *a, **k: (
+                            events.append("popen") or MagicMock()
+                        )
+                        with captured_output():
+                            try:
+                                instance.run_up(
+                                    self.arguments(network="lenient", detach=True)
+                                )
+                            except SystemExit as exited:
+                                self.assertEqual(exited.code, 1)
+                self.assertEqual(events, expected)
+                if running:
+                    publish.assert_not_called()
+                    mocks.popen.assert_not_called()
+
+    def test_up_closes_the_pinned_supervisor(self):
+        # Regression test: no test checked that up closes the pidfd of its
+        # supervisor. Without -d, up goes on as the console, so the pidfd
+        # would stay open for the whole session. Mocks: the start and the
+        # markers (setUp). The pin opens a directory of its own, and os.close
+        # records the file that it closes: up closes other descriptors first,
+        # and the pin can reuse one of their numbers.
+        closed = []
+        real_close = os.close
+
+        def close(fd):
+            entry = os.fstat(fd)
+            closed.append((fd, (entry.st_dev, entry.st_ino)))
+            real_close(fd)
+
+        with tempfile.TemporaryDirectory() as pin_dir:
+            entry = os.stat(pin_dir)
+            pin_file = (entry.st_dev, entry.st_ino)
+
+            def pin(pid):
+                fd = os.open(pin_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                pinned = sandy.PinnedSupervisor(fd, pid)
+                self.pinned.append(pinned)
+                return pinned
+
+            self.pin_supervisor.side_effect = pin
+            for label, marker_error in (
+                ("started", None),
+                ("marker failed", OSError("no scope")),
+            ):
+                with self.subTest(label=label):
+                    self.pinned.clear()
+                    closed.clear()
+                    self.pending_marker.side_effect = marker_error
+                    instance = make_sandy()
+                    with self.mount_dirs(instance) as (machine, _, _):
+                        with self.up_mocks(instance, machine), patch.object(
+                            sandy.os, "close", side_effect=close
+                        ):
+                            with captured_output():
+                                try:
+                                    instance.run_up(self.arguments(detach=True))
+                                except SystemExit as exited:
+                                    self.assertIsNotNone(marker_error)
+                                    self.assertEqual(exited.code, 1)
+                    self.assertEqual(len(self.pinned), 1)
+                    self.assertIn((self.pinned[0].pidfd, pin_file), closed)
+
+    def test_up_shows_its_output_before_it_waits_for_the_lock(self):
+        # Regression test: "Starting", which up printed with a flush before
+        # the lock, moved after the check under the lock. With stdout in a
+        # file, the lines before the lock then stayed in the buffer while up
+        # waited, also the line that the E2E race case waits for. Mocks: the
+        # lock (setUp) and the flush of the captured stdout.
+        events = self.lock_events
+        instance = make_sandy()
+        with self.mount_dirs(instance) as (machine, _, _):
+            with self.up_mocks(instance, machine):
+                with captured_output() as (stdout, _):
+                    stdout.flush = lambda: events.append(
+                        "flush after limits"
+                        if "I: Limits of this container" in stdout.getvalue()
+                        else "flush"
+                    )
+                    instance.run_up(self.arguments(detach=True))
+        self.assertLess(
+            events.index("flush after limits"), events.index("enter"), events
+        )
+
+    def test_up_without_the_lock_does_not_check_again(self):
+        # up -d without directories takes no lock; it makes no marker and no
+        # mount that another start's scope could get.
+        instance = make_sandy()
+        instance.workspace = None
+        with tempfile.TemporaryDirectory() as machine:
+            with self.up_mocks(instance, machine), patch.object(
+                instance, "_is_container_running", return_value=None
+            ) as running:
+                with captured_output():
+                    instance.run_up(self.arguments(detach=True))
+        running.assert_called_once_with()
+        self.supervisor_unit_loaded.assert_called_once_with("ai-dev")
+        self.assertEqual(len(self.pinned), 1)
 
     def test_detached_up_without_mounts_takes_no_lock(self):
         instance = make_sandy()
@@ -14809,12 +15184,13 @@ class AttachCgroupTests(unittest.TestCase):
         unit_fd = self.open_unit()
         self.addCleanup(os.close, unit_fd)
         self.assertFalse(sandy._up_console_marker_exists(unit_fd))
+        # Mocks: the check that the scope holds the supervisor of this up.
         with patch.object(
             sandy, "_open_supervisor_cgroup", side_effect=lambda _: self.open_unit()
-        ):
-            sandy._create_up_console_marker("ai-dev")
+        ), patch.object(sandy, "_supervisor_in_scope", return_value=True):
+            sandy._create_up_console_marker("ai-dev", PINNED_SUPERVISOR)
             # Creating it twice is not an error.
-            sandy._create_up_console_marker("ai-dev")
+            sandy._create_up_console_marker("ai-dev", PINNED_SUPERVISOR)
         self.assertTrue((self.unit / "up-console").is_dir())
         self.assertTrue(sandy._up_console_marker_exists(unit_fd))
         sandy._remove_up_console_marker(unit_fd)
@@ -14833,10 +15209,15 @@ class AttachCgroupTests(unittest.TestCase):
                 raise result
             return self.open_unit()
 
+        # Mocks: the scope check and the pidfd of the supervisor.
         with patch.object(
             sandy, "_open_supervisor_cgroup", side_effect=open_unit
-        ), patch.object(sandy.time, "sleep") as sleep:
-            sandy._create_up_console_marker("ai-dev")
+        ), patch.object(sandy.time, "sleep") as sleep, patch.object(
+            sandy, "_supervisor_in_scope", return_value=True
+        ), patch.object(
+            sandy, "_pidfd_process_alive", return_value=True
+        ):
+            sandy._create_up_console_marker("ai-dev", PINNED_SUPERVISOR)
         self.assertEqual(
             sleep.call_args_list, [call(sandy.UP_CONSOLE_POLL_INTERVAL)] * 2
         )
@@ -14846,9 +15227,11 @@ class AttachCgroupTests(unittest.TestCase):
             sandy, "_open_supervisor_cgroup", side_effect=FileNotFoundError
         ), patch.object(sandy.time, "sleep"), patch.object(
             sandy.time, "monotonic", side_effect=[0, 1, 10]
+        ), patch.object(
+            sandy, "_pidfd_process_alive", return_value=True
         ):
             with self.assertRaisesRegex(TimeoutError, "did not appear"):
-                sandy._create_up_console_marker("ai-dev")
+                sandy._create_up_console_marker("ai-dev", PINNED_SUPERVISOR)
 
     def test_new_attach_leaf_is_random_and_valid(self):
         first = sandy._new_attach_leaf()
