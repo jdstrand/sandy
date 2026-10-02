@@ -55,6 +55,10 @@ PORT_MAPPINGS_LOCK_FILENAME: Final = "port_mappings.lock"
 # decisions. It is held only for short sections, never for a container start.
 LIFECYCLE_LOCK_FILENAME: Final = "lifecycle.lock"
 LIFECYCLE_LOCK_TIMEOUT: Final = 10
+# Each container name has its own up lock, "up-<name>.lock", in the same
+# directory (see _acquire_up_lock).
+UP_LOCK_FILENAME_PREFIX: Final = "up-"
+UP_LOCK_FILENAME_SUFFIX: Final = ".lock"
 LIFECYCLE_LOCK_RETRY_INTERVAL: Final = 0.05
 INIT_SCRIPT_MAX_BYTES: Final = 8192
 # The container payload (PID 2) is the image's bash, started through a symlink
@@ -2999,6 +3003,50 @@ def _lifecycle_lock(timeout: float = LIFECYCLE_LOCK_TIMEOUT) -> Iterator[None]:
                 pass
     finally:
         lock_handle.close()
+
+
+def _up_lock_filename(machine_name: str) -> str:
+    """Return the name of the up lock file of a container name."""
+    if not _validate_container_name(machine_name):
+        raise ValueError("Invalid container name")
+    return f"{UP_LOCK_FILENAME_PREFIX}{machine_name}{UP_LOCK_FILENAME_SUFFIX}"
+
+
+def _is_up_lock_filename(name: str) -> bool:
+    """Return whether name is the up lock file of a valid container name."""
+    return (
+        name.startswith(UP_LOCK_FILENAME_PREFIX)
+        and name.endswith(UP_LOCK_FILENAME_SUFFIX)
+        and _validate_container_name(
+            name[len(UP_LOCK_FILENAME_PREFIX) : -len(UP_LOCK_FILENAME_SUFFIX)]
+        )
+    )
+
+
+def _acquire_up_lock(machine_name: str) -> Optional[Any]:
+    """Take the up lock of a container name; return None when it is held.
+
+    up holds this lock from its first check until the container is ready.
+    So a second up of the name cannot check, build, or change the port
+    state of the name in between. It does not wait: it fails at once.
+    Return the open lock file; the lock lasts until it closes. The kernel
+    releases the flock when its holder exits. The cache directory must
+    already exist. The file stays, as the other lock files do: a removal
+    could put two holders on two different inodes.
+    """
+    lock_path = os.path.join(
+        SYSTEMD_MACHINES, "sandy.__cache", _up_lock_filename(machine_name)
+    )
+    lock_handle = _open_stable_lock_file(lock_path)
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_handle.close()
+        return None
+    except BaseException:
+        lock_handle.close()
+        raise
+    return lock_handle
 
 
 LEADER_PID_PATTERN: Final = re.compile(r"[1-9][0-9]{0,6}")
@@ -7627,7 +7675,7 @@ class Sandy:
                 PORT_MAPPINGS_LOCK_FILENAME,
                 LIFECYCLE_LOCK_FILENAME,
                 SHARED_LIMITS_LOCK_FILENAME,
-            ):
+            ) or _is_up_lock_filename(entry):
                 # Each lock inode is permanent. Removing one could split
                 # queued and new processes across different locks.
                 continue
@@ -8898,11 +8946,6 @@ class Sandy:
         # The host values for the resource limits, before any host change.
         facts = _read_host_facts()
 
-        error = self._existing_container_error()
-        if error:
-            print(error)
-            sys.exit(1)
-
         # Parse and validate port mappings
         if hasattr(args, "ports") and args.ports:
             if args.network == "host":
@@ -8924,8 +8967,21 @@ class Sandy:
                 self.port_mappings.append(validated)
             self.port_mappings = self._dedupe_port_mappings(self.port_mappings)
 
-        # Check the directories to mount before any host change. The check
-        # refuses a directory that root owns, and probes ID-mapped mounts.
+        # One up of a name at a time, from this check until the container is
+        # ready (see _acquire_up_lock).
+        self._ensure_cache_dir()
+        up_lock = _acquire_up_lock(self.container)
+        if up_lock is None:
+            print(f"E: Another up is starting container '{self.container}'")
+            sys.exit(1)
+        error = self._existing_container_error()
+        if error:
+            print(error)
+            sys.exit(1)
+
+        # Check the directories to mount before the other host changes. The
+        # check refuses a directory that root owns, and probes ID-mapped
+        # mounts.
         mounts = self._plan_mounts()
 
         # The first host change: the limits that all containers share. No
@@ -8935,9 +8991,11 @@ class Sandy:
 
         # A container that stopped without sandy (its payload ended, or its
         # scope was stopped) leaves its port forwarding rules and state.
-        # Remove only this name's Sandy-owned rules and state. The cleanup
-        # uses only the network that exists now; it never creates the bridge
-        # or the firewall base, which host networking must not get.
+        # Remove only this name's Sandy-owned rules and state. No container
+        # and no other up of the name owns them: the up lock and the check
+        # above make sure. The cleanup uses only the network that exists now;
+        # it never creates the bridge or the firewall base, which host
+        # networking must not get.
         self._cleanup_port_mappings_for_container(self.container)
 
         mdir = self._get_machine_dir()
@@ -9224,14 +9282,13 @@ class Sandy:
             # console starts, and no attach can start before the mounts are
             # done.
             hold_lock = not args.detach or bool(mounts)
-            if hold_lock:
-                self._ensure_cache_dir()
             # Show the lines above before up waits for the lock.
             sys.stdout.flush()
             with _lifecycle_lock() if hold_lock else nullcontext():
                 if hold_lock:
-                    # Another up of this name can have started the container
-                    # while this one made its changes and waited for the lock.
+                    # The up lock keeps out the other ups of this name, but not
+                    # a machine or a scope of the name that another program
+                    # starts while this up makes its changes and waits here.
                     error = self._existing_container_error()
                     if error:
                         print(error)
@@ -9347,6 +9404,9 @@ class Sandy:
                         if pinned is not None:
                             os.close(pinned.pidfd)
 
+        # The container is ready, so another up of the name now finds it. On
+        # an error, the lock stays until up exits, after its cleanup.
+        up_lock.close()
         if args.detach:
             return
         # The console is one more attach. When it exits, the container stops
@@ -9357,10 +9417,11 @@ class Sandy:
     def _existing_container_error(self) -> Optional[str]:
         """Return the error when the container runs or its scope exists.
 
-        up checks this before any host change, and again under the lifecycle
-        lock before it starts the container: another up of the same name can
-        start it in between. Fail closed rather than reuse or stop a unit
-        that this run did not start. None means that up can go on.
+        up checks this under its up lock, before the other host changes, and
+        again under the lifecycle lock before it starts the container: another
+        program can start a machine or a scope of the name in between. Fail
+        closed rather than reuse or stop a unit that this run did not start.
+        None means that up can go on.
         """
         if self._is_container_running():
             return f"E: Container '{self.container}' is already running"

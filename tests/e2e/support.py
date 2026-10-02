@@ -45,6 +45,9 @@ SHARED_LIMITS_LOCK = CACHE_DIR / "shared_limits.lock"
 PERSISTENT_LOCKS = (PORT_LOCK, LIFECYCLE_LOCK, SHARED_LIMITS_LOCK)
 # Nor the saved shared limits, which are configuration (rm --cache keeps them).
 PERSISTENT_FILES = (*PERSISTENT_LOCKS, SHARED_LIMITS)
+# The up lock of a container name (_acquire_up_lock of sandy). Sandy never
+# removes one either.
+UP_LOCK_PATTERN = re.compile(r"up-[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\.lock")
 # All Sandy containers run in this slice, which holds their shared limits.
 SLICE = "sandy.slice"
 SLICE_CGROUP = Path("/sys/fs/cgroup") / SLICE
@@ -1372,7 +1375,7 @@ class E2EContext:
     def purge_cache(self) -> None:
         if CACHE_DIR.exists():
             self.sandy(["rm", "--cache", "--force"])
-        for path in PERSISTENT_FILES:
+        for path in (*PERSISTENT_FILES, *self._up_locks()):
             if path.exists() or path.is_symlink():
                 if not self._persistent_lock_is_safe(path):
                     raise E2EFailure(f"Unsafe persistent file: {path}")
@@ -1393,8 +1396,17 @@ class E2EContext:
         """Return whether the cache directory holds only safe persistent locks."""
         entries = list(CACHE_DIR.iterdir())
         return bool(entries) and all(
-            entry in PERSISTENT_LOCKS and self._persistent_lock_is_safe(entry)
+            (entry in PERSISTENT_LOCKS or UP_LOCK_PATTERN.fullmatch(entry.name))
+            and self._persistent_lock_is_safe(entry)
             for entry in entries
+        )
+
+    def _up_locks(self) -> list[Path]:
+        """Return the up lock files of the cache directory."""
+        if not CACHE_DIR.exists():
+            return []
+        return sorted(
+            path for path in CACHE_DIR.iterdir() if UP_LOCK_PATTERN.fullmatch(path.name)
         )
 
     def _persistent_lock_is_safe(self, lock: Path) -> bool:

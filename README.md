@@ -416,8 +416,8 @@ Port mapping state uses a persistent `0600` coordination lock in
 `/var/lib/machines/sandy.__cache`. Once created, `rm --cache` retains that
 empty lock and its directory so concurrent Sandy processes always coordinate
 on the same inode; it contains no port mappings or cache payload. The
-`lifecycle.lock` and `shared_limits.lock` files in the same directory are
-retained in the same way. `rm --cache` also keeps `shared_limits.json`, the
+`lifecycle.lock`, `shared_limits.lock`, and `up-<name>.lock` files in the same
+directory are retained in the same way. `rm --cache` also keeps `shared_limits.json`, the
 shared limits that `update --shared` saved.
 
 
@@ -512,6 +512,11 @@ kill in that scope). The scope holds the process limit of the container, and
 limits" below). On systemd 253 or later the scope also has
 `OOMPolicy=continue`, so that an OOM kill of one process does not stop the
 container. `up` fails if a unit with the scope's name already exists.
+
+Only one `up` of a name runs at a time. From its first check until the
+container is ready, `up` holds the lock file `up-<name>.lock` in
+`/var/lib/machines/sandy.__cache`. In that time, a second `up` of the name
+fails at once, before it changes anything.
 
 The container's main process is `sandy-keepalive`: the image's `/bin/bash`
 running a copy of `sandy-keepalive.sh` as container root. It waits until the

@@ -3701,6 +3701,88 @@ def ptrace_stop_status(signal_number, event=0):
     return (event << 16) | (signal_number << 8) | 0x7F
 
 
+class UpLockTests(unittest.TestCase):
+    """The up lock of a container name: its file name and the lock.
+
+    Mocks: the open of the stable lock file, which gives a temporary file.
+    The flock calls are real.
+    """
+
+    def open_temporary_lock(self, temp_dir, opened):
+        lock_path = Path(temp_dir) / "up-ai-dev.lock"
+
+        def open_lock(path):
+            self.assertEqual(
+                path,
+                os.path.join(sandy.SYSTEMD_MACHINES, "sandy.__cache", "up-ai-dev.lock"),
+            )
+            handle = open(lock_path, "a+", encoding="utf-8")
+            opened.append(handle)
+            return handle
+
+        return open_lock
+
+    def test_up_lock_filename_needs_a_valid_container_name(self):
+        self.assertEqual(sandy._up_lock_filename("ai-dev"), "up-ai-dev.lock")
+        for name in ("", "Bad", "../x", "a/b", "ai-dev\n", "a" * 64):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    sandy._up_lock_filename(name)
+
+    def test_is_up_lock_filename(self):
+        for name, expected in (
+            ("up-ai-dev.lock", True),
+            ("up-a.lock", True),
+            ("up-" + "a" * 63 + ".lock", True),
+            ("up-.lock", False),
+            ("up-Bad.lock", False),
+            ("up-a.b.lock", False),
+            ("up-a-.lock", False),
+            ("up-" + "a" * 64 + ".lock", False),
+            ("up-ai-dev.lock.tmp", False),
+            ("xup-ai-dev.lock", False),
+            ("up-ai-dev.lock\n", False),
+            ("lifecycle.lock", False),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(sandy._is_up_lock_filename(name), expected)
+
+    def test_up_lock_is_exclusive_and_does_not_wait(self):
+        opened: list = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            open_lock = self.open_temporary_lock(temp_dir, opened)
+            with patch.object(sandy, "_open_stable_lock_file", side_effect=open_lock):
+                first = sandy._acquire_up_lock("ai-dev")
+                try:
+                    self.assertIs(first, opened[0])
+                    # A second up of the name gets None at once, and its file
+                    # closes.
+                    self.assertIsNone(sandy._acquire_up_lock("ai-dev"))
+                    self.assertTrue(opened[1].closed)
+                finally:
+                    first.close()
+                # After the close, the next up gets the lock.
+                third = sandy._acquire_up_lock("ai-dev")
+                self.assertIs(third, opened[2])
+                third.close()
+
+    def test_up_lock_closes_its_file_when_flock_fails(self):
+        lock_handle = MagicMock()
+        lock_handle.fileno.return_value = 9
+        with patch.object(
+            sandy, "_open_stable_lock_file", return_value=lock_handle
+        ), patch.object(sandy.fcntl, "flock", side_effect=OSError(errno.EBADF, "x")):
+            with self.assertRaises(OSError):
+                sandy._acquire_up_lock("ai-dev")
+        lock_handle.close.assert_called_once_with()
+
+    def test_up_lock_refuses_an_invalid_name_before_it_opens_a_file(self):
+        with patch.object(sandy, "_open_stable_lock_file") as opened:
+            with self.assertRaises(ValueError):
+                sandy._acquire_up_lock("../lifecycle")
+        opened.assert_not_called()
+
+
 class LeaderExtractionTests(unittest.TestCase):
     """Host-side extraction of the Leader's seccomp filters and CapBnd.
 
@@ -10252,6 +10334,9 @@ class CacheTests(unittest.TestCase):
             # inode is permanent.
             shared_limits = cache / sandy.SHARED_LIMITS_FILENAME
             shared_limits_lock = cache / sandy.SHARED_LIMITS_LOCK_FILENAME
+            # The up lock of each container name is permanent too.
+            up_lock = cache / "up-ai-dev.lock"
+            look_alike = cache / "up-Bad.lock"
             archive = cache / "cache.tar"
             directory = cache / "partial"
             state_alias = cache / "state-alias"
@@ -10261,6 +10346,8 @@ class CacheTests(unittest.TestCase):
             lifecycle_lock.write_text("")
             shared_limits.write_text("{}\n")
             shared_limits_lock.write_text("")
+            up_lock.write_text("")
+            look_alike.write_text("")
             archive.write_text("archive")
             directory.mkdir()
             (directory / "file").write_text("partial")
@@ -10279,6 +10366,8 @@ class CacheTests(unittest.TestCase):
             self.assertTrue(lifecycle_lock.exists())
             self.assertTrue(shared_limits.exists())
             self.assertTrue(shared_limits_lock.exists())
+            self.assertTrue(up_lock.exists())
+            self.assertFalse(look_alike.exists())
             self.assertFalse(archive.exists())
             self.assertFalse(state_alias.exists())
             self.assertFalse(directory_alias.exists())
@@ -13007,6 +13096,10 @@ class RunUpTests(unittest.TestCase):
             self.lock_events.append(f"marker {name}")
         )
         self.ensure_cache_dir = self.start_patch(sandy.Sandy, "_ensure_cache_dir", None)
+        # The up lock of the container name: a mock lock file. UpLockTests
+        # cover the lock itself.
+        self.up_lock = MagicMock()
+        self.acquire_up_lock = self.start_patch(sandy, "_acquire_up_lock", self.up_lock)
         # The mounts of the workspace and shared directories: the check of a
         # host directory (it needs root and the kernel), the wait that mounts
         # them in the container, the pending marker, and the ids of the image
@@ -14074,6 +14167,119 @@ class RunUpTests(unittest.TestCase):
                 os.path.realpath(host_shared),
             )
 
+    def test_a_second_up_of_a_starting_name_fails_at_once(self):
+        # Regression test: two ups of a name could both pass the first check.
+        # The second then removed or replaced the port state of the first,
+        # and built or started the same container.
+        instance = make_sandy()
+        self.acquire_up_lock.return_value = None
+        with patch.object(instance, "_is_container_running") as running:
+            with captured_output() as (stdout, _):
+                with self.assertRaises(SystemExit) as exited:
+                    instance.run_up(
+                        self.arguments(network="lenient", ports=["tcp:8080:80"])
+                    )
+        self.assertEqual(exited.exception.code, 1)
+        self.assertEqual(
+            stdout.getvalue(), "E: Another up is starting container 'ai-dev'\n"
+        )
+        self.acquire_up_lock.assert_called_once_with("ai-dev")
+        running.assert_not_called()
+        self.supervisor_unit_loaded.assert_not_called()
+        self.plan_mount.assert_not_called()
+        self.set_shared_limits.assert_not_called()
+        self.stale_cleanup.assert_not_called()
+        self.assertEqual(self.lock_events, [])
+
+    def test_up_checks_its_ports_before_it_takes_the_up_lock(self):
+        instance = make_sandy()
+        with captured_output() as (stdout, _):
+            with self.assertRaises(SystemExit):
+                instance.run_up(self.arguments(network="lenient", ports=["tcp:0:80"]))
+        self.assertIn("E: Invalid port specification", stdout.getvalue())
+        self.ensure_cache_dir.assert_not_called()
+        self.acquire_up_lock.assert_not_called()
+
+    def test_up_holds_the_up_lock_from_its_first_check_until_ready(self):
+        for detach in (True, False):
+            with self.subTest(detach=detach):
+                instance = make_sandy()
+                manager = MagicMock()
+                self.up_lock.reset_mock()
+                for name, mock in (
+                    ("cache_dir", self.ensure_cache_dir),
+                    ("up_lock", self.acquire_up_lock),
+                    ("lock_file", self.up_lock),
+                    ("plan", self.plan_mount),
+                    ("limits", self.set_shared_limits),
+                    ("stale", self.stale_cleanup),
+                    ("mounts", self.wait_for_mounts),
+                    ("ready", self.wait_for_container_ready),
+                    ("console", self.exec),
+                ):
+                    mock.reset_mock()
+                    manager.attach_mock(mock, name)
+                with self.mount_dirs(instance) as (machine, _, _):
+                    with self.up_mocks(instance, machine) as mocks:
+                        manager.attach_mock(mocks.popen, "start")
+                        with patch.object(
+                            instance, "_existing_container_error", return_value=None
+                        ) as check:
+                            manager.attach_mock(check, "check")
+                            with captured_output():
+                                instance.run_up(self.arguments(detach=detach))
+                order = [
+                    entry[0]
+                    for entry in manager.mock_calls
+                    if entry[0]
+                    in (
+                        "cache_dir",
+                        "up_lock",
+                        "check",
+                        "plan",
+                        "limits",
+                        "stale",
+                        "start",
+                        "mounts",
+                        "ready",
+                        "lock_file.close",
+                        "console",
+                    )
+                ]
+                # With directories to mount, up checks again under the
+                # lifecycle lock, also with -d.
+                expected = [
+                    "cache_dir",
+                    "up_lock",
+                    "check",
+                    "plan",
+                    "plan",
+                    "limits",
+                    "stale",
+                    "check",
+                    "start",
+                    "mounts",
+                    "ready",
+                    "lock_file.close",
+                ]
+                expected += [] if detach else ["console"]
+                self.assertEqual(order, expected)
+
+    def test_a_failed_start_keeps_the_up_lock_for_its_cleanup(self):
+        # The cleanup of a failed start removes the port state of the name;
+        # no other up of the name may run before it is done. The lock goes
+        # when up exits.
+        instance = make_sandy()
+        instance.workspace = None
+        self.wait_for_container_ready.return_value = False
+        with tempfile.TemporaryDirectory() as machine:
+            with self.up_mocks(instance, machine) as mocks:
+                with captured_output():
+                    with self.assertRaises(SystemExit):
+                        instance.run_up(self.arguments())
+        mocks.stop.assert_called_once_with(mocks.popen.return_value)
+        self.up_lock.close.assert_not_called()
+
     def test_mounts_are_checked_before_any_host_change(self):
         # The check of a directory comes before the first host change, the
         # shared limits.
@@ -14329,7 +14535,9 @@ class RunUpTests(unittest.TestCase):
         self.supervisor_unit_loaded.assert_called_once_with("ai-dev")
         self.assertEqual(len(self.pinned), 1)
 
-    def test_detached_up_without_mounts_takes_no_lock(self):
+    def test_detached_up_without_mounts_takes_only_the_up_lock(self):
+        # Regression test: up -d without directories took no lock, so a
+        # second up of the name could replace and then remove its port state.
         instance = make_sandy()
         instance.workspace = None
         with tempfile.TemporaryDirectory() as machine:
@@ -14337,7 +14545,9 @@ class RunUpTests(unittest.TestCase):
                 with captured_output():
                     instance.run_up(self.arguments(detach=True))
         self.assertEqual(self.lock_events, [])
-        self.ensure_cache_dir.assert_not_called()
+        self.ensure_cache_dir.assert_called_once_with()
+        self.acquire_up_lock.assert_called_once_with("ai-dev")
+        self.up_lock.close.assert_called_once_with()
         self.wait_for_mounts.assert_not_called()
         self.read_image_user_ids.assert_not_called()
 

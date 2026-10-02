@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import fcntl
+
 from tests.e2e.support import (
+    CACHE_DIR,
     E2EContext,
     E2EFailure,
     HOST_SECRET_NAME,
@@ -147,6 +150,27 @@ def test_main(context: E2EContext) -> None:
             expected=1,
         )
         assert_contains(duplicate, "is already running")
+
+    with context.case("an up of a name that another up starts fails at once"):
+        # up holds the up lock of the name from its first check until the
+        # container is ready. Hold the lock here, as such an up does.
+        up_lock = CACHE_DIR / f"up-{context.main_name}.lock"
+        if not context._persistent_lock_is_safe(up_lock):
+            raise E2EFailure(f"The up lock is missing or unsafe: {up_lock}")
+        with up_lock.open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            refused = context.sandy(
+                ["up", "--detach", "--persistent", "--network", "lenient"],
+                name=context.main_name,
+                user=context.main_user,
+                expected=1,
+            )
+        assert_contains(
+            refused, f"E: Another up is starting container '{context.main_name}'"
+        )
+        # The refusal comes before the first check of up.
+        assert_not_contains(refused, "is already running")
+        context.wait_for_machine(context.main_name, running=True)
 
     with context.case("stopped persistent machine restarts without rebuilding"):
         _exec(context, "touch", "/home/developer/persistent-marker")

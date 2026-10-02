@@ -590,6 +590,8 @@ class SharedLimitStateTests(unittest.TestCase):
             )
             for path in files:
                 path.write_text("", encoding="ascii")
+            # The up lock of each container name stays after rm --cache too.
+            (cache / "up-e2e-main-abc123.lock").write_text("", encoding="ascii")
             context = SliceProbeContext(Path(parent))
             with patch.object(support, "CACHE_DIR", cache), patch.object(
                 support, "PERSISTENT_FILES", files
@@ -606,6 +608,43 @@ class SharedLimitStateTests(unittest.TestCase):
                     with self.assertRaisesRegex(E2EFailure, "Unsafe persistent file"):
                         E2EContext.purge_cache(context)
                 self.assertTrue(files[3].exists())
+
+
+class CacheLockTests(unittest.TestCase):
+    """Which files of the cache directory are the persistent locks.
+
+    Mocks: the cache directory, a temporary one, and the metadata check of a
+    lock file.
+    """
+
+    def test_up_locks_count_as_persistent_locks(self):
+        with tempfile.TemporaryDirectory() as parent:
+            cache = Path(parent) / "sandy.__cache"
+            cache.mkdir()
+            locks = (
+                cache / "lifecycle.lock",
+                cache / "up-e2e-main-abc123.lock",
+                cache / "up-a.lock",
+            )
+            for path in locks:
+                path.write_text("", encoding="ascii")
+            context = SliceProbeContext(Path(parent))
+            with patch.object(support, "CACHE_DIR", cache), patch.object(
+                support, "PERSISTENT_LOCKS", locks[:1]
+            ), patch.object(context, "_persistent_lock_is_safe", return_value=True):
+                self.assertEqual(context._up_locks(), sorted(locks[1:]))
+                self.assertTrue(context._cache_holds_only_safe_locks())
+                for name in ("up-Bad.lock", "up-a-.lock", "up-a.lock.tmp", "x.tar"):
+                    with self.subTest(name=name):
+                        other = cache / name
+                        other.write_text("", encoding="ascii")
+                        try:
+                            self.assertNotIn(other, context._up_locks())
+                            self.assertFalse(context._cache_holds_only_safe_locks())
+                        finally:
+                            other.unlink()
+            with patch.object(support, "CACHE_DIR", cache / "missing"):
+                self.assertEqual(context._up_locks(), [])
 
 
 class FilesystemMountTrackingTests(unittest.TestCase):
