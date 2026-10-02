@@ -106,7 +106,7 @@ def _host_file(
 ) -> Path:
     """Create a file of the host user on the host."""
     path.write_text(text, encoding="utf-8")
-    os.chown(path, context.host_uid, context.host_uid)
+    os.chown(path, context.host_uid, context.host_gid)
     path.chmod(mode)
     return path
 
@@ -208,9 +208,9 @@ def _check_owner_mapping(
     ids: tuple[int, int],
     created: list[Path],
 ) -> None:
-    """The host owner is the container user; the container user is the host owner."""
+    """The host owner and group are the container user's ids, and back again."""
     inside = f"/home/{context.main_user}/{label}"
-    host = (context.host_uid, context.host_uid)
+    host = (context.host_uid, context.host_gid)
     seed = directory / f"{FILE_PREFIX}{label}-seed.txt"
     seed_dir = directory / f"{FILE_PREFIX}{label}-seed-dir"
     renamed = directory / f"{FILE_PREFIX}{label}-renamed.txt"
@@ -288,7 +288,7 @@ def test_main(context: E2EContext) -> None:
     if context.machine_leader(main) is None:
         raise E2EFailure("The lifecycle tests must leave the main machine running")
     directories = (("workspace", context.workspace), ("shared", context.shared))
-    host = (context.host_uid, context.host_uid)
+    host = (context.host_uid, context.host_gid)
     # Everything that the cases create in the host directories. The files are
     # removed at the end, so that later modules find the directories as before.
     created: list[Path] = []
@@ -512,7 +512,7 @@ def test_main(context: E2EContext) -> None:
             ramfs.mkdir(mode=0o755)
             context.mount_scratch_filesystem("ramfs", ramfs)
             try:
-                os.chown(ramfs, context.host_uid, context.host_uid)
+                os.chown(ramfs, context.host_uid, context.host_gid)
                 temporary_before = set(up_temporary_directories())
                 refused = context.sandy(
                     ["up", "--detach", "--network", "host"],

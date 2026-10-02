@@ -23,6 +23,7 @@ from tests.e2e import support
 from tests.e2e import runner, test_mounts
 from tests.e2e.support import (
     BASE_IMAGE_VARIABLE,
+    DEFAULT_HOST_GID,
     DEFAULT_HOST_UID,
     DEFAULT_TIMEOUT,
     HOST_UID_MAX,
@@ -35,7 +36,7 @@ from tests.e2e.support import (
     E2EFailure,
     FilesystemFixtureIdentity,
     parse_base_image,
-    parse_host_uid,
+    parse_host_ids,
 )
 from tests.e2e.test_confinement import (
     ENTRY_FAILURE,
@@ -1262,16 +1263,23 @@ class SandyInvocationTests(unittest.TestCase):
 
 
 class EnvironmentSettingTests(unittest.TestCase):
-    """SANDY_E2E_HOST_UID and SANDY_E2E_BASE_IMAGE: strict parsing, nothing else."""
+    """The host ids and the base image settings: strict parsing, nothing else."""
 
-    def test_host_uid_defaults_to_1000(self):
-        self.assertEqual(parse_host_uid(None), 1000)
-        self.assertEqual(DEFAULT_HOST_UID, 1000)
+    def test_host_ids_default_to_ids_that_no_container_user_has(self):
+        # Regression test: the owner, the group, and the container user of the
+        # default image all had id 1000, so the mount cases passed for a map
+        # that swapped the uid and the gid or kept a host id. The container
+        # user is 1000:1000 in the default image and 1001:1001 in Ubuntu 26.04.
+        self.assertEqual(parse_host_ids(None), (DEFAULT_HOST_UID, DEFAULT_HOST_GID))
+        self.assertEqual((DEFAULT_HOST_UID, DEFAULT_HOST_GID), (1234, 2345))
+        self.assertNotEqual(DEFAULT_HOST_UID, DEFAULT_HOST_GID)
+        for container_id in (1000, 1001):
+            self.assertNotIn(container_id, (DEFAULT_HOST_UID, DEFAULT_HOST_GID))
 
-    def test_host_uid_accepts_numbers_up_to_the_maximum(self):
+    def test_a_host_uid_value_is_the_uid_and_the_gid(self):
         for value in ("1", "999", "1000", "1234", "60000"):
             with self.subTest(value=value):
-                self.assertEqual(parse_host_uid(value), int(value))
+                self.assertEqual(parse_host_ids(value), (int(value), int(value)))
         self.assertEqual(HOST_UID_MAX, 60000)
 
     def test_host_uid_rejects_everything_else(self):
@@ -1294,7 +1302,7 @@ class EnvironmentSettingTests(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(E2EFailure, HOST_UID_VARIABLE):
-                    parse_host_uid(value)
+                    parse_host_ids(value)
 
     def test_base_image_is_none_when_unset(self):
         self.assertIsNone(parse_base_image(None))
@@ -1335,17 +1343,17 @@ class EnvironmentSettingTests(unittest.TestCase):
         # Mocks: os.chown (the test is not root). The run root is real.
         with patch.dict(
             os.environ,
-            {HOST_UID_VARIABLE: "1234", BASE_IMAGE_VARIABLE: "ubuntu:26.04"},
+            {HOST_UID_VARIABLE: "1000", BASE_IMAGE_VARIABLE: "ubuntu:26.04"},
         ), patch.object(support.os, "chown") as chown:
             context = E2EContext()
         try:
-            self.assertEqual(context.host_uid, 1234)
+            self.assertEqual((context.host_uid, context.host_gid), (1000, 1000))
             self.assertEqual(context.base_image, "ubuntu:26.04")
             self.assertEqual(
                 chown.call_args_list,
                 [
-                    call(context.workspace, 1234, 1234),
-                    call(context.shared, 1234, 1234),
+                    call(context.workspace, 1000, 1000),
+                    call(context.shared, 1000, 1000),
                 ],
             )
             self.assertEqual(
@@ -1365,9 +1373,12 @@ class EnvironmentSettingTests(unittest.TestCase):
         ) as chown:
             context = E2EContext()
         try:
-            self.assertEqual(context.host_uid, 1000)
+            self.assertEqual((context.host_uid, context.host_gid), (1234, 2345))
             self.assertIsNone(context.base_image)
-            self.assertEqual(chown.call_args_list[0].args[1:], (1000, 1000))
+            self.assertEqual(
+                [entry.args[1:] for entry in chown.call_args_list],
+                [(1234, 2345), (1234, 2345)],
+            )
             self.assertNotIn("SANDY_BOOTSTRAP_BASE", context.safe_environment())
         finally:
             support.shutil.rmtree(context.root)
@@ -1818,6 +1829,7 @@ class HostUserTests(unittest.TestCase):
     def make_context(self):
         context = E2EContext.__new__(E2EContext)
         context.host_uid = 1234
+        context.host_gid = 2345
         return context
 
     def test_host_user_command_drops_to_the_numeric_ids_without_groups(self):
@@ -1826,7 +1838,7 @@ class HostUserTests(unittest.TestCase):
             (
                 "setpriv",
                 "--reuid=1234",
-                "--regid=1234",
+                "--regid=2345",
                 "--clear-groups",
                 "--",
                 "tee",
@@ -1852,7 +1864,7 @@ class HostUserTests(unittest.TestCase):
                 (
                     "setpriv",
                     "--reuid=1234",
-                    "--regid=1234",
+                    "--regid=2345",
                     "--clear-groups",
                     "--",
                     "rm",
@@ -1890,6 +1902,7 @@ class RunnerTests(unittest.TestCase):
         for variable, value in (
             (HOST_UID_VARIABLE, "0"),
             (HOST_UID_VARIABLE, "root"),
+            (HOST_UID_VARIABLE, "60001"),
             (BASE_IMAGE_VARIABLE, "ubuntu"),
             (BASE_IMAGE_VARIABLE, "ubuntu:26.04;id"),
         ):
@@ -1900,7 +1913,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_the_guard_accepts_valid_settings(self):
         with self.runner_environment(
-            **{HOST_UID_VARIABLE: "1234", BASE_IMAGE_VARIABLE: "ubuntu:26.04"}
+            **{HOST_UID_VARIABLE: "1000", BASE_IMAGE_VARIABLE: "ubuntu:26.04"}
         ):
             self.assertFalse(runner._guard())
         with self.runner_environment():
@@ -2006,7 +2019,7 @@ class MountCaseHelperTests(unittest.TestCase):
             self.assertTrue((keep / "kept").exists())
 
     def test_host_file_belongs_to_the_host_user(self):
-        context = fake_context(host_uid=1234)
+        context = fake_context(host_uid=1234, host_gid=2345)
         with tempfile.TemporaryDirectory() as parent:
             path = Path(parent) / "file"
             with patch.object(test_mounts.os, "chown") as chown:
@@ -2014,7 +2027,7 @@ class MountCaseHelperTests(unittest.TestCase):
             self.assertEqual(result, path)
             self.assertEqual(path.read_text(encoding="utf-8"), "text\n")
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-            chown.assert_called_once_with(path, 1234, 1234)
+            chown.assert_called_once_with(path, 1234, 2345)
 
     def test_exec_fails_accepts_only_a_failing_command(self):
         def result(code):

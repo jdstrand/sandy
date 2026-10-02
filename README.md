@@ -818,8 +818,12 @@ tests reuse the cache created by the cache tests.
 Two optional environment variables choose the host user and the image:
 
 - `SANDY_E2E_HOST_UID` is the uid and gid that own the E2E workspace and shared
-  directories (default 1000; a number from 1 to 60000). It can differ from the
-  uid of the container user, which the image decides.
+  directories, and the ids of the host user (a number from 1 to 60000). Without
+  it, the owner is 1234 and the group is 2345. These differ from each other and
+  from the ids of the container user, which the image decides. So the mount
+  cases fail for a map that swaps the uid and the gid, or that keeps a host id.
+  With the default image, set it to 1000 to test a host user that has the ids
+  of the container user.
 - `SANDY_E2E_BASE_IMAGE` is a base image, for example `ubuntu:26.04`. The
   runner passes it to Sandy as `SANDY_BOOTSTRAP_BASE`. Without it, the suite
   uses Sandy's default base image. In the Ubuntu 26.04 image, uid 1000 is
@@ -828,7 +832,7 @@ Two optional environment variables choose the host user and the image:
 The runner rejects a malformed value before it creates anything. For example:
 
 ```bash
-sudo env SANDY_E2E=1 SANDY_E2E_HOST_UID=1234 SANDY_E2E_BASE_IMAGE=ubuntu:26.04 make e2e
+sudo env SANDY_E2E=1 SANDY_E2E_HOST_UID=1000 SANDY_E2E_BASE_IMAGE=ubuntu:26.04 make e2e
 ```
 
 To run the fast suite and then smoke-test one uncached build with Sandy's

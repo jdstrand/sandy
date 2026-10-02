@@ -28,7 +28,7 @@ from tests.e2e.support import (
     E2EContext,
     E2EFailure,
     parse_base_image,
-    parse_host_uid,
+    parse_host_ids,
 )
 
 TEST_MODULES = (
@@ -54,8 +54,8 @@ def _guard() -> bool:
     arguments = sys.argv[1:]
     if arguments not in ([], ["--full"]):
         raise E2EFailure("The ordered E2E runner accepts only the optional --full flag")
-    # Reject a malformed host uid or base image before anything is created.
-    parse_host_uid(os.environ.get(HOST_UID_VARIABLE))
+    # Reject a malformed host id or base image before anything is created.
+    parse_host_ids(os.environ.get(HOST_UID_VARIABLE))
     parse_base_image(os.environ.get(BASE_IMAGE_VARIABLE))
     return arguments == ["--full"]
 

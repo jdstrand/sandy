@@ -55,14 +55,18 @@ DEFAULT_TIMEOUT = 120
 BUILD_TIMEOUT = 1800
 FULL_BUILD_TIMEOUT = 7200
 OUTPUT_TAIL_LENGTH = 12000
-# The workspace and shared directories belong to a host user whose uid is not
-# the uid of the container user: Sandy maps the owner of each directory to the
-# image user (see README.md, "Workspace and shared directories"). The uid and
-# the gid are both SANDY_E2E_HOST_UID; the default is 1000, the uid of the
-# first user of many hosts. On the Ubuntu 26.04 image uid 1000 is `ubuntu`, and
-# the container user is 1001.
+# The workspace and shared directories belong to a host user whose ids are not
+# the ids of the container user: Sandy maps the owner and the group of each
+# directory to the image user (see README.md, "Workspace and shared
+# directories"). These ids are the owner and the group, and the ids of the host
+# user. Without SANDY_E2E_HOST_UID, they differ from each other and from the
+# container user of the default image (1000:1000) and of the Ubuntu 26.04
+# image (1001:1001; uid 1000 is `ubuntu`). So a map that swaps the uid and the
+# gid, or that keeps a host id, fails the mount cases. SANDY_E2E_HOST_UID sets
+# the uid and the gid to one value.
 HOST_UID_VARIABLE = "SANDY_E2E_HOST_UID"
-DEFAULT_HOST_UID = 1000
+DEFAULT_HOST_UID = 1234
+DEFAULT_HOST_GID = 2345
 HOST_UID_MAX = 60000
 HOST_UID_PATTERN = re.compile(r"[1-9][0-9]{0,4}")
 # SANDY_E2E_BASE_IMAGE selects the base image of every build (Sandy reads it as
@@ -192,20 +196,21 @@ def parse_mountinfo(text: str) -> list[tuple[str, frozenset[str]]]:
     return mounts
 
 
-def parse_host_uid(value: str | None) -> int:
-    """Return the uid and gid of the host user from SANDY_E2E_HOST_UID.
+def parse_host_ids(value: str | None) -> tuple[int, int]:
+    """Return the uid and the gid of the host user from SANDY_E2E_HOST_UID.
 
-    Only decimal digits without a leading zero are valid, from 1 to
-    HOST_UID_MAX. Unset gives the default.
+    A value is the uid and the gid. Only decimal digits without a leading zero
+    are valid, from 1 to HOST_UID_MAX. Unset gives DEFAULT_HOST_UID and
+    DEFAULT_HOST_GID.
     """
     if value is None:
-        return DEFAULT_HOST_UID
+        return DEFAULT_HOST_UID, DEFAULT_HOST_GID
     if not HOST_UID_PATTERN.fullmatch(value) or int(value) > HOST_UID_MAX:
         raise E2EFailure(
             f"Invalid {HOST_UID_VARIABLE} {value!r}: use a number from 1 to "
             f"{HOST_UID_MAX}"
         )
-    return int(value)
+    return int(value), int(value)
 
 
 def parse_base_image(value: str | None) -> str | None:
@@ -241,7 +246,7 @@ class E2EContext:
         self.full_user = "developer"
         self._validate_names()
         # Validate the environment before anything is created.
-        self.host_uid = parse_host_uid(os.environ.get(HOST_UID_VARIABLE))
+        self.host_uid, self.host_gid = parse_host_ids(os.environ.get(HOST_UID_VARIABLE))
         self.base_image = parse_base_image(os.environ.get(BASE_IMAGE_VARIABLE))
 
         self.root = Path(tempfile.mkdtemp(prefix="sandy-e2e-", dir="/tmp"))
@@ -251,7 +256,7 @@ class E2EContext:
         self.workspace.mkdir(mode=0o755)
         self.shared.mkdir(mode=0o755)
         for mount_path in (self.workspace, self.shared):
-            os.chown(mount_path, self.host_uid, self.host_uid)
+            os.chown(mount_path, self.host_uid, self.host_gid)
 
         self.filesystem_image_root = Path("/var/lib") / f"sandy-e2e-image-{suffix}"
         self.filesystem_host_target = Path("/var/lib") / f"sandy-e2e-host-{suffix}"
@@ -1123,11 +1128,11 @@ class E2EContext:
         self._scratch_mounts.remove(path)
 
     def host_user_command(self, command: Sequence[str]) -> tuple[str, ...]:
-        """Return command wrapped to run as the host user: host_uid, no groups."""
+        """Return command wrapped to run as the host user: its ids, no groups."""
         return (
             "setpriv",
             f"--reuid={self.host_uid}",
-            f"--regid={self.host_uid}",
+            f"--regid={self.host_gid}",
             "--clear-groups",
             "--",
             *_validate_command(command),
