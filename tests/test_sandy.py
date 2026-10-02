@@ -17,7 +17,13 @@ import tempfile
 import threading
 import unittest
 from collections.abc import Iterator, Mapping
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import (
+    ExitStack,
+    closing,
+    contextmanager,
+    redirect_stderr,
+    redirect_stdout,
+)
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, call, mock_open, patch
@@ -4035,6 +4041,31 @@ class LeaderExtractionTests(unittest.TestCase):
         # The search stops at the payload; it reads no later child.
         self.assertEqual(opened.call_args_list, [call(90), call(77)])
 
+    def test_find_payload_finds_the_payload_before_many_orphans(self):
+        # Regression test: with more than 131072 adopted orphans, the Leader's
+        # list passed the 1 MiB limit, and every attach failed. The payload is
+        # the Leader's first child; the search reads no more of the list.
+        orphans = b"".join(b"%d " % pid for pid in range(1000000, 1150000))
+        self.assertGreater(len(orphans), 1048576)
+        statuses = {77: self.payload_status()}
+        with self.fake_proc(b"77 " + orphans, statuses) as (leader_fd, opened):
+            before = sandy._open_fds()
+            with patch.object(sandy.os, "read", wraps=os.read) as read:
+                self.assertEqual(
+                    sandy._find_payload(leader_fd, 42),
+                    (77, sandy.ProcessConfinement(2, 0xFDECBFFF)),
+                )
+            self.assertEqual(sandy._open_fds(), before)
+        self.assertEqual(opened.call_args_list, [call(77)])
+        # The whole list takes about 290 chunks; the search reads the first
+        # one, and the payload's status.
+        chunk_reads = [
+            entry
+            for entry in read.call_args_list
+            if entry.args[1] == sandy.PROC_READ_CHUNK_BYTES
+        ]
+        self.assertLess(len(chunk_reads), 10)
+
     def test_find_payload_reads_no_child_after_the_payload(self):
         # Container root can give an adopted orphan a status that is too
         # large to read (many supplementary groups). The orphan comes after
@@ -5157,23 +5188,67 @@ class EntryHelperTests(unittest.TestCase):
             finally:
                 os.close(proc_fd)
 
-    def test_read_child_pids_reads_past_one_chunk_and_bounds_the_size(self):
-        # More than one read: the kernel returns at most a page per read.
-        many = b"".join(b"%d " % pid for pid in range(1000000, 1001000))
-        self.assertGreater(len(many), sandy.PROC_READ_CHUNK_BYTES)
+    def test_read_child_pids_reads_any_size_one_chunk_at_a_time(self):
+        # Regression test: the list had a 1 MiB limit, and the Leader's list
+        # holds every orphan of its container. Entries of 1 to 7 digits, so
+        # that chunk ends split entries; more than 1 MiB in all.
+        pids = range(1, 200000)
+        many = b"".join(b"%d " % pid for pid in pids)
+        self.assertGreater(len(many), 1048576)
+        self.assertNotEqual(len(many) % sandy.PROC_READ_CHUNK_BYTES, 0)
         with tempfile.TemporaryDirectory() as temp_dir:
             proc_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
             try:
                 self.write_children(temp_dir, 55, many)
-                self.assertEqual(
-                    sandy._read_child_pids(proc_fd, 55),
-                    tuple(range(1000000, 1001000)),
-                )
-                with patch.object(sandy, "CHILD_PIDS_MAX_BYTES", len(many) - 1):
-                    with self.assertRaises(ValueError):
-                        sandy._read_child_pids(proc_fd, 55)
-                with patch.object(sandy, "CHILD_PIDS_MAX_BYTES", len(many)):
-                    self.assertEqual(len(sandy._read_child_pids(proc_fd, 55)), 1000)
+                before = sandy._open_fds()
+                self.assertEqual(sandy._read_child_pids(proc_fd, 55), tuple(pids))
+                self.assertEqual(sandy._open_fds(), before)
+            finally:
+                os.close(proc_fd)
+
+    def test_iter_child_pids_accepts_seven_digits_that_end_a_chunk(self):
+        # Regression test: no test had an entry whose 7 digits end one chunk
+        # while its space starts the next. A bound of 6 digits, or ">=" in
+        # place of ">", then rejected a valid PID, and the attach failed.
+        pids = (1, *range(1000000, 1000510), 100000, 1234567)
+        data = b"".join(b"%d " % pid for pid in pids)
+        chunk = sandy.PROC_READ_CHUNK_BYTES
+        self.assertEqual(data[chunk - 7 : chunk + 1], b"1234567 ")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                self.write_children(temp_dir, 55, data)
+                self.assertEqual(sandy._read_child_pids(proc_fd, 55), pids)
+            finally:
+                os.close(proc_fd)
+
+    def test_iter_child_pids_bounds_an_entry_and_checks_each_chunk(self):
+        chunk = sandy.PROC_READ_CHUNK_BYTES
+        cases = (
+            # More digits than a PID has, with no space: the memory stays small.
+            b"12345678",
+            b"1" * (chunk + 1),
+            # A bad entry in a later chunk, and a last entry without its space.
+            b"88 " * chunk + b"x ",
+            b"88 " * chunk + b"89",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proc_fd = os.open(temp_dir, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                for data in cases:
+                    with self.subTest(size=len(data), end=data[-2:]):
+                        self.write_children(temp_dir, 55, data)
+                        before = sandy._open_fds()
+                        with self.assertRaisesRegex(ValueError, "children list"):
+                            sandy._read_child_pids(proc_fd, 55)
+                        self.assertEqual(sandy._open_fds(), before)
+                # An early stop closes the file.
+                self.write_children(temp_dir, 55, b"88 " * chunk)
+                before = sandy._open_fds()
+                with closing(sandy._iter_child_pids(proc_fd, 55)) as children:
+                    self.assertEqual(next(children), 88)
+                    self.assertNotEqual(sandy._open_fds(), before)
+                self.assertEqual(sandy._open_fds(), before)
             finally:
                 os.close(proc_fd)
 

@@ -61,6 +61,11 @@ KEEPALIVE_HOLD_SECONDS = 3
 KEEPALIVE_DIR_GLOB = "sandy-keepalive-*"
 # aarch64 has 7 of the 10 denied syscalls, and 5.15 hides bpf.
 MIN_OBSERVABLE_DENIED = 6
+# Orphans that a session leaves to the Leader. Their entries in the Leader's
+# child list take more than one read chunk of the payload search.
+ADOPTED_ORPHANS = 1000
+ORPHAN_COMMAND = b"sleep\x003333\x00"
+ORPHANS_GONE_TIMEOUT = 30
 # Denied by Docker's default profile and by nspawn's filter; the nsenter path
 # reached the kernel with each of them (specs/security-parity.md item 1).
 DENIED_SYSCALLS = (
@@ -1032,6 +1037,53 @@ def test_main(context: E2EContext) -> None:
             timeout=START_TIMEOUT,
         )
         _exec_when_mounted(context, "true")
+
+    with context.case("an attach finds the payload among many adopted orphans"):
+        # The Leader adopts the orphans of its container while the session
+        # that made them runs. With 1000 orphans the Leader's child list takes
+        # more than one read chunk; the payload stays its first entry, because
+        # the kernel adds an adopted orphan at the end, and an attach works.
+        # A test VM cannot hold enough processes for a list above the old
+        # 1 MiB limit; the unit tests of the payload search cover that size.
+        leader_now = int(context.machine_leader(context.main_name) or 0)
+        if not leader_now:
+            raise E2EFailure("The main container is not running")
+        session = _Session(
+            context,
+            f"for i in $(seq {ADOPTED_ORPHANS}); do "
+            "(sleep 3333 </dev/null >/dev/null 2>&1 &); done; sleep 300",
+        )
+        try:
+            deadline = time.monotonic() + START_TIMEOUT
+            while True:
+                children = _children(leader_now)
+                orphans = [
+                    child for child in children if _cmdline(child) == ORPHAN_COMMAND
+                ]
+                if len(orphans) >= ADOPTED_ORPHANS:
+                    break
+                if session.process.poll() is not None:
+                    raise E2EFailure("The session ended before its orphans existed")
+                if time.monotonic() > deadline:
+                    raise E2EFailure(f"Only {len(orphans)} orphans reached the Leader")
+                time.sleep(0.1)
+            listing = Path(f"/proc/{leader_now}/task/{leader_now}/children")
+            size = len(listing.read_bytes())
+            if size <= sandy.PROC_READ_CHUNK_BYTES:
+                raise E2EFailure(f"The Leader's child list has only {size} bytes")
+            if not _is_payload(children[0], leader_now):
+                raise E2EFailure("The payload is not the Leader's first child")
+            print(f"    {len(children)} children, {size} bytes", flush=True)
+            _exec(context, "true")
+        finally:
+            session.process.terminate()
+            session.finish()
+        # The end of the session kills its leaf, and the orphans in it.
+        deadline = time.monotonic() + ORPHANS_GONE_TIMEOUT
+        while any(_cmdline(child) == ORPHAN_COMMAND for child in _children(leader_now)):
+            if time.monotonic() > deadline:
+                raise E2EFailure("The orphans outlived their session")
+            time.sleep(0.1)
 
     with context.case("the keepalive files stay until the payload opened its script"):
         # Review finding S2: up removed the keepalive files as soon as an

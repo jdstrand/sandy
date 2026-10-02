@@ -28,12 +28,13 @@ import tempfile
 import threading
 import time
 import tty
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from typing import (
     Any,
     Callable,
     Dict,
     Final,
+    Generator,
     Iterator,
     Mapping,
     NamedTuple,
@@ -3184,23 +3185,25 @@ def _find_payload(proc_fd: int, leader_pid: int) -> Tuple[int, ProcessConfinemen
     is still starting, and the Leader's confinement may not be final. proc_fd
     is the Leader's host /proc/<pid> directory. A child that exits meanwhile
     is skipped. Only one process can be PID 2 of the container, so the search
-    stops at the first match; it does not read the status of later children,
-    such as orphans that the Leader adopted.
+    stops at the first match. It reads neither the status of later children
+    nor the rest of the list: the payload is the Leader's first child, and
+    the orphans that the Leader adopts come after it.
     """
-    for child in _read_child_pids(proc_fd, leader_pid):
-        try:
-            child_fd = _open_process_dir(child)
-        except FileNotFoundError:
-            continue
-        try:
-            status_text = _read_process_status(child_fd)
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        finally:
-            os.close(child_fd)
-        payload = _parse_payload_status(status_text, child, leader_pid)
-        if payload is not None:
-            return child, payload
+    with closing(_iter_child_pids(proc_fd, leader_pid)) as children:
+        for child in children:
+            try:
+                child_fd = _open_process_dir(child)
+            except FileNotFoundError:
+                continue
+            try:
+                status_text = _read_process_status(child_fd)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            finally:
+                os.close(child_fd)
+            payload = _parse_payload_status(status_text, child, leader_pid)
+            if payload is not None:
+                return child, payload
     raise ProcessLookupError("Container is still starting; try again")
 
 
@@ -4380,24 +4383,55 @@ def _read_cap_last_cap() -> int:
 
 
 CHILD_PIDS_PATTERN: Final = re.compile(r"(?:[1-9][0-9]{0,6} )*")
-# An entry takes at most 8 bytes, so this allows 131072 children.
-CHILD_PIDS_MAX_BYTES: Final = 1048576
+# The digits of the longest entry, without its space.
+CHILD_PID_MAX_DIGITS: Final = 7
+
+
+def _iter_child_pids(proc_fd: int, pid: int) -> Generator[int, None, None]:
+    """Yield the children of pid from its open host /proc/<pid> directory.
+
+    pid must be single-threaded: the list holds the children of its main
+    thread. The list includes children that have exited but are not reaped
+    yet. The kernel adds a child at the end of the list, also an orphan that
+    pid adopts.
+
+    The list has no size limit. The Leader adopts the orphans of its
+    container, as many as the container's process limit allows, and a limit
+    here would refuse every attach. So read the list one chunk at a time,
+    and check each chunk before any of its entries is used; the memory stays
+    at one chunk. Close the generator to stop early; that closes the file.
+    """
+    fd = os.open(
+        f"task/{_require_pid(pid)}/children", READ_FILE_OPEN_FLAGS, dir_fd=proc_fd
+    )
+    try:
+        partial = b""
+        while True:
+            chunk = os.read(fd, PROC_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            data = partial + chunk
+            end = data.rfind(b" ") + 1
+            entries, partial = data[:end], data[end:]
+            if len(partial) > CHILD_PID_MAX_DIGITS or not CHILD_PIDS_PATTERN.fullmatch(
+                entries.decode("ascii", errors="replace")
+            ):
+                raise ValueError("Malformed process children list")
+            for value in entries.split():
+                yield _require_pid(int(value))
+        # Every entry ends with a space.
+        if partial:
+            raise ValueError("Malformed process children list")
+    finally:
+        os.close(fd)
 
 
 def _read_child_pids(proc_fd: int, pid: int) -> Tuple[int, ...]:
     """Return the children of pid from its open host /proc/<pid> directory.
 
-    pid must be single-threaded: the list holds the children of its main
-    thread. The list includes children that have exited but are not reaped
-    yet.
+    See _iter_child_pids.
     """
-    data = _read_proc_file(
-        proc_fd, f"task/{_require_pid(pid)}/children", CHILD_PIDS_MAX_BYTES
-    )
-    text = data.decode("ascii", errors="replace")
-    if not CHILD_PIDS_PATTERN.fullmatch(text):
-        raise ValueError("Malformed process children list")
-    return tuple(_require_pid(int(value)) for value in text.split())
+    return tuple(_iter_child_pids(proc_fd, pid))
 
 
 def _read_own_child_pids() -> Tuple[int, ...]:
