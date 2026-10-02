@@ -26,6 +26,9 @@ from types import ModuleType
 
 from tests.e2e.support import (
     SANDY,
+    SLICE,
+    SLICE_CGROUP,
+    SYSTEMD_MACHINES,
     CommandResult,
     E2EContext,
     E2EFailure,
@@ -356,6 +359,19 @@ def _open_scope_process(pid: int, unit: str) -> int:
         os.close(pidfd)
         raise
     return pidfd
+
+
+def _wait_for_cgroup(pid: int, cgroup: str) -> None:
+    """Wait until /proc/<pid>/cgroup names cgroup, a path below /sys/fs/cgroup."""
+    expected = f"0::{cgroup}"
+    deadline = time.monotonic() + HOLD_STOP_TIMEOUT
+    while True:
+        current = Path(f"/proc/{pid}/cgroup").read_text(encoding="ascii").strip()
+        if current == expected:
+            return
+        if time.monotonic() > deadline:
+            raise E2EFailure(f"PID {pid} runs in {current!r}, not in {expected!r}")
+        time.sleep(0.01)
 
 
 def _process_state(pid: int) -> str:
@@ -891,6 +907,131 @@ def test_main(context: E2EContext) -> None:
         print(f"    held before the payload in start {held_in}", flush=True)
         context.wait_for_machine(context.main_name, running=True)
         _exec(context, "true")
+
+    with context.case("an attach before the payload exists is refused without mounts"):
+        # In the case above, up has directories to mount, so the scope check
+        # or the mounts-pending marker refuses the attach before the payload
+        # check runs. Without directories, up makes no marker. nspawn moves
+        # the stopped Leader into the payload cgroup, and then only the
+        # payload check stops an attach. Start up with names of directories
+        # that do not exist, and hold the Leader there.
+        missing = ("missing-workspace", "missing-shared")
+        for name in missing:
+            if os.path.lexists(context.root / name):
+                raise E2EFailure(f"{name} exists in the run root")
+        bare_arguments = [
+            str(SANDY),
+            "--workspace",
+            missing[0],
+            "--shared",
+            missing[1],
+            "--user",
+            context.main_user,
+            "--container",
+            context.main_name,
+            "up",
+            "--detach",
+            "--persistent",
+            "--network",
+            "lenient",
+        ]
+        unit = f"sandy-{context.main_name}.scope"
+        pending = SLICE_CGROUP / unit / "mounts-pending"
+        marker_name = "bare-start-refused-marker"
+        marker = (
+            SYSTEMD_MACHINES
+            / f"sandy.{context.main_name}"
+            / "home"
+            / context.main_user
+            / marker_name
+        )
+        held_in = 0
+        for attempt in range(1, HOLD_ATTEMPTS + 1):
+            context.stop_container(context.main_name, context.main_user)
+            print(f"    $ {shlex.join(bare_arguments)}", flush=True)
+            bare_log = context.root / f"bare-hold-up-{attempt}.log"
+            with bare_log.open("w", encoding="utf-8") as stream:
+                up = subprocess.Popen(
+                    bare_arguments,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=context.root,
+                    env=start_environment,
+                )
+            try:
+                leader = 0
+                deadline = time.monotonic() + START_TIMEOUT
+                while not leader and up.poll() is None:
+                    if time.monotonic() > deadline:
+                        raise E2EFailure("The container did not register")
+                    leader = _machined_leader(context.main_name)
+                if not leader:
+                    raise E2EFailure(f"up exited {up.returncode} before registration")
+                pidfd = _open_scope_process(leader, unit)
+                try:
+                    signal.pidfd_send_signal(pidfd, signal.SIGSTOP)
+                    try:
+                        deadline = time.monotonic() + HOLD_STOP_TIMEOUT
+                        while _process_state(leader) != "T":
+                            if time.monotonic() > deadline:
+                                raise E2EFailure("The Leader did not stop")
+                            time.sleep(0.01)
+                        if not _has_payload(leader):
+                            held_in = attempt
+                            _wait_for_cgroup(leader, f"/{SLICE}/{unit}/payload")
+                            if pending.exists():
+                                raise E2EFailure(
+                                    "up made a mounts-pending marker with no "
+                                    "directory to mount"
+                                )
+                            refused = _exec(
+                                context,
+                                f"touch /home/{context.main_user}/{marker_name}",
+                                expected=ENTRY_FAILURE,
+                            )
+                            assert_contains(refused, "Container is still starting")
+                            if marker.exists():
+                                raise E2EFailure("The command ran before the payload")
+                            if _has_payload(leader):
+                                raise E2EFailure("The held Leader started its payload")
+                    finally:
+                        try:
+                            signal.pidfd_send_signal(pidfd, signal.SIGCONT)
+                        except ProcessLookupError:
+                            pass
+                finally:
+                    os.close(pidfd)
+                returncode = up.wait(timeout=START_TIMEOUT)
+            finally:
+                if up.poll() is None:
+                    up.kill()
+                    up.wait(timeout=10)
+            output = bare_log.read_text(encoding="utf-8", errors="replace")
+            if returncode != 0:
+                raise E2EFailure(
+                    f"up -d exited {returncode} after the hold: {output[-2000:]}"
+                )
+            for name in missing:
+                if f"Could not find '{name}'" not in output:
+                    raise E2EFailure(f"up did not skip {name}: {output[-2000:]}")
+            if held_in:
+                break
+        if not held_in:
+            raise E2EFailure(
+                f"The payload existed at the stop in all {HOLD_ATTEMPTS} starts"
+            )
+        print(f"    held in the payload cgroup in start {held_in}", flush=True)
+        context.wait_for_machine(context.main_name, running=True)
+        # The next cases need the main container with its directories.
+        context.stop_container(context.main_name, context.main_user)
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=context.main_name,
+            user=context.main_user,
+            timeout=START_TIMEOUT,
+        )
+        _exec_when_mounted(context, "true")
 
     with context.case("the keepalive files stay until the payload opened its script"):
         # Review finding S2: up removed the keepalive files as soon as an
