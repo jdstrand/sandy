@@ -56,6 +56,22 @@ from tests.e2e.test_confinement import (
 from tests.e2e.test_network import _wait_for_public_https
 from tests.e2e.test_scope import _has_new_only_child, _leaves, _read_cgroup_file
 
+# The host directory in which up makes its temporary directories. No test reads
+# or changes it: preflight lists entries there, and cleanup removes them.
+HOST_UP_TEMPORARY_ROOT = support.UP_TEMPORARY_ROOT
+
+
+def setUpModule() -> None:
+    """Point the harness at a private, empty directory instead of the host /tmp.
+
+    A test that needs entries there patches UP_TEMPORARY_ROOT again.
+    """
+    directory = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(directory.cleanup)
+    patcher = patch.object(support, "UP_TEMPORARY_ROOT", Path(directory.name))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
 
 class CleanupProbeContext(E2EContext):
     """Exercise cleanup ownership decisions without touching host state."""
@@ -197,6 +213,27 @@ class CleanupOwnershipTests(unittest.TestCase):
             self.assertEqual(context.cache_purges, 1)
             self.assertEqual(context.slice_removals, 1)
             self.assertEqual(context.state_checks, 1)
+
+    def test_cleanup_and_preflight_do_not_use_the_host_temporary_directory(self):
+        # Regression test: the cleanup and preflight tests read the host /tmp.
+        # cleanup removed a sandy-keepalive-* directory of the test user, and
+        # preflight refused one of root. A real decoy directory in the host
+        # /tmp; mocks: the host state probes of CleanupProbeContext.
+        decoy = Path(
+            tempfile.mkdtemp(prefix="sandy-keepalive-unit-", dir=HOST_UP_TEMPORARY_ROOT)
+        )
+        try:
+            self.assertEqual(support.up_temporary_directories(), [])
+            with tempfile.TemporaryDirectory() as parent:
+                root = Path(parent) / "run"
+                root.mkdir()
+                context = CleanupProbeContext(root, host_state_owned=True)
+
+                self.assertEqual(context.cleanup(), [])
+
+            self.assertTrue(decoy.is_dir())
+        finally:
+            decoy.rmdir()
 
     def test_cleanup_removes_the_network_when_the_bridge_or_firewall_remains(self):
         # Regression test: a failed case can delete the bridge and leave the
