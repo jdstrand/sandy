@@ -888,8 +888,9 @@ Step 2 decisions that differ from the plan above:
   removes empty ones; this is safe because leaves are created and joined
   under the lifecycle lock.
 - The helper proves the scope from the Leader's host cgroup, which must be
-  below `/system.slice/sandy-<name>.scope/payload`. A container started by
-  an earlier sandy fails this check; `bash` and `exec` refuse it.
+  below `/system.slice/sandy-<name>.scope/payload` (below `/sandy.slice/`
+  since `security-parity.md` item 2). A container started by an earlier
+  sandy fails this check; `bash` and `exec` refuse it.
 - `init.sh` now runs in the main thread after readiness, before the
   console attach (not in a thread during the console).
 - `up` runs `_cleanup_port_mappings_for_container` after CLI validation;

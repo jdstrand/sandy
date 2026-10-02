@@ -157,7 +157,7 @@ already runs it as root, so the helper gets the same trust.
      confirm with `machinectl` that it is still the machine's Leader.
    * Read the Leader's host cgroup through a `/proc/<pid>` directory
      descriptor, and require it below
-     `/system.slice/sandy-<name>.scope/payload` (step 2 of the scope brief).
+     `/sandy.slice/sandy-<name>.scope/payload` (step 2 of the scope brief).
    * Require the payload (container PID 2) among the Leader's children
      (item 5).
    * Open `/proc/<pid>/ns/{cgroup,ipc,uts,net,pid,mnt,user}` through the same
