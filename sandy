@@ -188,9 +188,9 @@ def _validate_container_name(name: str) -> bool:
     # RFC hostname: start with letter, contain only letters, digits, hyphens
     # No underscores allowed in hostnames (unlike previous version)
     return (
-        bool(re.match(r"^[a-z][a-z0-9-]*[a-z0-9]$", name))
+        bool(re.fullmatch(r"^[a-z][a-z0-9-]*[a-z0-9]$", name))
         if len(name) > 1
-        else bool(re.match(r"^[a-z]$", name))
+        else bool(re.fullmatch(r"^[a-z]$", name))
     )
 
 
@@ -205,7 +205,7 @@ def _validate_username(username: str) -> bool:
     # Strict POSIX username: start with lowercase letter or underscore,
     # followed by lowercase letters, digits, underscores, or hyphens
     # Note: $ is allowed as final character for Samba machine accounts, but we exclude it for security
-    return bool(re.match(r"^[a-z_][a-z0-9_-]*$", username))
+    return bool(re.fullmatch(r"^[a-z_][a-z0-9_-]*$", username))
 
 
 def _validate_workspace_path(path: str) -> bool:
@@ -354,7 +354,7 @@ def _validate_image_name(image: str) -> bool:
     if not image or len(image) > 128:
         return False
     # OCI image name validation (simplified)
-    return bool(re.match(r"^[a-z][a-z0-9._:-]{0,127}$", image))
+    return bool(re.fullmatch(r"^[a-z][a-z0-9._:-]{0,127}$", image))
 
 
 def _validate_network_cidr(cidr: str) -> bool:

@@ -157,6 +157,8 @@ class ValidationTests(unittest.TestCase):
                 ("bad_name", False),
                 ("bad;name", False),
                 ("bad\nname", False),
+                # re.match with "$" accepted a trailing newline.
+                ("ai-dev\n", False),
             ],
         )
 
@@ -175,6 +177,7 @@ class ValidationTests(unittest.TestCase):
                 ("user$", False),
                 ("user;id", False),
                 ("user\nname", False),
+                ("developer\n", False),
             ],
         )
 
@@ -315,6 +318,7 @@ class ValidationTests(unittest.TestCase):
                 ("registry.example/debian:latest", False),
                 ("debian latest", False),
                 ("a" * 129, False),
+                ("debian:trixie-slim\n", False),
             ],
         )
 
