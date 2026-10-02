@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import fcntl
+import os
+import signal
 
 from tests.e2e.support import (
     CACHE_DIR,
@@ -170,6 +172,35 @@ def test_main(context: E2EContext) -> None:
         )
         # The refusal comes before the first check of up.
         assert_not_contains(refused, "is already running")
+        context.wait_for_machine(context.main_name, running=True)
+
+    with context.case("a machine query that does not answer ends the command"):
+        # Stop systemd-machined for a moment: machinectl then waits for its
+        # answer for 25 seconds. Sandy waits for at most 3 seconds
+        # (QUERY_COMMAND_TIMEOUT of sandy), and no answer is not "stopped".
+        machined = context.run(
+            ["systemctl", "show", "systemd-machined", "-p", "MainPID", "--value"]
+        ).stdout.strip()
+        if not machined.isdigit() or int(machined) <= 1:
+            raise E2EFailure(f"systemd-machined does not run: {machined!r}")
+        os.kill(int(machined), signal.SIGSTOP)
+        try:
+            refused = context.sandy(
+                ["up", "--detach", "--persistent", "--network", "lenient"],
+                name=context.main_name,
+                user=context.main_user,
+                expected=1,
+            )
+            attach = context.sandy(
+                ["exec", "--", "true"],
+                name=context.main_name,
+                user=context.main_user,
+                expected=1,
+            )
+        finally:
+            os.kill(int(machined), signal.SIGCONT)
+        assert_contains(refused, f"E: Could not query machine '{context.main_name}'")
+        assert_contains(attach, "E: 'machinectl' did not answer in 3 seconds")
         context.wait_for_machine(context.main_name, running=True)
 
     with context.case("stopped persistent machine restarts without rebuilding"):

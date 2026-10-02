@@ -76,6 +76,10 @@ LIFECYCLE_LOCK_RETRY_INTERVAL: Final = 0.05
 # the markers that it needs; when the start fails before that, up removes its
 # ports in that hold, with no wait.
 PORT_MAPPINGS_LOCK_TIMEOUT: Final = 5
+# machinectl show and systemctl show answer in milliseconds. Some of them run
+# under the lifecycle lock, which each attach waits for, so a query that does
+# not answer in this many seconds fails.
+QUERY_COMMAND_TIMEOUT: Final = 3
 INIT_SCRIPT_MAX_BYTES: Final = 8192
 # The container payload (PID 2) is the image's bash, started through a symlink
 # named sandy-keepalive, reading a copy of sandy-keepalive.sh. Both are in a
@@ -1854,6 +1858,7 @@ def _systemctl_show_value(unit: str, prop: str) -> str:
         capture_output=True,
         text=True,
         check=True,
+        timeout=QUERY_COMMAND_TIMEOUT,
     )
     output = result.stdout
     if output.endswith("\n"):
@@ -3174,6 +3179,7 @@ def _query_machine_leader(machine_name: str) -> int:
         capture_output=True,
         text=True,
         check=True,
+        timeout=QUERY_COMMAND_TIMEOUT,
     )
     output = result.stdout
     if output.endswith("\n"):
@@ -7188,7 +7194,11 @@ class Sandy:
             print(f"E: Problem removing {safe_con}: {_terminal_safe_repr(str(e))}")
 
     def _is_container_running(self, container_name=None):
-        """Check if container is running and return PID if so, None otherwise"""
+        """Check if container is running and return PID if so, None otherwise
+
+        A query that does not answer in QUERY_COMMAND_TIMEOUT raises
+        subprocess.TimeoutExpired: no answer does not mean "not running".
+        """
         if container_name is None:
             container_name = self.container
 
@@ -7198,6 +7208,7 @@ class Sandy:
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=QUERY_COMMAND_TIMEOUT,
             )
             pid = result.stdout.strip()
             return pid if pid else None
@@ -9616,7 +9627,14 @@ class Sandy:
         closed rather than reuse or stop a unit that this run did not start.
         None means that up can go on.
         """
-        if self._is_container_running():
+        try:
+            running = self._is_container_running()
+        except subprocess.SubprocessError as exc:
+            return (
+                f"E: Could not query machine '{self.container}': "
+                f"{_terminal_safe_repr(str(exc))}"
+            )
+        if running:
             return f"E: Container '{self.container}' is already running"
         unit = _supervisor_unit_name(self.container)
         try:
@@ -10312,27 +10330,36 @@ def main():
             )
             sys.exit(1)
 
-    # Execute command
-    if args.command == "up":
-        sandy.run_up(args)
-    elif args.command == "down":
-        sandy.run_down(args)
-    elif args.command == "rm":
-        sandy.run_rm(args, all=args.all, cache=args.cache, network=args.network)
-    elif args.command == "bash":
-        sandy.run_bash(args)
-    elif args.command == "exec":
-        sandy.run_exec(args)
-    elif args.command == "status":
-        sandy.run_status()
-    elif args.command == "update":
-        sandy.run_update(args)
-    elif args.command == "list":
-        sandy.run_list()
-    else:
-        # No command specified, run default (bash)
-        status = sandy._exec(None, login_shell=True)
-        _raise_for_container_status(status)
+    # Execute command. A query that does not answer in QUERY_COMMAND_TIMEOUT
+    # ends the command, after the cleanup of the command has run.
+    try:
+        if args.command == "up":
+            sandy.run_up(args)
+        elif args.command == "down":
+            sandy.run_down(args)
+        elif args.command == "rm":
+            sandy.run_rm(args, all=args.all, cache=args.cache, network=args.network)
+        elif args.command == "bash":
+            sandy.run_bash(args)
+        elif args.command == "exec":
+            sandy.run_exec(args)
+        elif args.command == "status":
+            sandy.run_status()
+        elif args.command == "update":
+            sandy.run_update(args)
+        elif args.command == "list":
+            sandy.run_list()
+        else:
+            # No command specified, run default (bash)
+            status = sandy._exec(None, login_shell=True)
+            _raise_for_container_status(status)
+    except subprocess.TimeoutExpired as exc:
+        program = exc.cmd[0] if isinstance(exc.cmd, list) and exc.cmd else exc.cmd
+        print(
+            f"E: '{_strip_control_characters(str(program))}' did not answer in "
+            f"{exc.timeout:g} seconds"
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

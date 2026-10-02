@@ -1177,6 +1177,20 @@ class MainDispatchTests(unittest.TestCase):
                         sandy.main()
         return instance
 
+    def test_a_query_that_does_not_answer_ends_the_command(self):
+        instance = MagicMock()
+        instance.run_status.side_effect = subprocess.TimeoutExpired(
+            ["machinectl", "show", "ai-dev", "-p", "Leader", "--value"],
+            sandy.QUERY_COMMAND_TIMEOUT,
+        )
+        with captured_output() as (stdout, _):
+            with self.assertRaises(SystemExit) as exited:
+                self.run_main(self.make_args("status"), instance)
+        self.assertEqual(exited.exception.code, 1)
+        self.assertEqual(
+            stdout.getvalue(), "E: 'machinectl' did not answer in 3 seconds\n"
+        )
+
     def test_root_and_safe_directory_checks_precede_construction(self):
         args = self.make_args("status")
         instance = MagicMock(container="ai-dev", user="developer")
@@ -3920,6 +3934,7 @@ class LeaderExtractionTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=True,
+            timeout=sandy.QUERY_COMMAND_TIMEOUT,
         )
 
     def test_query_machine_leader_rejects_bad_output_and_names(self):
@@ -10856,6 +10871,7 @@ class ExecutionTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=True,
+            timeout=sandy.QUERY_COMMAND_TIMEOUT,
         )
 
         with patch.object(
@@ -10864,6 +10880,18 @@ class ExecutionTests(unittest.TestCase):
             side_effect=subprocess.CalledProcessError(1, ["machinectl"]),
         ):
             self.assertIsNone(instance._is_container_running())
+
+    def test_is_container_running_does_not_read_a_timeout_as_stopped(self):
+        # Regression test: the query had no timeout. A timeout must not mean
+        # "not running": rm, for example, then removes the image.
+        instance = make_sandy()
+        with patch.object(
+            sandy,
+            "_run_secure_subprocess",
+            side_effect=subprocess.TimeoutExpired(["machinectl"], 3),
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                instance._is_container_running()
 
     def test_machine_poweroff_cleans_state_first(self):
         instance = make_sandy()
@@ -15403,6 +15431,22 @@ class RunUpTests(unittest.TestCase):
         mocks.stop.assert_called_once_with(mocks.popen.return_value)
         self.up_lock.close.assert_not_called()
 
+    def test_up_refuses_when_the_machine_query_does_not_answer(self):
+        # Mocks: machinectl, which times out.
+        instance = make_sandy()
+        with patch.object(
+            instance,
+            "_is_container_running",
+            side_effect=subprocess.TimeoutExpired(["machinectl"], 3),
+        ):
+            with captured_output() as (stdout, _):
+                with self.assertRaises(SystemExit) as exited:
+                    instance.run_up(self.arguments())
+        self.assertEqual(exited.exception.code, 1)
+        self.assertIn("E: Could not query machine 'ai-dev': ", stdout.getvalue())
+        self.supervisor_unit_loaded.assert_not_called()
+        self.set_shared_limits.assert_not_called()
+
     def test_mounts_are_checked_before_any_host_change(self):
         # The check of a directory comes before the first host change, the
         # shared limits.
@@ -16301,6 +16345,7 @@ class SupervisorScopeTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=True,
+            timeout=sandy.QUERY_COMMAND_TIMEOUT,
         )
 
     def test_systemctl_show_value_rejects_malformed_output(self):
