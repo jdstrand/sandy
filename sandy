@@ -2504,6 +2504,7 @@ MS_PRIVATE: Final = 1 << 18
 # <linux/openat2.h>: openat2 resolve flags.
 RESOLVE_NO_MAGICLINKS: Final = 0x02
 RESOLVE_NO_SYMLINKS: Final = 0x04
+RESOLVE_IN_ROOT: Final = 0x10
 _LIBC: Optional[Any] = None
 
 
@@ -2745,13 +2746,15 @@ def _mount_step_error(step: str, error: Optional[int]) -> _MountError:
     return _MountError(f"{step} failed: {os.strerror(error)} (errno {error})")
 
 
-def _openat2_no_links(path: str, flags: int) -> int:
+def _openat2_no_links(path: str, flags: int, root_fd: Optional[int] = None) -> int:
     """Open an absolute path that has no link in any of its components.
 
     openat2 with RESOLVE_NO_SYMLINKS rejects a symbolic link in every
     component, parents included, and RESOLVE_NO_MAGICLINKS rejects the
     /proc style links. Either gives ELOOP. The path starts at the root of
-    the calling process. Use O_PATH in flags when only a handle is needed.
+    the calling process, or at root_fd when it is given: RESOLVE_IN_ROOT
+    then keeps the whole path below root_fd. Use O_PATH in flags when only
+    a handle is needed.
     """
     # The rules for a path in the container also fit a host path: normalized,
     # absolute, and without control characters. A NUL byte would end the C
@@ -2759,10 +2762,13 @@ def _openat2_no_links(path: str, flags: int) -> int:
     if not _validate_container_path(path):
         raise ValueError("Invalid path")
     encoded = ctypes.create_string_buffer(os.fsencode(path))
-    how = _OpenHow(flags | os.O_CLOEXEC, 0, RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)
+    resolve = RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS
+    if root_fd is not None:
+        resolve |= RESOLVE_IN_ROOT
+    how = _OpenHow(flags | os.O_CLOEXEC, 0, resolve)
     return _entry_syscall(
         "openat2",
-        AT_FDCWD,
+        AT_FDCWD if root_fd is None else root_fd,
         ctypes.addressof(encoded),
         ctypes.addressof(how),
         ctypes.sizeof(how),
@@ -6952,22 +6958,47 @@ class Sandy:
         print("   The container does not see these mounts")
 
     def _prepare_image_mounts(
-        self, machine_fd: int, mdir: str, plans: list
+        self, machine_fd: int, plans: list
     ) -> Tuple[Tuple[MountPlan, ...], Tuple[int, int]]:
         """Keep the plans whose target exists in the image; read the user's ids.
 
         Return the plans to mount and the uid and gid of the container user.
-        Exit when the ids cannot be read. The ids map the owner of each host
-        directory to the user (see _mount_one).
+        Exit when a target or the ids cannot be read. The ids map the owner
+        of each host directory to the user (see _mount_one).
+
+        The check opens each target below the image root, with no link in
+        its path, as the mount does (see _move_mount_in_namespace). So a link
+        in the image never leads to a host path. A target that is missing or
+        is not a directory is skipped. A link in its path ends the command
+        before the start, with the error of the mount.
         """
         kept = []
         for plan in plans:
-            if not os.path.isdir(os.path.join(mdir, plan.target[1:])):
-                print(
-                    f"W: Could not find '{plan.target}' in the container. "
-                    f"Skipping {plan.label} mount"
+            try:
+                os.close(
+                    _openat2_no_links(
+                        plan.target, os.O_PATH | os.O_DIRECTORY, root_fd=machine_fd
+                    )
                 )
-                continue
+            except (OSError, ValueError) as exc:
+                error = exc.errno if isinstance(exc, OSError) else None
+                if error in (errno.ENOENT, errno.ENOTDIR):
+                    print(
+                        f"W: Could not find '{plan.target}' in the container. "
+                        f"Skipping {plan.label} mount"
+                    )
+                    continue
+                # A link in the path gives ELOOP, and the mount refuses it too.
+                reason = (
+                    _mount_step_error("openat2", error)
+                    if isinstance(exc, OSError)
+                    else "the path is not valid"
+                )
+                print(
+                    f"E: Could not mount '{_strip_control_characters(plan.source)}' "
+                    f"on '{_strip_control_characters(plan.target)}': {reason}"
+                )
+                sys.exit(1)
             print(
                 f"I: Mounting '{_strip_control_characters(plan.source)}' "
                 f"on '{plan.target}'"
@@ -9008,7 +9039,7 @@ class Sandy:
         try:
             # The mount targets and the image user's ids, before any change of
             # the network.
-            mounts, image_ids = self._prepare_image_mounts(machine_fd, mdir, mounts)
+            mounts, image_ids = self._prepare_image_mounts(machine_fd, mounts)
 
             # Bind mount init.sh as read-only to protect it from modification.
             # Open it before port forwarding so IP discovery cannot follow a raw

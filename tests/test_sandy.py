@@ -5996,6 +5996,7 @@ class MountPrimitiveTests(unittest.TestCase):
         self.assertEqual(sandy.MS_PRIVATE, 1 << 18)
         self.assertEqual(sandy.RESOLVE_NO_MAGICLINKS, 0x02)
         self.assertEqual(sandy.RESOLVE_NO_SYMLINKS, 0x04)
+        self.assertEqual(sandy.RESOLVE_IN_ROOT, 0x10)
 
     def test_openat2_no_links_resolves_with_no_links(self):
         with fake_mount_kernel() as calls:
@@ -6014,6 +6015,19 @@ class MountPrimitiveTests(unittest.TestCase):
         # is the size of struct open_how.
         self.assertEqual(record["args"][0], sandy.AT_FDCWD)
         self.assertEqual(record["args"][3], 24)
+
+    def test_openat2_no_links_keeps_the_path_below_a_root_descriptor(self):
+        with fake_mount_kernel() as calls:
+            sandy._openat2_no_links(
+                "/home/developer/workspace", os.O_PATH | os.O_DIRECTORY, root_fd=7
+            )
+        (record,) = calls
+        self.assertEqual(record["args"][0], 7)
+        self.assertEqual(record["path"], b"/home/developer/workspace")
+        self.assertEqual(
+            record["how"],
+            (os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC, 0, 0x04 | 0x02 | 0x10),
+        )
 
     def test_openat2_no_links_encodes_the_path_like_the_file_system(self):
         with fake_mount_kernel() as calls:
@@ -7280,7 +7294,8 @@ class PlanMountsTests(unittest.TestCase):
     """Sandy._plan_mounts and Sandy._prepare_image_mounts.
 
     Mocks: the check of a directory (_plan_mount) and the image user's ids.
-    Real temporary directories give the paths and the images.
+    Real temporary directories give the paths and the images. The check of a
+    target in an image is the real openat2 call.
     """
 
     def setUp(self):
@@ -7426,11 +7441,16 @@ class PlanMountsTests(unittest.TestCase):
 
     @contextmanager
     def image(self, directories):
+        """Yield the path and a descriptor of a temporary image root."""
         with tempfile.TemporaryDirectory() as temp_dir:
             machine = Path(temp_dir)
             for directory in directories:
                 (machine / directory).mkdir(parents=True)
-            yield machine
+            machine_fd = os.open(machine, os.O_PATH | os.O_DIRECTORY)
+            try:
+                yield machine, machine_fd
+            finally:
+                os.close(machine_fd)
 
     plans = [
         sandy.MountPlan("workspace", "/srv/work", "/home/developer/workspace", 1, 2),
@@ -7439,17 +7459,15 @@ class PlanMountsTests(unittest.TestCase):
 
     def test_prepare_keeps_the_targets_that_the_image_has(self):
         instance = make_sandy()
-        with self.image(["home/developer/workspace"]) as machine:
+        with self.image(["home/developer/workspace"]) as (_, machine_fd):
             with patch.object(
                 sandy, "_read_image_user_ids", return_value=(1001, 1002)
             ) as read:
                 with captured_output() as (stdout, _):
-                    kept, ids = instance._prepare_image_mounts(
-                        9, str(machine), self.plans
-                    )
+                    kept, ids = instance._prepare_image_mounts(machine_fd, self.plans)
         self.assertEqual(kept, (self.plans[0],))
         self.assertEqual(ids, (1001, 1002))
-        read.assert_called_once_with(9, "developer")
+        read.assert_called_once_with(machine_fd, "developer")
         self.assertEqual(
             stdout.getvalue(),
             "I: Mounting '/srv/work' on '/home/developer/workspace'\n"
@@ -7462,20 +7480,20 @@ class PlanMountsTests(unittest.TestCase):
         instance.user = "other"
         instance.user_home = "/home/other"
         plan = sandy.MountPlan("workspace", "/srv/work", "/home/other/workspace", 1, 2)
-        with self.image(["home/other/workspace"]) as machine:
+        with self.image(["home/other/workspace"]) as (_, machine_fd):
             with patch.object(
                 sandy, "_read_image_user_ids", return_value=(1000, 1000)
             ) as read:
                 with captured_output():
-                    instance._prepare_image_mounts(9, str(machine), [plan])
-        read.assert_called_once_with(9, "other")
+                    instance._prepare_image_mounts(machine_fd, [plan])
+        read.assert_called_once_with(machine_fd, "other")
 
     def test_prepare_reads_nothing_when_no_target_is_left(self):
         instance = make_sandy()
-        with self.image([]) as machine:
+        with self.image([]) as (_, machine_fd):
             with patch.object(sandy, "_read_image_user_ids") as read:
                 with captured_output():
-                    result = instance._prepare_image_mounts(9, str(machine), self.plans)
+                    result = instance._prepare_image_mounts(machine_fd, self.plans)
         self.assertEqual(result, ((), (0, 0)))
         read.assert_not_called()
 
@@ -7487,18 +7505,145 @@ class PlanMountsTests(unittest.TestCase):
             PermissionError("Unsafe image file path component 'passwd'"),
         ):
             with self.subTest(error=error):
-                with self.image(["home/developer/workspace"]) as machine:
+                with self.image(["home/developer/workspace"]) as (_, machine_fd):
                     with patch.object(sandy, "_read_image_user_ids", side_effect=error):
                         with captured_output() as (stdout, _):
                             with self.assertRaises(SystemExit) as exited:
                                 instance._prepare_image_mounts(
-                                    9, str(machine), self.plans[:1]
+                                    machine_fd, self.plans[:1]
                                 )
                 self.assertEqual(exited.exception.code, 1)
                 self.assertIn(
                     "E: Could not read the uid and gid of 'developer' in the "
                     "container image: ",
                     stdout.getvalue(),
+                )
+
+    def test_prepare_checks_the_target_below_the_image_root(self):
+        # A directory that only the host has is missing from the image, and
+        # one that only the image has exists. Nothing is mocked but the image
+        # user's ids.
+        instance = make_sandy()
+        image_only = f"/sandy-image-only-{os.getpid()}/workspace"
+        self.assertFalse(os.path.lexists(image_only))
+        with tempfile.TemporaryDirectory() as host_only:
+            plans = [
+                sandy.MountPlan("workspace", "/srv/work", host_only, 1, 2),
+                sandy.MountPlan("shared", "/srv/share", image_only, 1, 3),
+            ]
+            with self.image([image_only[1:]]) as (_, machine_fd):
+                with patch.object(
+                    sandy, "_read_image_user_ids", return_value=(1000, 1000)
+                ):
+                    with captured_output() as (stdout, _):
+                        kept, _ = instance._prepare_image_mounts(machine_fd, plans)
+        self.assertEqual(kept, (plans[1],))
+        self.assertIn(
+            f"W: Could not find '{host_only}' in the container. Skipping "
+            "workspace mount\n",
+            stdout.getvalue(),
+        )
+
+    def test_prepare_refuses_a_link_in_the_image_before_the_start(self):
+        # Regression test: os.path.isdir followed a link in the image with the
+        # rules of the host, so an absolute link answered for a host
+        # directory. The mount opens no link, so up refuses a target with a
+        # link in its path, with the error of the mount. Nothing is mocked but
+        # the image user's ids.
+        instance = make_sandy()
+        with tempfile.TemporaryDirectory() as host_dir:
+            host = Path(host_dir)
+            (host / "developer" / "workspace").mkdir(parents=True)
+
+            def link_to_the_host(machine):
+                (machine / "home" / "developer").mkdir(parents=True)
+                (machine / "home" / "developer" / "workspace").symlink_to(
+                    host / "developer" / "workspace"
+                )
+
+            def parent_link_to_the_host(machine):
+                (machine / "home").symlink_to(host)
+
+            def link_in_the_image(machine):
+                (machine / "home" / "developer" / "real").mkdir(parents=True)
+                (machine / "home" / "developer" / "workspace").symlink_to("real")
+
+            for layout in (
+                link_to_the_host,
+                parent_link_to_the_host,
+                link_in_the_image,
+            ):
+                with self.subTest(layout=layout.__name__):
+                    with self.image([]) as (machine, machine_fd):
+                        layout(machine)
+                        # The check of the old code said yes to each layout.
+                        self.assertTrue(
+                            os.path.isdir(machine / "home/developer/workspace")
+                        )
+                        with patch.object(sandy, "_read_image_user_ids") as read:
+                            with captured_output() as (stdout, _):
+                                with self.assertRaises(SystemExit) as exited:
+                                    instance._prepare_image_mounts(
+                                        machine_fd, self.plans[:1]
+                                    )
+                    self.assertEqual(exited.exception.code, 1)
+                    read.assert_not_called()
+                    self.assertEqual(
+                        stdout.getvalue(),
+                        "E: Could not mount '/srv/work' on "
+                        "'/home/developer/workspace': openat2 failed: "
+                        f"{os.strerror(errno.ELOOP)} (errno {errno.ELOOP})\n",
+                    )
+
+    def test_prepare_skips_a_target_that_is_not_a_directory(self):
+        # Nothing is mocked but the image user's ids.
+        instance = make_sandy()
+        for file in ("home/developer/workspace", "home/developer"):
+            with self.subTest(file=file):
+                with self.image(["home"]) as (machine, machine_fd):
+                    (machine / file).parent.mkdir(parents=True, exist_ok=True)
+                    (machine / file).write_text("")
+                    with patch.object(sandy, "_read_image_user_ids") as read:
+                        with captured_output() as (stdout, _):
+                            result = instance._prepare_image_mounts(
+                                machine_fd, self.plans[:1]
+                            )
+                self.assertEqual(result, ((), (0, 0)))
+                read.assert_not_called()
+                self.assertEqual(
+                    stdout.getvalue(),
+                    "W: Could not find '/home/developer/workspace' in the "
+                    "container. Skipping workspace mount\n",
+                )
+
+    def test_prepare_ends_the_command_when_a_target_cannot_be_checked(self):
+        # Mocks: openat2, for errors that a real image does not give here.
+        instance = make_sandy()
+        for error, reason in (
+            (
+                PermissionError(errno.EACCES, "openat2 failed: Permission denied"),
+                f"openat2 failed: Permission denied (errno {errno.EACCES})",
+            ),
+            (ValueError("Invalid path"), "the path is not valid"),
+        ):
+            with self.subTest(error=error):
+                with patch.object(
+                    sandy, "_openat2_no_links", side_effect=error
+                ) as opened, patch.object(sandy, "_read_image_user_ids") as read:
+                    with captured_output() as (stdout, _):
+                        with self.assertRaises(SystemExit) as exited:
+                            instance._prepare_image_mounts(7, self.plans)
+                self.assertEqual(exited.exception.code, 1)
+                opened.assert_called_once_with(
+                    "/home/developer/workspace",
+                    os.O_PATH | os.O_DIRECTORY,
+                    root_fd=7,
+                )
+                read.assert_not_called()
+                self.assertEqual(
+                    stdout.getvalue(),
+                    "E: Could not mount '/srv/work' on '/home/developer/workspace': "
+                    f"{reason}\n",
                 )
 
 
@@ -13651,6 +13796,17 @@ class RunUpTests(unittest.TestCase):
                 stack.enter_context(
                     patch.object(sandy.platform, "machine", return_value="unknown-cpu")
                 )
+                # The unknown architecture has no number for openat2, so the
+                # check of the targets in the image opens them with os.open.
+                open_target = stack.enter_context(
+                    patch.object(
+                        sandy,
+                        "_openat2_no_links",
+                        side_effect=lambda path, flags, root_fd: os.open(
+                            path[1:], flags, dir_fd=root_fd
+                        ),
+                    )
+                )
                 fchown = stack.enter_context(patch.object(sandy.os, "fchown"))
                 with captured_output() as (stdout, _):
                     instance.run_up(args)
@@ -13697,6 +13853,17 @@ class RunUpTests(unittest.TestCase):
             [
                 call("workspace", workspace, "/home/developer/workspace"),
                 call("shared", shared, "/home/developer/shared"),
+            ],
+        )
+        self.assertEqual(
+            open_target.call_args_list,
+            [
+                call(
+                    "/home/developer/workspace",
+                    os.O_PATH | os.O_DIRECTORY,
+                    root_fd=ANY,
+                ),
+                call("/home/developer/shared", os.O_PATH | os.O_DIRECTORY, root_fd=ANY),
             ],
         )
         self.wait_for_mounts.assert_called_once_with(
