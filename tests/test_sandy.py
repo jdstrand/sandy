@@ -15630,10 +15630,11 @@ class RunUpTests(unittest.TestCase):
     def test_up_closes_the_pinned_supervisor(self):
         # Regression test: no test checked that up closes the pidfd of its
         # supervisor. Without -d, up goes on as the console, so the pidfd
-        # would stay open for the whole session. Mocks: the start and the
-        # markers (setUp). The pin opens a directory of its own, and os.close
-        # records the file that it closes: up closes other descriptors first,
-        # and the pin can reuse one of their numbers.
+        # would stay open for the whole session: the case without -d checks
+        # that the close comes before the console attach. Mocks: the start,
+        # the markers, and the console (setUp). The pin opens a directory of
+        # its own, and os.close records the file that it closes: up closes
+        # other descriptors first, and the pin can reuse one of their numbers.
         closed = []
         real_close = os.close
 
@@ -15653,13 +15654,18 @@ class RunUpTests(unittest.TestCase):
                 return pinned
 
             self.pin_supervisor.side_effect = pin
-            for label, marker_error in (
-                ("started", None),
-                ("marker failed", OSError("no scope")),
+            # What up had closed when the console attach started.
+            at_console: list = []
+            self.exec.side_effect = lambda *a, **k: at_console.append(list(closed)) or 0
+            for label, marker_error, detach in (
+                ("started", None, True),
+                ("marker failed", OSError("no scope"), True),
+                ("console", None, False),
             ):
                 with self.subTest(label=label):
                     self.pinned.clear()
                     closed.clear()
+                    at_console.clear()
                     self.pending_marker.side_effect = marker_error
                     instance = make_sandy()
                     with self.mount_dirs(instance) as (machine, _, _):
@@ -15668,12 +15674,18 @@ class RunUpTests(unittest.TestCase):
                         ):
                             with captured_output():
                                 try:
-                                    instance.run_up(self.arguments(detach=True))
+                                    instance.run_up(self.arguments(detach=detach))
                                 except SystemExit as exited:
                                     self.assertIsNotNone(marker_error)
                                     self.assertEqual(exited.code, 1)
                     self.assertEqual(len(self.pinned), 1)
-                    self.assertIn((self.pinned[0].pidfd, pin_file), closed)
+                    pinned_file = (self.pinned[0].pidfd, pin_file)
+                    self.assertIn(pinned_file, closed)
+                    if detach:
+                        self.assertEqual(at_console, [])
+                    else:
+                        self.assertEqual(len(at_console), 1)
+                        self.assertIn(pinned_file, at_console[0])
 
     def test_up_shows_its_output_before_it_waits_for_the_lock(self):
         # Regression test: "Starting", which up printed with a flush before
