@@ -71,10 +71,12 @@ HOST_UID_MAX = 60000
 HOST_UID_PATTERN = re.compile(r"[1-9][0-9]{0,4}")
 # SANDY_E2E_BASE_IMAGE selects the base image of every build (Sandy reads it as
 # SANDY_BOOTSTRAP_BASE), such as ubuntu:26.04. Unset: Sandy's default image.
+# Sandy accepts only ^[a-z][a-z0-9._:-]{0,127}$ (_validate_image_name), and it
+# checks the value only when a later case runs it. So the runner accepts only
+# NAME:TAG values that Sandy accepts too: lowercase, no '/', a letter first, and
+# at most 128 characters.
 BASE_IMAGE_VARIABLE = "SANDY_E2E_BASE_IMAGE"
-BASE_IMAGE_PATTERN = re.compile(
-    r"[a-z0-9][a-z0-9._/-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
-)
+BASE_IMAGE_PATTERN = re.compile(r"[a-z][a-z0-9._-]{0,62}:[a-z0-9][a-z0-9._-]{0,63}")
 # Scratch file systems that a case mounts on a directory of its run root.
 SCRATCH_FILESYSTEMS = ("ramfs", "tmpfs")
 MOUNTINFO = Path("/proc/self/mountinfo")
@@ -219,8 +221,8 @@ def parse_base_image(value: str | None) -> str | None:
         return None
     if not BASE_IMAGE_PATTERN.fullmatch(value):
         raise E2EFailure(
-            f"Invalid {BASE_IMAGE_VARIABLE} {value!r}: use NAME:TAG, such as "
-            "ubuntu:26.04"
+            f"Invalid {BASE_IMAGE_VARIABLE} {value!r}: use a lowercase NAME:TAG "
+            "without '/', such as ubuntu:26.04"
         )
     return value
 

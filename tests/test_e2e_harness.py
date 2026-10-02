@@ -48,6 +48,7 @@ from tests.e2e.test_confinement import (
     _entry_failure_reason,
     _has_payload,
     _hold_payload_at_fork,
+    _load_sandy_module,
     _machined_leader,
     _open_scope_process,
     _Session,
@@ -1307,14 +1308,23 @@ class EnvironmentSettingTests(unittest.TestCase):
     def test_base_image_is_none_when_unset(self):
         self.assertIsNone(parse_base_image(None))
 
+    ACCEPTED_BASE_IMAGES = (
+        "ubuntu:26.04",
+        "ubuntu:noble",
+        "debian:trixie-slim",
+        "a:1",
+        # 128 characters, the most that Sandy accepts.
+        "a" * 63 + ":" + "1" * 64,
+    )
+    # Sandy rejects these three too, but only when a case builds.
+    SANDY_REJECTED_BASE_IMAGES = (
+        "docker.io/library/debian:trixie",
+        "1abc:2",
+        "ubuntu:Noble",
+    )
+
     def test_base_image_accepts_name_and_tag(self):
-        for value in (
-            "ubuntu:26.04",
-            "ubuntu:noble",
-            "debian:trixie-slim",
-            "docker.io/library/debian:trixie",
-            "a:1",
-        ):
+        for value in self.ACCEPTED_BASE_IMAGES:
             with self.subTest(value=value):
                 self.assertEqual(parse_base_image(value), value)
 
@@ -1331,13 +1341,28 @@ class EnvironmentSettingTests(unittest.TestCase):
             "ubuntu:26.04@sha256:abc",
             "-ubuntu:1",
             "ubuntu:-1",
-            "a" * 65 + ":1",
+            "a" * 64 + ":1",
             "a:" + "1" * 65,
+            "a" * 63 + ":" + "1" * 65,
             "ubuntu:26.04:extra",
+            *self.SANDY_REJECTED_BASE_IMAGES,
         ):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(E2EFailure, BASE_IMAGE_VARIABLE):
                     parse_base_image(value)
+
+    def test_base_image_accepts_only_what_sandy_accepts(self):
+        # Regression test: the runner accepted a slash, a digit first, and an
+        # uppercase tag. Sandy rejects them, but only when a later case builds,
+        # after the run has made host changes. Nothing is mocked: this is
+        # Sandy's own check.
+        validate = _load_sandy_module()._validate_image_name
+        for value in self.ACCEPTED_BASE_IMAGES:
+            with self.subTest(value=value):
+                self.assertTrue(validate(value))
+        for value in self.SANDY_REJECTED_BASE_IMAGES:
+            with self.subTest(value=value):
+                self.assertFalse(validate(value))
 
     def test_context_reads_the_settings_and_chowns_the_directories(self):
         # Mocks: os.chown (the test is not root). The run root is real.
@@ -1905,6 +1930,7 @@ class RunnerTests(unittest.TestCase):
             (HOST_UID_VARIABLE, "60001"),
             (BASE_IMAGE_VARIABLE, "ubuntu"),
             (BASE_IMAGE_VARIABLE, "ubuntu:26.04;id"),
+            (BASE_IMAGE_VARIABLE, "docker.io/library/debian:trixie"),
         ):
             with self.subTest(variable=variable, value=value):
                 with self.runner_environment(**{variable: value}):

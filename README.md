@@ -824,10 +824,11 @@ Two optional environment variables choose the host user and the image:
   cases fail for a map that swaps the uid and the gid, or that keeps a host id.
   With the default image, set it to 1000 to test a host user that has the ids
   of the container user.
-- `SANDY_E2E_BASE_IMAGE` is a base image, for example `ubuntu:26.04`. The
-  runner passes it to Sandy as `SANDY_BOOTSTRAP_BASE`. Without it, the suite
-  uses Sandy's default base image. In the Ubuntu 26.04 image, uid 1000 is
-  `ubuntu`, and `developer` has uid 1001.
+- `SANDY_E2E_BASE_IMAGE` is a base image, for example `ubuntu:26.04`: a
+  lowercase NAME:TAG without `/`, which Sandy accepts. The runner passes it to
+  Sandy as `SANDY_BOOTSTRAP_BASE`. Without it, the suite uses Sandy's default
+  base image. In the Ubuntu 26.04 image, uid 1000 is `ubuntu`, and `developer`
+  has uid 1001.
 
 The runner rejects a malformed value before it creates anything. For example:
 
