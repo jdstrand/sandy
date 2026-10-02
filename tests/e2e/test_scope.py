@@ -911,7 +911,7 @@ def test_main(context: E2EContext) -> None:
         )
         assert_contains(refused, "update --shared cannot be used with --container")
         refused = context.sandy(["update", "-m", "2g"], name=second, expected=1)
-        assert_contains(refused, "--memory need --shared")
+        assert_contains(refused, "--memory needs --shared")
         _check_group_limits(context, None, changed)
         reset = context.sandy(["update", "--shared", "--reset"])
         assert_not_contains(reset, "(saved)")

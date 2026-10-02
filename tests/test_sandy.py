@@ -17469,7 +17469,7 @@ class UpdateCommandTests(unittest.TestCase):
             ({}, "E: update needs --pids-limit, or --shared to change the limits"),
             (
                 {"memory": GIB, "pids_limit": 5},
-                "E: --memory need --shared: a container has no CPU or memory limit "
+                "E: --memory needs --shared: a container has no CPU or memory limit "
                 "of its own",
             ),
             (

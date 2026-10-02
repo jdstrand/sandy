@@ -9861,8 +9861,9 @@ class Sandy:
             if given
         ]
         if shared_only:
+            verb = "needs" if len(shared_only) == 1 else "need"
             print(
-                f"E: {', '.join(shared_only)} need --shared: a container has "
+                f"E: {', '.join(shared_only)} {verb} --shared: a container has "
                 "no CPU or memory limit of its own"
             )
             sys.exit(1)
