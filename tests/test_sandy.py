@@ -5293,8 +5293,9 @@ class EntryHelperTests(unittest.TestCase):
 
     def test_read_child_pids_reads_any_size_one_chunk_at_a_time(self):
         # Regression test: the list had a 1 MiB limit, and the Leader's list
-        # holds every orphan of its container. Entries of 1 to 7 digits, so
-        # that chunk ends split entries; more than 1 MiB in all.
+        # holds every orphan of its container. Entries of 1 to 6 digits, so
+        # that chunk ends split entries; more than 1 MiB in all. The next
+        # test has entries of 7 digits.
         pids = range(1, 200000)
         many = b"".join(b"%d " % pid for pid in pids)
         self.assertGreater(len(many), 1048576)
