@@ -3186,7 +3186,8 @@ ATTACH_LEAF_POLL_INTERVAL: Final = 0.02
 CGROUP_EVENTS_MAX_BYTES: Final = 4096
 # The up-console marker: an empty cgroup in the scope of a container that up
 # started without -d. It exists from the start of up until the console of that
-# up exits or hangs up. While it exists, no attach exit stops the container.
+# up ends, in any way (see _exec). While it exists, no attach exit stops the
+# container.
 # up creates it under the lifecycle lock before any attach can exist.
 UP_CONSOLE_CGROUP: Final = "up-console"
 UP_CONSOLE_TIMEOUT: Final = 5
@@ -8165,61 +8166,76 @@ class Sandy:
         interactive login shell so that startup files execute only once
         (mirrors `ssh -tt` behaviour).
         """
-        container_environment = _container_environment(self.user, self.user_home)
-
-        leader = self._is_container_running()
-        if not leader:
-            print(f"E: Container '{self.container}' not found or not running")
-            sys.exit(1)
-
-        if not login_shell and not command:
-            print("E: Command required for container execution")
-            sys.exit(1)
-
-        exec_cmd = "exec bash --login" if login_shell else str(command)
+        # With console=True, this is the console of up without -d. Each way
+        # out ends the console: a hangup only removes the up-console marker,
+        # and each other way out is a console exit, also when the console did
+        # not start. A marker that stayed would keep the container running
+        # after its last attach.
+        console_ended = not console
         try:
-            request = self._entry_request(
-                leader,
-                self.user,
-                self.user_home,
-                ENTRY_KIND_TTY,
-                exec_cmd,
-                use_workspace=True,
-            )
-        except ValueError as exc:
-            print(f"E: Invalid container entry: {_terminal_safe_repr(str(exc))}")
-            sys.exit(1)
+            container_environment = _container_environment(self.user, self.user_home)
 
-        events_before = _container_memory_events(self.container)
-        try:
-            with self._entry_helper_command(request) as (argv, script_fd):
-                with _attach_hangup_handlers():
-                    # The helper runs the command through script, which
-                    # allocates a terminal from the container's devpts
-                    # instance.
-                    status = self._run_container_interactive(
-                        argv,
-                        environment=container_environment,
-                        pass_fds=(script_fd,),
-                    )
-        except _AttachHangup as hangup:
-            # Loss of the terminal ends only this attach; the attach leaf is
-            # already removed. It never stops the container.
-            if console:
-                self._end_up_console()
-            sys.exit(128 + hangup.signum)
-        except _EntrySetupError as exc:
-            print(
-                "E: Could not prepare the container entry: "
-                f"{_terminal_safe_repr(str(exc))}"
-            )
-            if console:
-                # The console did not start; handle it as a console exit.
+            leader = self._is_container_running()
+            if not leader:
+                print(f"E: Container '{self.container}' not found or not running")
+                sys.exit(1)
+
+            if not login_shell and not command:
+                print("E: Command required for container execution")
+                sys.exit(1)
+
+            exec_cmd = "exec bash --login" if login_shell else str(command)
+            try:
+                request = self._entry_request(
+                    leader,
+                    self.user,
+                    self.user_home,
+                    ENTRY_KIND_TTY,
+                    exec_cmd,
+                    use_workspace=True,
+                )
+            except ValueError as exc:
+                print(f"E: Invalid container entry: {_terminal_safe_repr(str(exc))}")
+                sys.exit(1)
+
+            events_before = _container_memory_events(self.container)
+            try:
+                with self._entry_helper_command(request) as (argv, script_fd):
+                    with _attach_hangup_handlers():
+                        # The helper runs the command through script, which
+                        # allocates a terminal from the container's devpts
+                        # instance.
+                        status = self._run_container_interactive(
+                            argv,
+                            environment=container_environment,
+                            pass_fds=(script_fd,),
+                        )
+            except _AttachHangup as hangup:
+                # Loss of the terminal ends only this attach; the attach leaf
+                # is already removed. It never stops the container.
+                if console:
+                    console_ended = True
+                    self._end_up_console()
+                sys.exit(128 + hangup.signum)
+            except _EntrySetupError as exc:
+                print(
+                    "E: Could not prepare the container entry: "
+                    f"{_terminal_safe_repr(str(exc))}"
+                )
+                if console:
+                    # The console did not start; handle it as a console exit.
+                    console_ended = True
+                    self._stop_if_last_attach(console=True)
+                sys.exit(1)
+            self._report_oom_kills(events_before)
+            console_ended = True
+            self._stop_if_last_attach(console=console)
+            return status
+        finally:
+            if not console_ended:
+                # For example: a machine query that failed or did not answer,
+                # an invalid entry, a Ctrl-C, or another error.
                 self._stop_if_last_attach(console=True)
-            sys.exit(1)
-        self._report_oom_kills(events_before)
-        self._stop_if_last_attach(console=console)
-        return status
 
     def _report_oom_kills(self, before: Optional[MemoryEvents]) -> None:
         """Tell the user when the kernel ended processes for lack of memory.

@@ -17959,6 +17959,112 @@ class AttachLifecycleTests(unittest.TestCase):
                 else:
                     rule.assert_not_called()
 
+    def test_each_other_end_of_the_up_console_is_a_console_exit(self):
+        # Regression test: when the console of up without -d ended in another
+        # way than an exit, a hangup, or an entry setup error, the up-console
+        # marker stayed, and the container never stopped at its last attach
+        # exit. Mocks: the machine query, the helper command, the session,
+        # the end after a hangup, and the last-attach rule.
+        @contextmanager
+        def helper_command(request):
+            yield ["helper"], 5
+
+        no_answer = subprocess.TimeoutExpired(["machinectl"], 3)
+        failed = sandy._MachineQueryError("ai-dev", "Connection refused")
+        helper_error = OSError(errno.EMFILE, "Too many open files")
+        interrupt = KeyboardInterrupt()
+        # (name, leader, query error, helper error, session error, expected)
+        cases: tuple[
+            tuple[
+                str,
+                str | None,
+                BaseException | None,
+                BaseException | None,
+                BaseException | None,
+                BaseException | type[BaseException],
+            ],
+            ...,
+        ] = (
+            ("no answer", None, no_answer, None, None, no_answer),
+            ("failed query", None, failed, None, None, failed),
+            ("not running", None, None, None, None, SystemExit),
+            ("invalid entry", "abc", None, None, None, SystemExit),
+            ("helper error", "123", None, helper_error, None, helper_error),
+            ("interrupt", "123", None, None, interrupt, interrupt),
+        )
+        for name, leader, query_error, helper_failure, session_error, expected in cases:
+            for console in (True, False):
+                with self.subTest(name=name, console=console):
+                    instance = make_sandy()
+                    instance.workspace = None
+                    with patch.object(
+                        instance,
+                        "_is_container_running",
+                        side_effect=query_error,
+                        return_value=leader,
+                    ), patch.object(
+                        instance,
+                        "_entry_helper_command",
+                        side_effect=helper_failure or helper_command,
+                    ), patch.object(
+                        instance,
+                        "_run_container_interactive",
+                        side_effect=session_error,
+                        return_value=0,
+                    ), patch.object(
+                        instance, "_end_up_console"
+                    ) as end, patch.object(
+                        instance, "_stop_if_last_attach"
+                    ) as rule:
+                        with captured_output():
+                            with self.assertRaises(BaseException) as raised:
+                                instance._exec(None, login_shell=True, console=console)
+                    if isinstance(expected, BaseException):
+                        self.assertIs(raised.exception, expected)
+                    else:
+                        self.assertIsInstance(raised.exception, expected)
+                    end.assert_not_called()
+                    if console:
+                        rule.assert_called_once_with(console=True)
+                    else:
+                        rule.assert_not_called()
+
+    def test_up_console_exit_and_hangup_end_the_console_once(self):
+        # Mocks: as above. A normal exit is one console exit. A hangup only
+        # removes the marker, so no stop follows it.
+        @contextmanager
+        def helper_command(request):
+            yield ["helper"], 5
+
+        hangup = sandy._AttachHangup(sandy.signal.SIGHUP)
+        for name, session_error, rule_calls, end_calls in (
+            ("exit", None, [call(console=True)], 0),
+            ("hangup", hangup, [], 1),
+        ):
+            with self.subTest(name=name):
+                instance = make_sandy()
+                instance.workspace = None
+                with patch.object(
+                    instance, "_is_container_running", return_value="123"
+                ), patch.object(
+                    instance, "_entry_helper_command", side_effect=helper_command
+                ), patch.object(
+                    instance,
+                    "_run_container_interactive",
+                    side_effect=session_error,
+                    return_value=0,
+                ), patch.object(
+                    instance, "_end_up_console"
+                ) as end, patch.object(
+                    instance, "_stop_if_last_attach"
+                ) as rule:
+                    try:
+                        instance._exec(None, login_shell=True, console=True)
+                    except SystemExit:
+                        pass
+                self.assertEqual(rule.call_args_list, rule_calls)
+                self.assertEqual(end.call_count, end_calls)
+
 
 class OomReportTests(unittest.TestCase):
     """memory.events of the scope and the slice, and the OOM kill report.
