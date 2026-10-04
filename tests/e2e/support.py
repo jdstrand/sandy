@@ -42,8 +42,9 @@ PORT_LOCK = CACHE_DIR / "port_mappings.lock"
 LIFECYCLE_LOCK = CACHE_DIR / "lifecycle.lock"
 SHARED_LIMITS = CACHE_DIR / "shared_limits.json"
 SHARED_LIMITS_LOCK = CACHE_DIR / "shared_limits.lock"
+ADDRESSES_LOCK = CACHE_DIR / "addresses.lock"
 # Product code never removes these stable lock inodes.
-PERSISTENT_LOCKS = (PORT_LOCK, LIFECYCLE_LOCK, SHARED_LIMITS_LOCK)
+PERSISTENT_LOCKS = (PORT_LOCK, LIFECYCLE_LOCK, SHARED_LIMITS_LOCK, ADDRESSES_LOCK)
 # Nor the saved shared limits, which are configuration (rm --cache keeps them).
 PERSISTENT_FILES = (*PERSISTENT_LOCKS, SHARED_LIMITS)
 # up waits for the lifecycle lock for at most 10 seconds (LIFECYCLE_LOCK_TIMEOUT
@@ -626,11 +627,14 @@ class E2EContext:
         *,
         workspace: str | None = None,
         shared: str | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> tuple[subprocess.Popen[bytes], Path]:
         """Start up of name in the background; return the process and its log.
 
         workspace and shared name other directories, relative to the run root
-        where sandy runs, as for sandy(). The caller waits for the process.
+        where sandy runs, as for sandy(). environment replaces the safe
+        environment, as for run(): a build passes minimal_environment(). The
+        caller waits for the process.
         """
         if not NAME_PATTERN.fullmatch(name):
             raise E2EFailure(f"Refusing unsafe container name: {name!r}")
@@ -666,7 +670,7 @@ class E2EContext:
                     stdout=stream,
                     stderr=subprocess.STDOUT,
                     cwd=self.root,
-                    env=self.safe_environment(),
+                    env=dict(environment or self.safe_environment()),
                 )
         finally:
             signal.signal(

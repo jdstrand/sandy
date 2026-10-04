@@ -2847,6 +2847,15 @@ class FilesystemSafetyTests(unittest.TestCase):
 
 
 class GuestFileTests(unittest.TestCase):
+    def setUp(self):
+        # The address lock is in the cache directory of the host. Mock: the
+        # lock, a MagicMock context manager. The test of two builds uses the
+        # real lock on a temporary file.
+        self.real_addresses_lock = sandy._addresses_lock
+        patcher = patch.object(sandy, "_addresses_lock")
+        self.addresses_lock = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_create_guest_files_without_network(self):
         writes = []
 
@@ -3245,6 +3254,175 @@ class GuestFileTests(unittest.TestCase):
                             with self.assertRaisesRegex(PermissionError, error):
                                 sandy._read_machine_container_ip(temp_dir)
                         self.assertEqual(open_descriptors(), before)
+
+    def test_address_scan_holds_the_lock_until_its_init_script_exists(self):
+        # Mocks: the lock, the scan, and the writes, which record events.
+        # The scan, the choice, and the write of /init.sh are one step under
+        # the lock; the messages come after the release.
+        events: list[str] = []
+        lock = self.addresses_lock.return_value
+        lock.__enter__.side_effect = lambda *_: events.append("lock")
+        lock.__exit__.side_effect = lambda *_: events.append(
+            f"unlock, output: {stdout.getvalue()!r}"
+        )
+
+        def read_address(path: str) -> str | None:
+            events.append(f"scan {Path(path).name}")
+            raise OSError("unreadable")
+
+        def record_write(path: str, _content: str, mode: int = 0o600) -> None:
+            events.append(f"write {path}")
+
+        def exists(path: str) -> bool:
+            return path == sandy.SYSTEMD_MACHINES
+
+        with patch.object(sandy.os.path, "exists", side_effect=exists):
+            with patch.object(
+                sandy.glob, "glob", return_value=["/var/lib/machines/sandy.old"]
+            ):
+                with patch.object(
+                    sandy, "_read_machine_container_ip", side_effect=read_address
+                ):
+                    with patch.object(sandy, "_write", side_effect=record_write):
+                        with captured_output() as (stdout, _):
+                            sandy._create_guest_files(
+                                "/machine", "test-box", "10.20.30.0/24", "10.20.30.1"
+                            )
+        self.assertEqual(
+            events,
+            [
+                "write /machine/etc/hosts",
+                "write /machine/etc/localtime",
+                "lock",
+                "scan sandy.old",
+                "write /machine/init.sh",
+                "unlock, output: 'I: Creating /etc/hosts with:\\n127.0.0.1 "
+                "localhost test-box\\n\\nI: Creating empty /etc/localtime in guest\\n'",
+            ],
+        )
+        output = stdout.getvalue()
+        self.assertLess(
+            output.index("W: Did not reserve the address in "),
+            output.index("I: Creating /init.sh with:"),
+        )
+
+    def test_two_builds_of_different_names_get_different_addresses(self):
+        # Regression test: no lock covered the scan and the write of /init.sh,
+        # so two builds of different names could both find .10 free. Build a
+        # waits in the lock before its write; build b must wait for the lock,
+        # then find the address of a. Mocks: SYSTEMD_MACHINES (a temporary
+        # directory), _open_verified_dir (no ownership check),
+        # _open_stable_lock_file (a temporary lock file), and _write (it
+        # writes the file; a waits first). The flock and the scan are real.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            machines = root / "machines"
+            (machines / "sandy.__cache").mkdir(parents=True)
+            lock_file = root / "addresses.lock"
+            images = {}
+            for name in ("a", "b"):
+                images[name] = machines / f"sandy.{name}"
+                (images[name] / "etc").mkdir(parents=True)
+                (images[name] / "etc" / "localtime").write_text("", encoding="utf-8")
+            a_in_lock = threading.Event()
+            a_may_write = threading.Event()
+
+            def open_lock(path: str) -> io.TextIOWrapper:
+                self.assertEqual(
+                    path,
+                    os.path.join(str(machines), "sandy.__cache", "addresses.lock"),
+                )
+                return open(lock_file, "a+", encoding="utf-8")
+
+            def open_machine(path: str) -> int:
+                return os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+
+            def write(path: str, content: str, mode: int = 0o600) -> None:
+                if path == str(images["a"] / "init.sh"):
+                    a_in_lock.set()
+                    a_may_write.wait(10)
+                Path(path).write_text(content, encoding="utf-8")
+                os.chmod(path, mode)
+
+            errors: list[BaseException] = []
+
+            def build(name: str) -> None:
+                try:
+                    sandy._create_guest_files(
+                        str(images[name]), name, "10.20.30.0/24", "10.20.30.1"
+                    )
+                except BaseException as exc:  # the test reports each error
+                    errors.append(exc)
+
+            builds = {
+                name: threading.Thread(target=build, args=(name,), daemon=True)
+                for name in images
+            }
+            with patch.object(sandy, "_addresses_lock", self.real_addresses_lock):
+                with patch.object(sandy, "SYSTEMD_MACHINES", str(machines)):
+                    with patch.object(
+                        sandy, "_open_stable_lock_file", side_effect=open_lock
+                    ):
+                        with patch.object(
+                            sandy, "_open_verified_dir", side_effect=open_machine
+                        ):
+                            with patch.object(sandy, "_write", side_effect=write):
+                                with captured_output():
+                                    builds["a"].start()
+                                    self.assertTrue(a_in_lock.wait(10))
+                                    builds["b"].start()
+                                    builds["b"].join(1.0)
+                                    b_did_not_wait = not builds["b"].is_alive()
+                                    a_may_write.set()
+                                    for thread in builds.values():
+                                        thread.join(10)
+            addresses = {
+                name: (image / "init.sh").read_text(encoding="utf-8")
+                for name, image in images.items()
+            }
+        self.assertEqual(errors, [])
+        self.assertFalse(b_did_not_wait, "build b did not wait for the address lock")
+        self.assertIn('CONTAINER_IP="10.20.30.10"', addresses["a"])
+        self.assertIn('CONTAINER_IP="10.20.30.11"', addresses["b"])
+
+    def test_addresses_lock_holds_an_exclusive_flock_on_its_stable_file(self):
+        # Mocks: the stable lock file and flock, which record their calls.
+        handle = MagicMock()
+        handle.fileno.return_value = 9
+        with patch.object(
+            sandy, "_open_stable_lock_file", return_value=handle
+        ) as opened, patch.object(sandy.fcntl, "flock") as flock:
+            with self.real_addresses_lock():
+                self.assertEqual(flock.call_args_list, [call(9, sandy.fcntl.LOCK_EX)])
+                handle.close.assert_not_called()
+        opened.assert_called_once_with(
+            os.path.join(sandy.SYSTEMD_MACHINES, "sandy.__cache", "addresses.lock")
+        )
+        self.assertEqual(
+            flock.call_args_list,
+            [call(9, sandy.fcntl.LOCK_EX), call(9, sandy.fcntl.LOCK_UN)],
+        )
+        handle.close.assert_called_once_with()
+
+        # An error of the flock closes the file; an error of the unlock does
+        # not hide the result of the step.
+        handle.reset_mock()
+        with patch.object(
+            sandy, "_open_stable_lock_file", return_value=handle
+        ), patch.object(sandy.fcntl, "flock", side_effect=OSError(errno.EINTR, "x")):
+            with self.assertRaises(OSError):
+                with self.real_addresses_lock():
+                    self.fail("the step ran without the lock")
+        handle.close.assert_called_once_with()
+        handle.reset_mock()
+        with patch.object(
+            sandy, "_open_stable_lock_file", return_value=handle
+        ), patch.object(
+            sandy.fcntl, "flock", side_effect=[None, OSError(errno.EBADF, "x")]
+        ):
+            with self.real_addresses_lock():
+                pass
+        handle.close.assert_called_once_with()
 
 
 class SandyInitializationTests(unittest.TestCase):
@@ -10752,8 +10930,10 @@ class CacheTests(unittest.TestCase):
             # inode is permanent.
             shared_limits = cache / sandy.SHARED_LIMITS_FILENAME
             shared_limits_lock = cache / sandy.SHARED_LIMITS_LOCK_FILENAME
-            # The up lock of each container name is permanent too.
+            # The up lock of each container name is permanent too, and so is
+            # the lock of the addresses.
             up_lock = cache / "up-ai-dev.lock"
+            addresses_lock = cache / sandy.ADDRESSES_LOCK_FILENAME
             look_alike = cache / "up-Bad.lock"
             archive = cache / "cache.tar"
             directory = cache / "partial"
@@ -10765,6 +10945,7 @@ class CacheTests(unittest.TestCase):
             shared_limits.write_text("{}\n")
             shared_limits_lock.write_text("")
             up_lock.write_text("")
+            addresses_lock.write_text("")
             look_alike.write_text("")
             archive.write_text("archive")
             directory.mkdir()
@@ -10785,6 +10966,7 @@ class CacheTests(unittest.TestCase):
             self.assertTrue(shared_limits.exists())
             self.assertTrue(shared_limits_lock.exists())
             self.assertTrue(up_lock.exists())
+            self.assertTrue(addresses_lock.exists())
             self.assertFalse(look_alike.exists())
             self.assertFalse(archive.exists())
             self.assertFalse(state_alias.exists())

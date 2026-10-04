@@ -62,6 +62,9 @@ PORT_MAPPINGS_LOCK_FILENAME: Final = "port_mappings.lock"
 # decisions. It is held only for short sections, never for a container start.
 LIFECYCLE_LOCK_FILENAME: Final = "lifecycle.lock"
 LIFECYCLE_LOCK_TIMEOUT: Final = 10
+# A new image reserves its address: it reads the /init.sh of the other images
+# and writes its own. This lock, in the same directory, makes that one step.
+ADDRESSES_LOCK_FILENAME: Final = "addresses.lock"
 # Each container name has its own up lock, "up-<name>.lock", in the same
 # directory (see _acquire_up_lock).
 UP_LOCK_FILENAME_PREFIX: Final = "up-"
@@ -3101,6 +3104,30 @@ def _lifecycle_lock(timeout: float = LIFECYCLE_LOCK_TIMEOUT) -> Iterator[None]:
         lock_handle.close()
 
 
+@contextmanager  # ensures flock acquisition/release is paired at the call site
+def _addresses_lock() -> Iterator[None]:
+    """Hold the lock of the container addresses exclusively.
+
+    The cache directory must already exist: up takes its up lock there
+    first. A holder only reads the /init.sh files and writes one, and no
+    holder of the lifecycle lock waits for this lock, so the wait has no
+    limit.
+    """
+    lock_path = os.path.join(SYSTEMD_MACHINES, "sandy.__cache", ADDRESSES_LOCK_FILENAME)
+    lock_handle = _open_stable_lock_file(lock_path)
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_handle.close()
+
+
 def _up_lock_filename(machine_name: str) -> str:
     """Return the name of the up lock file of a container name."""
     if not _validate_container_name(machine_name):
@@ -4973,54 +5000,56 @@ def _create_guest_files(
             )
             return
 
-        # Find used IP addresses by scanning existing init.sh files. Root in
-        # each container controls its image, so read each file through the
-        # pinned image root, with no link and with a size limit. A file that
-        # is not safe to read reserves no address.
-        used_ips = set()
-        if os.path.exists(SYSTEMD_MACHINES):
-            for container_dir in glob.glob(f"{SYSTEMD_MACHINES}/sandy.*"):
-                # Skip cache directory
-                if container_dir.endswith(".__cache"):
-                    continue
+        # Hold the address lock from the scan until the new /init.sh exists,
+        # so that the scan of another build finds this address. The messages
+        # wait until the release: a stopped terminal must not hold the lock.
+        messages: list[str] = []
+        init_script_content: Optional[str] = None
+        with _addresses_lock():
+            # Find used IP addresses by scanning existing init.sh files. Root
+            # in each container controls its image, so read each file through
+            # the pinned image root, with no link and with a size limit. A
+            # file that is not safe to read reserves no address.
+            used_ips = set()
+            if os.path.exists(SYSTEMD_MACHINES):
+                for container_dir in glob.glob(f"{SYSTEMD_MACHINES}/sandy.*"):
+                    # Skip cache directory
+                    if container_dir.endswith(".__cache"):
+                        continue
 
-                try:
-                    address = _read_machine_container_ip(container_dir)
-                except (OSError, ValueError) as exc:
-                    init_script = os.path.join(container_dir, "init.sh")
-                    print(
-                        "W: Did not reserve the address in "
-                        f"{_terminal_safe_repr(init_script)}: "
-                        f"{_terminal_safe_repr(str(exc))}"
-                    )
-                    continue
-                if address is not None:
-                    used_ip = ipaddress.ip_address(address)
-                    if used_ip in network:
-                        used_ips.add(used_ip)
+                    try:
+                        address = _read_machine_container_ip(container_dir)
+                    except (OSError, ValueError) as exc:
+                        init_script = os.path.join(container_dir, "init.sh")
+                        messages.append(
+                            "W: Did not reserve the address in "
+                            f"{_terminal_safe_repr(init_script)}: "
+                            f"{_terminal_safe_repr(str(exc))}"
+                        )
+                        continue
+                    if address is not None:
+                        used_ip = ipaddress.ip_address(address)
+                        if used_ip in network:
+                            used_ips.add(used_ip)
 
-        # Find first available IP starting from .10
-        container_ip = None
-        for i in range(
-            10, 254
-        ):  # Skip .1-.9 (reserved for gateway/infrastructure), .255 (broadcast)
-            candidate_ip = network.network_address + i
-            if candidate_ip not in used_ips and candidate_ip != ipaddress.ip_address(
-                gateway
-            ):
-                container_ip = str(candidate_ip)
-                break
+            # Find first available IP starting from .10
+            container_ip = None
+            for i in range(
+                10, 254
+            ):  # Skip .1-.9 (reserved for gateway/infrastructure), .255 (broadcast)
+                candidate_ip = network.network_address + i
+                if (
+                    candidate_ip not in used_ips
+                    and candidate_ip != ipaddress.ip_address(gateway)
+                ):
+                    container_ip = str(candidate_ip)
+                    break
 
-        if container_ip is None:
-            print(
-                "W: No available IP addresses in network range, skipping /init.sh creation"
-            )
-            return
-
-        init_script_path = os.path.join(mdir, "init.sh")
-        # Extract network prefix (e.g., "24" from the CIDR)
-        prefix_len = network.prefixlen
-        init_script_content = f"""#!/bin/sh
+            if container_ip is not None:
+                init_script_path = os.path.join(mdir, "init.sh")
+                # Extract network prefix (e.g., "24" from the CIDR)
+                prefix_len = network.prefixlen
+                init_script_content = f"""#!/bin/sh
 set -e
 # Container network initialization script
 # Generated automatically by sandy
@@ -5051,8 +5080,16 @@ ip route add default via ${{GATEWAY_IP}}
 rm -f -- /etc/resolv.conf
 printf '%s\\n' 'nameserver 1.1.1.1' 'nameserver 1.0.0.1' > /etc/resolv.conf
 """
+                _write(init_script_path, init_script_content, mode=0o0755)
+
+        for message in messages:
+            print(message)
+        if init_script_content is None:
+            print(
+                "W: No available IP addresses in network range, skipping /init.sh creation"
+            )
+            return
         print(f"I: Creating /init.sh with:\n{init_script_content}")
-        _write(init_script_path, init_script_content, mode=0o0755)
 
 
 def _nft_port_rule_comment(container_name: str, proto: str, host_port: int) -> str:
@@ -7847,6 +7884,7 @@ class Sandy:
                 PORT_MAPPINGS_LOCK_FILENAME,
                 LIFECYCLE_LOCK_FILENAME,
                 SHARED_LIMITS_LOCK_FILENAME,
+                ADDRESSES_LOCK_FILENAME,
             ) or _is_up_lock_filename(entry):
                 # Each lock inode is permanent. Removing one could split
                 # queued and new processes across different locks.

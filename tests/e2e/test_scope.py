@@ -22,6 +22,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from tests.e2e.support import (
+    ADDRESSES_LOCK,
     LIFECYCLE_LOCK,
     PORT_LOCK,
     PORT_STATE,
@@ -54,8 +55,9 @@ SCOPE_MARKERS = ("mounts-pending", "up-console")
 REFUSED_UP_PORT = 18089
 # A FIFO that root in a container makes in its image, and links /init.sh to.
 INIT_FIFO = "e2e-init-fifo"
-# A lenient build from the cache takes about 20 seconds. A scan that blocks
-# on the FIFO must fail the case well before BUILD_TIMEOUT.
+# A lenient build from the cache takes about 20 seconds. A case that expects
+# one, for example with a scan that blocks on the FIFO, fails after this many
+# seconds, well before BUILD_TIMEOUT.
 INIT_SCAN_TIMEOUT = 300
 # The host port of an up that finds the port mapping lock busy.
 BUSY_LOCK_UP_PORT = 18090
@@ -1470,6 +1472,54 @@ def test_main(context: E2EContext) -> None:
         if not (SYSTEMD_MACHINES / f"sandy.{stuck}" / "etc").is_dir():
             raise E2EFailure("rm removed the image of the running container")
         context.remove_container(stuck, context.main_user)
+
+    with context.case("a new image reserves its address under the address lock"):
+        # No lock covered the scan of the other images and the write of the
+        # new /init.sh, so two builds of different names could get the same
+        # address. Hold that lock: the build must wait for it in flock(2),
+        # then end with an address that the main image does not have. Sandy
+        # makes the lock file; the case makes it when it is missing, so that
+        # the old code fails at the wait, not at the open.
+        lock_fd = os.open(
+            ADDRESSES_LOCK,
+            os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            context.register_container(context.scan_name, context.main_user)
+            build, log_path = context.start_up(
+                context.scan_name,
+                context.main_user,
+                ["up", "--build", "--detach", "--persistent", "--network", "lenient"],
+                "addresses",
+                environment=context.minimal_environment(),
+            )
+            try:
+                _wait_for(
+                    "the build waits for the address lock",
+                    lambda: waits_for_flock(build.pid, ADDRESSES_LOCK),
+                )
+            except E2EFailure:
+                if build.poll() is None:
+                    build.kill()
+                    build.wait(timeout=10)
+                raise
+        finally:
+            os.close(lock_fd)
+        try:
+            returncode = build.wait(timeout=INIT_SCAN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            build.kill()
+            build.wait(timeout=10)
+            raise E2EFailure("The build did not end after the lock release") from None
+        output = log_path.read_text(encoding="utf-8", errors="replace")
+        if returncode != 0:
+            raise E2EFailure(f"up --build exited {returncode}: {output[-2000:]}")
+        context.wait_for_machine(context.scan_name, running=True)
+        if _init_address(context.scan_name) == _init_address(name):
+            raise E2EFailure("The new image got the address of the main image")
+        context.remove_container(context.scan_name, context.main_user)
 
     with context.case("up -d is never stopped by an attach exit"):
         context.sandy(

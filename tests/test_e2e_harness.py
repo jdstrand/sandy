@@ -1452,6 +1452,20 @@ class SandyInvocationTests(unittest.TestCase):
             self.assertEqual(options["stderr"], subprocess.STDOUT)
             self.assertEqual(options["cwd"], context.root)
             self.assertEqual(options["env"], context.safe_environment())
+            # A build passes its own environment, for the cache key of the
+            # minimal setup script.
+            with patch("tests.e2e.support.subprocess.Popen") as build_popen:
+                context.start_up(
+                    "e2e-box",
+                    "developer",
+                    ["up", "--build"],
+                    "build",
+                    environment={"PATH": "/usr/bin", "SANDY_SETUP_SCRIPT": "/m.sh"},
+                )
+            self.assertEqual(
+                build_popen.call_args.kwargs["env"],
+                {"PATH": "/usr/bin", "SANDY_SETUP_SCRIPT": "/m.sh"},
+            )
             for name, log_name in (("box", "up"), ("e2e-box", "../up")):
                 with self.subTest(name=name, log_name=log_name):
                     with self.assertRaises(E2EFailure):
