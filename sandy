@@ -7,6 +7,7 @@ import errno
 import fcntl
 import glob
 import hashlib
+import io
 import json
 import ipaddress
 import os
@@ -28,7 +29,13 @@ import tempfile
 import threading
 import time
 import tty
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import (
+    ExitStack,
+    closing,
+    contextmanager,
+    nullcontext,
+    redirect_stdout,
+)
 from typing import (
     Any,
     Callable,
@@ -60,14 +67,14 @@ LIFECYCLE_LOCK_TIMEOUT: Final = 10
 UP_LOCK_FILENAME_PREFIX: Final = "up-"
 UP_LOCK_FILENAME_SUFFIX: Final = ".lock"
 LIFECYCLE_LOCK_RETRY_INTERVAL: Final = 0.05
-# Under the lifecycle lock, up waits for the port mapping lock for at most this
-# long to publish its ports (without -d, or with directories to mount), and so
-# does the stop after the last session. It stays below LIFECYCLE_LOCK_TIMEOUT,
-# the wait of each attach for the lifecycle lock. Without the lifecycle lock
-# (up -d with no directories to mount, down, rm), the wait has no limit. up
-# holds the port mapping lock until its supervisor starts; when the supervisor
-# does not start, up removes its ports before it releases the lock, with no
-# wait.
+# Under the lifecycle lock, each wait for the port mapping lock has this limit:
+# the publish of up (without -d, or with directories to mount), and the stop
+# after the last session. It stays below LIFECYCLE_LOCK_TIMEOUT, the wait of
+# each attach for the lifecycle lock. Without the lifecycle lock (up -d with no
+# directories to mount, down, rm), the wait has no limit. up holds the port
+# mapping lock from the publish until it has pinned its supervisor and made
+# the markers that it needs; when the start fails before that, up removes its
+# ports in that hold, with no wait.
 PORT_MAPPINGS_LOCK_TIMEOUT: Final = 5
 INIT_SCRIPT_MAX_BYTES: Final = 8192
 # The container payload (PID 2) is the image's bash, started through a symlink
@@ -267,6 +274,16 @@ def _finish_spinner_line(spinner_event: Optional[threading.Event], suffix: str =
 
     if spinner_event:
         spinner_event.set()
+
+
+def _write_held_output(held: io.StringIO) -> None:
+    """Write the output that was held back while a lock was held, once."""
+    text = held.getvalue()
+    held.seek(0)
+    held.truncate()
+    if text:
+        sys.stdout.write(text)
+        sys.stdout.flush()
 
 
 def _validate_env_var(
@@ -7257,7 +7274,8 @@ class Sandy:
         not lock again: a second flock(2) on a new open of the lock file would
         wait for that hold. Open the current state file only, because a write
         in the hold replaces it. up holds the lock from the publish of its
-        ports until its supervisor starts (see run_up).
+        ports until it has pinned its supervisor and made the markers that
+        it needs (see run_up).
         """
         if self._port_mapping_lock_holder == threading.get_ident():
             state_handle = _open_existing_managed_text_file(
@@ -9383,90 +9401,140 @@ class Sandy:
                 # Publish the ports only now. An up that the check above refuses
                 # then adds no rule for the container of another start. No
                 # container owns the port rules and state that up adds until
-                # the supervisor starts, and no _stop_failed_start removes
-                # them. So hold the port mapping lock from the publish until
-                # the supervisor starts. When it does not start, up removes
-                # them before it releases the lock: no other process finds
-                # them, and the removal does not wait for the lock again.
-                # Each attach waits for the lifecycle lock, so an up that holds
-                # it waits for the port mapping lock for at most
-                # PORT_MAPPINGS_LOCK_TIMEOUT. Without it, up holds only its up
-                # lock, which no process waits for, so up waits for the port
-                # mapping lock as long as it takes.
+                # the supervisor starts. So hold the port mapping lock from
+                # the publish until up has pinned the supervisor and made
+                # the markers that it needs. When the start fails before
+                # that, up removes the ports before it releases the lock: no
+                # other process finds them, and the removal does not wait for
+                # the lock again. Each attach waits for the lifecycle lock, so
+                # an up that holds it waits for the port mapping lock for at
+                # most PORT_MAPPINGS_LOCK_TIMEOUT. Without it, up holds only
+                # its up lock, which no process waits for, so up waits for the
+                # port mapping lock as long as it takes.
                 port_lock_timeout = PORT_MAPPINGS_LOCK_TIMEOUT if hold_lock else None
-                with ExitStack() as port_lock:
-                    if publish_ports:
-                        try:
-                            port_lock.enter_context(
-                                self._port_mapping_lock(
-                                    exclusive=True, timeout=port_lock_timeout
-                                )
-                            )
-                        except TimeoutError as exc:
-                            print(
-                                "E: Could not publish the ports of "
-                                f"'{self.container}': {exc}"
-                            )
-                            sys.exit(1)
-                    started = False
-                    try:
-                        if publish_ports:
-                            self._setup_port_forwarding_rules(init_container_ip)
-                        print(
-                            f"I: Starting '{self.container}'{mode} ", end="", flush=True
-                        )
-                        try:
-                            # The container inherits the OOM score adjustment.
-                            with _oom_score_adj_for_children(limits.oom_score_adj):
-                                supervisor = _run_secure_subprocess_popen(
-                                    scope_cmd,
-                                    start_new_session=True,
-                                    stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL,
-                                    env=container_environment,
-                                    pass_fds=tuple(runtime_fds),
-                                )
-                            # From now on, the stop of the container removes
-                            # the ports, or _stop_failed_start does.
-                            started = True
-                        except (OSError, ValueError) as exc:
-                            # The value could not be set, or the start failed;
-                            # the restore raises nothing. So no supervisor runs.
-                            _finish_spinner_line(spinner_line_event)
-                            print(
-                                f"E: Could not start '{self.container}': "
-                                f"{_terminal_safe_repr(str(exc))}"
-                            )
-                            sys.exit(1)
-                        finally:
-                            close_runtime_fds()
-                    finally:
-                        if publish_ports and not started:
-                            # This removal runs in the hold of the publish, so
-                            # it does not take the lock again.
-                            self._cleanup_port_mappings_for_container(self.container)
-                # Pin the supervisor before anything can reap it. The markers
-                # and the mounts go only into a scope that holds it: the
-                # scope of the name can be another start's.
+                # A terminal write can block, for example after the STOP
+                # character, and the lock would then stay held. So up holds
+                # back its output while it holds the lock, and writes it
+                # after the release.
+                held_output = io.StringIO()
                 try:
-                    pinned = _pin_supervisor(supervisor.pid)
-                    if mounts:
-                        _create_mounts_pending_marker(self.container, pinned)
-                    if not args.detach:
-                        _create_up_console_marker(self.container, pinned)
-                except (OSError, ValueError) as exc:
-                    _finish_spinner_line(spinner_line_event)
-                    print(
-                        f"E: Container '{self.container}' did not start: "
-                        f"{_terminal_safe_repr(str(exc))}"
-                    )
-                    self._stop_failed_start(supervisor)
-                    sys.exit(1)
+                    with ExitStack() as port_lock:
+                        if publish_ports:
+                            try:
+                                port_lock.enter_context(
+                                    self._port_mapping_lock(
+                                        exclusive=True, timeout=port_lock_timeout
+                                    )
+                                )
+                            except TimeoutError as exc:
+                                print(
+                                    "E: Could not publish the ports of "
+                                    f"'{self.container}': {exc}"
+                                )
+                                sys.exit(1)
+                            port_lock.enter_context(redirect_stdout(held_output))
+                        started = False
+                        try:
+                            if publish_ports:
+                                self._setup_port_forwarding_rules(init_container_ip)
+                            print(
+                                f"I: Starting '{self.container}'{mode} ",
+                                end="",
+                                flush=True,
+                            )
+                            try:
+                                # The container inherits the OOM score
+                                # adjustment.
+                                with _oom_score_adj_for_children(limits.oom_score_adj):
+                                    supervisor = _run_secure_subprocess_popen(
+                                        scope_cmd,
+                                        start_new_session=True,
+                                        stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                        env=container_environment,
+                                        pass_fds=tuple(runtime_fds),
+                                    )
+                                # From now on, the stop of the container
+                                # removes the ports, or _stop_failed_start
+                                # does.
+                                started = True
+                            except (OSError, ValueError) as exc:
+                                # The value could not be set, or the start
+                                # failed; the restore raises nothing. So no
+                                # supervisor runs.
+                                _finish_spinner_line(spinner_line_event)
+                                print(
+                                    f"E: Could not start '{self.container}': "
+                                    f"{_terminal_safe_repr(str(exc))}"
+                                )
+                                sys.exit(1)
+                            finally:
+                                close_runtime_fds()
+                        finally:
+                            if publish_ports and not started:
+                                # This removal runs in the hold of the
+                                # publish, so it does not take the lock
+                                # again.
+                                self._cleanup_port_mappings_for_container(
+                                    self.container
+                                )
+                        # Pin the supervisor before anything can reap it.
+                        # The markers and the mounts go only into a scope
+                        # that holds it: the scope of the name can be
+                        # another start's. This is still in the hold of the
+                        # publish.
+                        try:
+                            pinned = _pin_supervisor(supervisor.pid)
+                            if mounts:
+                                _create_mounts_pending_marker(self.container, pinned)
+                            if not args.detach:
+                                _create_up_console_marker(self.container, pinned)
+                        except BaseException as exc:
+                            failed = isinstance(exc, (OSError, ValueError))
+                            try:
+                                # The start failed after all. End the
+                                # "Starting" line and name the error first.
+                                # With ports, stdout still goes to the held
+                                # output, so these lines come before the
+                                # output of the removal, each on its own line.
+                                # Without ports, these writes go to the
+                                # terminal and can fail; the finally below
+                                # still stops the supervisor.
+                                _finish_spinner_line(spinner_line_event)
+                                if failed:
+                                    print(
+                                        f"E: Container '{self.container}' did "
+                                        f"not start: {_terminal_safe_repr(str(exc))}"
+                                    )
+                                # No container owns the ports yet. Remove them
+                                # in the hold, with no wait, so that no other
+                                # process finds them. Without ports there is
+                                # no hold, and the name has no port state: up
+                                # removed it at its start.
+                                if publish_ports:
+                                    self._cleanup_port_mappings_for_container(
+                                        self.container
+                                    )
+                            finally:
+                                # Release the lock, and only then stop the
+                                # supervisor, which can take
+                                # CONTAINER_STOP_TIMEOUT. The handler at the
+                                # end writes the held output after the stop.
+                                port_lock.close()
+                                self._stop_failed_start(supervisor, remove_ports=False)
+                            if not failed:
+                                raise
+                            sys.exit(1)
                 except BaseException:
-                    self._stop_failed_start(supervisor)
+                    # The start failed. Show its messages, then exit.
+                    _write_held_output(held_output)
                     raise
             try:
+                # The output of the start, which up held back while it held
+                # the port mapping lock. A write error stops the container
+                # below, as it does for each later write.
+                _write_held_output(held_output)
                 # Mount the workspace and shared directories as soon as the
                 # container has its payload. Until then, no attach works.
                 #
@@ -9574,10 +9642,13 @@ class Sandy:
             "keepalive payload"
         )
 
-    def _stop_failed_start(self, supervisor: subprocess.Popen) -> None:
+    def _stop_failed_start(
+        self, supervisor: subprocess.Popen, remove_ports: bool = True
+    ) -> None:
         """Stop a supervisor that this run started, then remove its port rules.
 
-        SIGTERM makes nspawn power off the container.
+        SIGTERM makes nspawn power off the container. With remove_ports
+        False, leave the port rules and state: the caller removed them.
         """
         if supervisor.poll() is None:
             supervisor.terminate()
@@ -9586,7 +9657,8 @@ class Sandy:
             except subprocess.TimeoutExpired:
                 supervisor.kill()
                 supervisor.wait()
-        self._cleanup_port_mappings_for_container(self.container)
+        if remove_ports:
+            self._cleanup_port_mappings_for_container(self.container)
 
     def run_rm(self, args, all=False, cache=False, network=False):
         """Remove container(s)"""

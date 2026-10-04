@@ -427,14 +427,18 @@ lifecycle lock, so it waits for the port mapping lock there for at most 5
 seconds. When that lock stays busy (for example, during `rm --cache`), `up`
 fails before it starts the container. `up -d` with no directories to mount
 takes no lifecycle lock, so it waits until the port mapping lock is free.
-`up` holds the port mapping lock from the publish until the container
-process starts. When that process does not start, `up` removes the ports
-before it releases the lock, so no other `up` finds them. The stop after the
-last session also waits for the port mapping lock under the lifecycle lock
-for at most 5 seconds, less than the 10 seconds that each attach waits for
-the lifecycle lock. When the port mapping lock stays busy for that time, the
-container keeps running with its ports (see `up` above). `down` and `rm`
-take no lifecycle lock, so they wait until the port mapping lock is free.
+`up` holds the port mapping lock from the publish until it has pinned the
+container process and made the markers that it needs in the scope of the
+container. When the start fails before that, `up` removes the ports before
+it releases the lock, so no other `up` finds them, and the removal does not
+wait for the lock. During that hold, `up` holds back its output and writes
+it after the release, so a stopped terminal cannot keep the lock held. The
+stop after the last session also waits for the port mapping lock under the
+lifecycle lock for at most 5 seconds, less than the 10 seconds that each
+attach waits for the lifecycle lock. When the port mapping lock stays busy
+for that time, the container keeps running with its ports (see `up`
+above). `down` and `rm` take no lifecycle lock, so they wait until the port
+mapping lock is free.
 
 
 ## Security

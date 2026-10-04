@@ -563,14 +563,27 @@ class E2EContext:
             *arguments,
         )
         print(f"    $ {shlex.join(command)} &", flush=True)
-        with log_path.open("w", encoding="utf-8") as stream:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=stream,
-                stderr=subprocess.STDOUT,
-                cwd=self.root,
-                env=self.safe_environment(),
+        # A case can send SIGINT to this up. execve keeps an ignored signal
+        # ignored, and the runner can start with SIGINT ignored (for example,
+        # as a background job of a shell). So give sandy the default action:
+        # execve resets a handler to it. A blocked SIGINT stays blocked in
+        # sandy too, so refuse to start then.
+        if signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, ()):
+            raise E2EFailure("SIGINT is blocked, so up would not get it")
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            with log_path.open("w", encoding="utf-8") as stream:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=self.root,
+                    env=self.safe_environment(),
+                )
+        finally:
+            signal.signal(
+                signal.SIGINT, signal.SIG_DFL if previous is None else previous
             )
         return process, log_path
 

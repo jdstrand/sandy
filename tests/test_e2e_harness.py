@@ -1326,6 +1326,52 @@ class SandyInvocationTests(unittest.TestCase):
                         context.start_up(name, "developer", ["up"], log_name)
             self.assertEqual(popen.call_count, 2)
 
+    def test_start_up_gives_sandy_the_default_sigint_action(self):
+        # Regression test: a runner that started with SIGINT ignored (for
+        # example, as a background job of a shell) passed that on to sandy
+        # through execve, and the SIGINT case then blamed sandy. Now the
+        # parent has the Python handler during the start; execve resets a
+        # handler to the default action. Mocks: subprocess.Popen, which
+        # records the SIGINT handler of the parent, and fails the second time.
+        seen = []
+
+        def popen(*_args, **_kwargs):
+            seen.append(signal.getsignal(signal.SIGINT))
+            if len(seen) == 2:
+                raise OSError("exec failed")
+            return MagicMock()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context = self.make_context()
+            context.root = Path(temp_dir)
+            previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                with patch("tests.e2e.support.subprocess.Popen", side_effect=popen):
+                    context.start_up("e2e-box", "developer", ["up"], "up")
+                    self.assertIs(signal.getsignal(signal.SIGINT), signal.SIG_IGN)
+                    with self.assertRaises(OSError):
+                        context.start_up("e2e-box", "developer", ["up"], "up")
+                    # The handler of the runner comes back, also on a failure.
+                    self.assertIs(signal.getsignal(signal.SIGINT), signal.SIG_IGN)
+            finally:
+                signal.signal(signal.SIGINT, previous)
+        self.assertEqual(seen, [signal.default_int_handler] * 2)
+
+    def test_start_up_refuses_a_blocked_sigint(self):
+        # A blocked SIGINT stays blocked through execve. Mocks:
+        # subprocess.Popen.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context = self.make_context()
+            context.root = Path(temp_dir)
+            previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+            try:
+                with patch("tests.e2e.support.subprocess.Popen") as popen:
+                    with self.assertRaisesRegex(E2EFailure, "SIGINT is blocked"):
+                        context.start_up("e2e-box", "developer", ["up"], "up")
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        popen.assert_not_called()
+
     def test_flock_checks_find_only_the_flock_entries_of_the_path(self):
         # Mocks: the /proc/locks file, in the form that Linux 5.15 and 6.12
         # print for a process that waits in flock(2).
