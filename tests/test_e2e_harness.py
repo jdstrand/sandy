@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import shlex
 import signal
 import socket
 import stat
@@ -1337,9 +1338,11 @@ class SandyInvocationTests(unittest.TestCase):
                     "rm",
                 ],
             )
-            self.assertEqual(environment["SANDY_TEST_MACHINECTL"], str(real))
-            self.assertEqual(environment["LC_ALL"], "C.UTF-8")
-            self.assertEqual(stand_in.read_text(encoding="ascii"), STAND_IN_MACHINECTL)
+            self.assertEqual(environment, context.safe_environment())
+            self.assertEqual(
+                stand_in.read_text(encoding="ascii"),
+                STAND_IN_MACHINECTL.format(real=shlex.quote(str(real))),
+            )
             self.assertEqual(stat.S_IMODE(stand_in.stat().st_mode), 0o755)
             self.assertEqual(real.read_bytes(), b"")
             self.assertEqual(stat.S_IMODE(real.stat().st_mode), 0o755)
@@ -1354,16 +1357,24 @@ class SandyInvocationTests(unittest.TestCase):
                         context.with_a_machinectl_that_stops_nothing(["sandy"])
 
     def test_stand_in_machinectl_stops_nothing_and_runs_the_real_one(self):
-        # Mocks: the real machinectl, a script that prints its arguments.
-        # The stand-in itself runs in a real /bin/sh.
+        # Regression test: the stand-in found the real machinectl through an
+        # environment variable, and the entry helper of sandy, which runs with
+        # the environment of the container session, did not have it. Now the
+        # path is in the stand-in. Mocks: the real machinectl, a script that
+        # prints its arguments, in a directory with a space. The stand-in
+        # itself runs in a real /bin/sh with no special environment.
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            stand_in = root / "stand-in-machinectl"
-            stand_in.write_text(STAND_IN_MACHINECTL, encoding="ascii")
+            root = Path(temp_dir) / "run root"
+            root.mkdir()
             real = root / "real-machinectl"
             real.write_text('#!/bin/sh\necho "real: $*"\n', encoding="ascii")
             real.chmod(0o755)
-            environment = {"PATH": "/usr/bin:/bin", "SANDY_TEST_MACHINECTL": str(real)}
+            stand_in = root / "stand-in-machinectl"
+            stand_in.write_text(
+                STAND_IN_MACHINECTL.format(real=shlex.quote(str(real))),
+                encoding="ascii",
+            )
+            environment = {"PATH": "/usr/bin:/bin"}
             outputs = {}
             for verb in ("poweroff", "terminate", "show"):
                 completed = subprocess.run(

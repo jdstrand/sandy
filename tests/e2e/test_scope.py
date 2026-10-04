@@ -16,7 +16,7 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import BinaryIO
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -31,6 +31,7 @@ from tests.e2e.support import (
     SLICE,
     SLICE_CGROUP,
     SYSTEMD_MACHINES,
+    CommandResult,
     E2EContext,
     E2EFailure,
     assert_contains,
@@ -66,6 +67,10 @@ BUSY_LOCK_UP_PORT = 18090
 # lock for 10 (LIFECYCLE_LOCK_TIMEOUT).
 PORT_LOCK_WAIT = 5
 LIFECYCLE_LOCK_WAIT = 10
+# Under the lifecycle lock, the stop after the last session takes at most 5 s
+# (CONTAINER_POWEROFF_TIMEOUT of sandy) after its port cleanup. With its
+# queries, the lock is free well before this many seconds.
+STOP_UNDER_LOCK_WAIT = 7
 # The host port of an up that gets SIGINT while it waits for the port mapping
 # lock, and how long it may take to exit then.
 INTERRUPTED_UP_PORT = 18091
@@ -493,9 +498,20 @@ class _Attach:
 
 
 class _Console:
-    """`sandy up` without -d; its console reads commands from a pipe."""
+    """`sandy up` without -d; its console reads commands from a pipe.
 
-    def __init__(self, context: E2EContext, name: str, *extra: str) -> None:
+    wrap, when given, returns the command and the environment to run in
+    place of sandy and the safe environment, for example
+    with_a_machinectl_that_stops_nothing of the context.
+    """
+
+    def __init__(
+        self,
+        context: E2EContext,
+        name: str,
+        *extra: str,
+        wrap: Callable[[list[str]], tuple[list[str], dict[str, str]]] | None = None,
+    ) -> None:
         arguments = [
             str(SANDY),
             "--workspace",
@@ -510,6 +526,9 @@ class _Console:
             "host",
             *extra,
         ]
+        environment = context.safe_environment()
+        if wrap is not None:
+            arguments, environment = wrap(arguments)
         self.output = context.root / f"console-{time.monotonic_ns()}.log"
         with self.output.open("w", encoding="utf-8") as stream:
             self.process = subprocess.Popen(
@@ -518,7 +537,7 @@ class _Console:
                 stdout=stream,
                 stderr=subprocess.STDOUT,
                 cwd=context.root,
-                env=context.safe_environment(),
+                env=environment,
             )
 
     def send(self, text: str) -> None:
@@ -1128,6 +1147,61 @@ def test_main(context: E2EContext) -> None:
             raise E2EFailure(
                 "The stop with a busy port mapping lock stopped the container"
             )
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("the stop after the last attach is short under its lock"):
+        # Regression test: under the lifecycle lock, the stop after the last
+        # session ran machinectl poweroff and terminate with no timeout, and
+        # waited up to 5 s after each. So each attach, to any container,
+        # could fail after its 10 s wait. Here the console of up has a
+        # machinectl whose poweroff and terminate do nothing: the stop must
+        # give up after 5 s in all, keep the container running, and name
+        # the down command, and an attach to another container must work.
+        if not context.machine_running(name):
+            raise E2EFailure(f"The other container {name} is not running")
+        console = _Console(
+            context, second, wrap=context.with_a_machinectl_that_stops_nothing
+        )
+        _wait_for_console(context, second)
+        console.send("exit\n")
+        _wait_for(
+            "the stop holds the lifecycle lock",
+            lambda: holds_flock(console.process.pid, LIFECYCLE_LOCK),
+        )
+        held_from = time.monotonic()
+        attaches: list[CommandResult] = []
+        attach = threading.Thread(
+            target=lambda: attaches.append(
+                context.sandy(["exec", "--", "true"], name=name, expected=None)
+            )
+        )
+        attach.start()
+        _wait_for(
+            "the stop frees the lifecycle lock",
+            lambda: not holds_flock(console.process.pid, LIFECYCLE_LOCK),
+            timeout=LIFECYCLE_LOCK_WAIT + STOP_UNDER_LOCK_WAIT,
+        )
+        held = time.monotonic() - held_from
+        attach.join(timeout=WAIT_TIMEOUT)
+        returncode, output = console.finish(timeout=WAIT_TIMEOUT)
+        if held >= STOP_UNDER_LOCK_WAIT:
+            raise E2EFailure(f"The stop held the lifecycle lock for {held:.1f} s")
+        if not attaches or attaches[0].returncode != 0:
+            raise E2EFailure(
+                f"An attach to {name} failed during the stop: "
+                f"{attaches[0].output[-2000:] if attaches else 'no result'}"
+            )
+        if returncode != 0:
+            raise E2EFailure(f"Console up exited {returncode}: {output[-2000:]}")
+        for line in (
+            f"W: Container '{second}' did not stop",
+            f"   Stop it with: sandy --container {second} down",
+        ):
+            if line not in output:
+                raise E2EFailure(f"No {line!r} in: {output[-2000:]}")
+        if not context.machine_running(second):
+            raise E2EFailure("The container stopped, so the case tested nothing")
         context.sandy(["down"], name=second)
         _wait_stopped(context, second)
 

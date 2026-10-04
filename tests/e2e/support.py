@@ -128,20 +128,21 @@ SYSTEMD_RUN_BINARY_DIRS = (Path("/usr/bin"), Path("/bin"))
 SYSTEM_BUS_SOCKET = Path("/run/dbus/system_bus_socket")
 # To make a stop fail, a second script binds the real machinectl at a side
 # path and a stand-in over machinectl, in a private mount namespace. The
-# stand-in does nothing for poweroff and terminate, and runs the real binary,
-# which SANDY_TEST_MACHINECTL names, for each other command. sandy passes that
-# variable on to machinectl. Measured on systemd 249 and 257.
+# stand-in does nothing for poweroff and terminate, and runs the real binary
+# at the side path for each other command. The path is in the stand-in, not
+# in the environment: the entry helper of sandy runs with the environment of
+# the container session. Measured on systemd 249 and 257.
 MACHINECTL_BINARY_DIRS = (Path("/usr/bin"), Path("/bin"))
 STAND_IN_MACHINECTL_SCRIPT = (
     'mount --bind -- "$1" "$2" && mount --bind -- "$3" "$1" && shift 3 && exec "$@"'
 )
 STAND_IN_MACHINECTL = """#!/bin/sh
 # E2E stand-in: poweroff and terminate do nothing. Each other command runs
-# the real machinectl, which the harness binds at SANDY_TEST_MACHINECTL.
+# the real machinectl, which the harness binds at the path below.
 case "$1" in
 poweroff | terminate) exit 0 ;;
 esac
-exec "$SANDY_TEST_MACHINECTL" "$@"
+exec {real} "$@"
 """
 # The locks of the host, with the processes that wait for them.
 PROC_LOCKS = Path("/proc/locks")
@@ -569,7 +570,10 @@ class E2EContext:
         stand_in = self.root / "stand-in-machinectl"
         real = self.root / "real-machinectl"
         if not stand_in.exists():
-            stand_in.write_text(STAND_IN_MACHINECTL, encoding="ascii")
+            stand_in.write_text(
+                STAND_IN_MACHINECTL.format(real=shlex.quote(str(real))),
+                encoding="ascii",
+            )
             stand_in.chmod(0o755)
         if not real.exists():
             real.write_bytes(b"")
@@ -589,7 +593,7 @@ class E2EContext:
             str(stand_in),
             *command,
         ]
-        return command, self.safe_environment({"SANDY_TEST_MACHINECTL": str(real)})
+        return command, self.safe_environment()
 
     def with_a_broken_systemd_run(self, command: Sequence[str]) -> list[str]:
         """Return command wrapped so that systemd-run is found but cannot run."""

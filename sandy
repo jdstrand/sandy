@@ -168,8 +168,12 @@ KEEPALIVE_OPEN_TIMEOUT: Final = 10
 KEEPALIVE_OPEN_INTERVAL: Final = 0.05
 ATTACH_HANGUP_SIGNALS: Final = (signal.SIGHUP, signal.SIGTERM)
 CONTAINER_STOP_TIMEOUT: Final = 30
-# Bounded so that a stop under the lifecycle lock (10 s wait for others)
-# stays short. The keepalive stops in well under a second (measured).
+# Each attach waits 10 s for the lifecycle lock. So a stop under that lock
+# takes at most this long in all, with its commands and its waits: the stop
+# after the last session, and the stop of a supervisor whose pin or marker
+# failed. down and rm, which take no lifecycle lock, wait this long after the
+# poweroff and again after the terminate. The keepalive stops in well under a
+# second (measured).
 CONTAINER_POWEROFF_TIMEOUT: Final = 5
 CONTAINER_STOP_POLL_INTERVAL: Final = 0.1
 CONTAINER_IP_UNSET: Final = object()
@@ -1906,14 +1910,16 @@ def _supervisor_scope_argv(
     return argv
 
 
-def _systemctl_show_value(unit: str, prop: str) -> str:
+def _systemctl_show_value(
+    unit: str, prop: str, timeout: float = QUERY_COMMAND_TIMEOUT
+) -> str:
     """Return one property value of unit from systemctl show."""
     result = _run_secure_subprocess(
         ["systemctl", "show", unit, "-p", prop, "--value"],
         capture_output=True,
         text=True,
         check=True,
-        timeout=QUERY_COMMAND_TIMEOUT,
+        timeout=timeout,
     )
     output = result.stdout
     if output.endswith("\n"):
@@ -1937,9 +1943,26 @@ def _supervisor_started_attached(machine_name: str) -> bool:
     return description == _supervisor_description(machine_name, detached=False)
 
 
-def _supervisor_unit_loaded(machine_name: str) -> bool:
+def _query_timeout_until(deadline: float) -> float:
+    """Return the timeout of a query or command that must end at deadline.
+
+    It is at most QUERY_COMMAND_TIMEOUT, and at least
+    CONTAINER_STOP_POLL_INTERVAL, so that a step at the deadline still gets
+    one short chance.
+    """
+    return min(
+        QUERY_COMMAND_TIMEOUT,
+        max(deadline - time.monotonic(), CONTAINER_STOP_POLL_INTERVAL),
+    )
+
+
+def _supervisor_unit_loaded(
+    machine_name: str, timeout: float = QUERY_COMMAND_TIMEOUT
+) -> bool:
     """Return whether systemd knows the container's scope in any state."""
-    load_state = _systemctl_show_value(_supervisor_unit_name(machine_name), "LoadState")
+    load_state = _systemctl_show_value(
+        _supervisor_unit_name(machine_name), "LoadState", timeout=timeout
+    )
     if load_state == "not-found":
         return False
     if not UNIT_STATE_PATTERN.fullmatch(load_state):
@@ -7204,6 +7227,7 @@ class Sandy:
         self,
         container_name: Optional[str] = None,
         port_lock_timeout: Optional[float] = None,
+        stop_timeout: float = 2 * CONTAINER_POWEROFF_TIMEOUT,
     ) -> bool:
         """Stop the container if it's running.
 
@@ -7211,6 +7235,8 @@ class Sandy:
         when it did not stop. With port_lock_timeout, raise TimeoutError when
         the port mapping lock is not free in that time. That comes before any
         change: the container keeps running, with its port rules and state.
+        The poweroff and the terminate, with their machinectl commands and
+        waits, take at most stop_timeout in all after the port cleanup.
         """
         if container_name is None:
             container_name = self.container
@@ -7228,14 +7254,26 @@ class Sandy:
         # Actually stop the container. After a successful poweroff, the
         # machine is gone and terminate would fail, so terminate only a
         # container that did not stop in time. Wait until the scope is gone
-        # too, so that a following up can start the same name.
-        _run_secure_subprocess(["machinectl", "poweroff", container_name])
-        if self._wait_for_container_stop(container_name):
+        # too, so that a following up can start the same name. The poweroff
+        # gets the first half of stop_timeout, and the terminate the rest.
+        deadline = time.monotonic() + stop_timeout
+        poweroff_deadline = deadline - stop_timeout / 2
+        _run_secure_subprocess(
+            ["machinectl", "poweroff", container_name],
+            timeout=_query_timeout_until(poweroff_deadline),
+        )
+        if self._wait_for_container_stop(
+            container_name, max(poweroff_deadline - time.monotonic(), 0.0)
+        ):
             return True
         _run_secure_subprocess(
-            ["machinectl", "terminate", container_name], stderr=subprocess.DEVNULL
+            ["machinectl", "terminate", container_name],
+            stderr=subprocess.DEVNULL,
+            timeout=_query_timeout_until(deadline),
         )
-        if self._wait_for_container_stop(container_name):
+        if self._wait_for_container_stop(
+            container_name, max(deadline - time.monotonic(), 0.0)
+        ):
             return True
         print(f"W: Container '{container_name}' did not stop")
         return False
@@ -7243,13 +7281,19 @@ class Sandy:
     def _wait_for_container_stop(
         self, container_name: str, timeout: float = CONTAINER_POWEROFF_TIMEOUT
     ) -> bool:
-        """Wait until the machine and its Sandy scope are gone."""
+        """Wait until the machine and its Sandy scope are gone.
+
+        The queries end by the deadline too, so a query that does not answer
+        does not make the wait longer.
+        """
         deadline = time.monotonic() + timeout
         while True:
             try:
                 if not self._is_container_running(
-                    container_name
-                ) and not _supervisor_unit_loaded(container_name):
+                    container_name, timeout=_query_timeout_until(deadline)
+                ) and not _supervisor_unit_loaded(
+                    container_name, timeout=_query_timeout_until(deadline)
+                ):
                     return True
             except (ValueError, subprocess.SubprocessError):
                 # A stop that cannot be confirmed is not a stop.
@@ -7287,10 +7331,12 @@ class Sandy:
         except Exception as e:
             print(f"E: Problem removing {safe_con}: {_terminal_safe_repr(str(e))}")
 
-    def _is_container_running(self, container_name=None):
+    def _is_container_running(
+        self, container_name=None, timeout: float = QUERY_COMMAND_TIMEOUT
+    ):
         """Check if container is running and return PID if so, None otherwise
 
-        A query that does not answer in QUERY_COMMAND_TIMEOUT raises
+        A query that does not answer in timeout raises
         subprocess.TimeoutExpired, and a query that fails for another reason
         than an unknown machine raises _MachineQueryError: neither one means
         "not running".
@@ -7304,7 +7350,7 @@ class Sandy:
                 capture_output=True,
                 text=True,
                 check=True,
-                timeout=QUERY_COMMAND_TIMEOUT,
+                timeout=timeout,
                 env=_c_locale_environment(),
             )
         except subprocess.CalledProcessError as exc:
@@ -8301,7 +8347,12 @@ class Sandy:
                     return
                 print(f"I: Stopping '{self.container}': no session is attached")
                 try:
-                    self._machine_poweroff(port_lock_timeout=PORT_MAPPINGS_LOCK_TIMEOUT)
+                    # Each attach waits for the lifecycle lock, so the stop
+                    # itself also takes only a short time.
+                    stopped = self._machine_poweroff(
+                        port_lock_timeout=PORT_MAPPINGS_LOCK_TIMEOUT,
+                        stop_timeout=CONTAINER_POWEROFF_TIMEOUT,
+                    )
                 except TimeoutError:
                     # Each attach waits for the lifecycle lock, so the stop
                     # waits for the port mapping lock only for a short time.
@@ -8311,6 +8362,14 @@ class Sandy:
                         f"W: Did not stop '{self.container}': the port mapping "
                         "lock stayed busy"
                     )
+                    stopped = False
+                except subprocess.SubprocessError as exc:
+                    print(
+                        f"W: Could not stop '{self.container}': "
+                        f"{_terminal_safe_repr(str(exc))}"
+                    )
+                    stopped = False
+                if not stopped:
                     print(f"   Stop it with: sandy --container {self.container} down")
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             print(
@@ -9635,11 +9694,19 @@ class Sandy:
                                     )
                             finally:
                                 # Release the lock, and only then stop the
-                                # supervisor, which can take
-                                # CONTAINER_STOP_TIMEOUT. The handler at the
-                                # end writes the held output after the stop.
+                                # supervisor. This stop runs under the
+                                # lifecycle lock (without -d, or with
+                                # mounts), so it takes at most
+                                # CONTAINER_POWEROFF_TIMEOUT in all. The
+                                # handler at the end writes the held output
+                                # after the stop.
                                 port_lock.close()
-                                self._stop_failed_start(supervisor, remove_ports=False)
+                                self._stop_failed_start(
+                                    supervisor,
+                                    remove_ports=False,
+                                    term_timeout=CONTAINER_POWEROFF_TIMEOUT / 2,
+                                    kill_timeout=CONTAINER_POWEROFF_TIMEOUT / 2,
+                                )
                             if not failed:
                                 raise
                             sys.exit(1)
@@ -9769,20 +9836,32 @@ class Sandy:
         )
 
     def _stop_failed_start(
-        self, supervisor: subprocess.Popen, remove_ports: bool = True
+        self,
+        supervisor: subprocess.Popen,
+        remove_ports: bool = True,
+        term_timeout: float = CONTAINER_STOP_TIMEOUT,
+        kill_timeout: float = CONTAINER_POWEROFF_TIMEOUT,
     ) -> None:
         """Stop a supervisor that this run started, then remove its port rules.
 
-        SIGTERM makes nspawn power off the container. With remove_ports
-        False, leave the port rules and state: the caller removed them.
+        SIGTERM makes nspawn power off the container. After term_timeout,
+        SIGKILL ends the supervisor; after kill_timeout more, give up with a
+        warning. With remove_ports False, leave the port rules and state: the
+        caller removed them.
         """
         if supervisor.poll() is None:
             supervisor.terminate()
             try:
-                supervisor.wait(timeout=CONTAINER_STOP_TIMEOUT)
+                supervisor.wait(timeout=term_timeout)
             except subprocess.TimeoutExpired:
                 supervisor.kill()
-                supervisor.wait()
+                try:
+                    supervisor.wait(timeout=kill_timeout)
+                except subprocess.TimeoutExpired:
+                    print(
+                        f"W: The supervisor of '{self.container}' did not stop "
+                        f"(PID {supervisor.pid})"
+                    )
         if remove_ports:
             self._cleanup_port_mappings_for_container(self.container)
 

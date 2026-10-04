@@ -142,8 +142,9 @@ $ sudo /path/to/sandy [GLOBAL OPTIONS] [COMMAND] [COMMAND OPTIONS]
   When the console exits, the container stops, unless another `bash` or
   `exec` session is still attached; then the last session to exit stops it.
   If the port mapping lock stays busy for 5 seconds at that time (for
-  example, during `rm --cache`), the container keeps running and the session
-  says so; stop it with `down`.
+  example, during `rm --cache`), or the container does not stop in 5 more
+  seconds, the container keeps running and the session says so; stop it
+  with `down`.
   Key flags:
   - `--build` to create a container
   - `--detach` starts the container without a console and leaves it running
@@ -432,14 +433,20 @@ takes no lifecycle lock, so it waits until the port mapping lock is free.
 container process and made the markers that it needs in the scope of the
 container. When the start fails before that, `up` removes the ports before
 it releases the lock, so no other `up` finds them, and the removal does not
-wait for the lock. During that hold, `up` holds back its output and writes
-it after the release, so a stopped terminal cannot keep the lock held. The
-stop after the last session also waits for the port mapping lock under the
-lifecycle lock for at most 5 seconds, less than the 10 seconds that each
-attach waits for the lifecycle lock. When the port mapping lock stays busy
-for that time, the container keeps running with its ports (see `up`
-above). `down` and `rm` take no lifecycle lock, so they wait until the port
-mapping lock is free.
+wait for the lock. It then stops the container process in at most 5
+seconds (SIGTERM, then SIGKILL), because it can still hold the lifecycle
+lock. During that hold, `up` holds back its output and writes it after the
+release, so a stopped terminal cannot keep the lock held. The stop after
+the last session also waits for the port mapping lock under the lifecycle
+lock for at most 5 seconds, less than the 10 seconds that each attach waits
+for the lifecycle lock. When the port mapping lock stays busy for that
+time, the container keeps running with its ports (see `up` above). After
+that wait, the stop itself (`machinectl poweroff`, then `machinectl
+terminate`, with their waits and commands) takes at most 5 seconds more;
+a container that has not stopped then keeps running. `down` and `rm` take
+no lifecycle lock, so they wait until the port mapping lock is free, and
+they give the poweroff and the terminate 5 seconds each. Each `machinectl`
+command ends in 3 seconds at most.
 
 
 ## Security
@@ -604,7 +611,7 @@ sequenceDiagram
         end
         S->>C: count the populated attach-* leaves, under the lifecycle lock
         opt no attach left, no up-console marker, and started without -d
-            S->>N: machinectl poweroff
+            S->>N: machinectl poweroff (terminate after 2.5 s, 5 s in all)
         end
     else the terminal closes (SIGHUP), or sandy gets SIGTERM
         S->>C: cgroup.kill and rmdir attach-RANDOM

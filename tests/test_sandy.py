@@ -49,6 +49,19 @@ def _load_sandy_module():
 sandy = _load_sandy_module()
 # A supervisor pinned by up, for tests that mock the checks that use it.
 PINNED_SUPERVISOR = sandy.PinnedSupervisor(pidfd=-1, pid=4242)
+# The stop of a supervisor whose pin or marker failed: up removed its ports,
+# and the stop runs under the lifecycle lock, so it is short.
+LOCKED_STOP = {
+    "remove_ports": False,
+    "term_timeout": sandy.CONTAINER_POWEROFF_TIMEOUT / 2,
+    "kill_timeout": sandy.CONTAINER_POWEROFF_TIMEOUT / 2,
+}
+# The stop after the last session runs under the lifecycle lock: it waits
+# for the port mapping lock, and then stops, each for a short time.
+LAST_ATTACH_STOP = {
+    "port_lock_timeout": sandy.PORT_MAPPINGS_LOCK_TIMEOUT,
+    "stop_timeout": sandy.CONTAINER_POWEROFF_TIMEOUT,
+}
 
 
 def make_sandy():
@@ -11331,6 +11344,11 @@ class ExecutionTests(unittest.TestCase):
         # sandy parses the error text, so the query runs in the C locale.
         environment = run.call_args.kwargs["env"]
         self.assertEqual((environment["LANG"], environment["LC_ALL"]), ("C", "C"))
+        # A wait for a stop gives a shorter timeout, so that the query ends
+        # by the deadline of the wait.
+        with patch.object(sandy, "_run_secure_subprocess", return_value=result) as run:
+            self.assertEqual(instance._is_container_running("other", 0.5), "1234")
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.5)
 
         # The error of machined for an unknown name, as systemd 249 and 257
         # print it, is the only failure that means "not running".
@@ -11424,6 +11442,8 @@ class ExecutionTests(unittest.TestCase):
                 instance._is_container_running()
 
     def test_machine_poweroff_cleans_state_first(self):
+        # Mocks: the query, the cleanup, the commands, the wait, and a clock
+        # that stands still.
         instance = make_sandy()
         manager = MagicMock()
         manager.wait.return_value = True
@@ -11434,16 +11454,21 @@ class ExecutionTests(unittest.TestCase):
                 with patch.object(sandy, "_run_secure_subprocess", manager.run):
                     with patch.object(
                         instance, "_wait_for_container_stop", manager.wait
-                    ):
+                    ), patch.object(sandy.time, "monotonic", return_value=100.0):
                         self.assertIs(instance._machine_poweroff(), True)
         # A successful poweroff is not followed by terminate, which would
-        # fail with "No machine known".
+        # fail with "No machine known". By default (down and rm), the
+        # poweroff gets CONTAINER_POWEROFF_TIMEOUT, and its command ends in
+        # QUERY_COMMAND_TIMEOUT.
         self.assertEqual(
             manager.mock_calls,
             [
                 call.cleanup("ai-dev", lock_timeout=None),
-                call.run(["machinectl", "poweroff", "ai-dev"]),
-                call.wait("ai-dev"),
+                call.run(
+                    ["machinectl", "poweroff", "ai-dev"],
+                    timeout=sandy.QUERY_COMMAND_TIMEOUT,
+                ),
+                call.wait("ai-dev", sandy.CONTAINER_POWEROFF_TIMEOUT),
             ],
         )
 
@@ -11470,40 +11495,70 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(manager.mock_calls, [call.cleanup("ai-dev", lock_timeout=5)])
 
     def test_machine_poweroff_terminates_only_after_timeout(self):
-        for stopped_after_terminate in (True, False):
-            with self.subTest(stopped_after_terminate=stopped_after_terminate):
-                instance = make_sandy()
-                manager = MagicMock()
-                manager.wait.side_effect = [False, stopped_after_terminate]
-                with patch.object(
-                    instance, "_is_container_running", return_value="123"
-                ), patch.object(
-                    instance, "_cleanup_port_mappings_for_container", manager.cleanup
-                ), patch.object(
-                    sandy, "_run_secure_subprocess", manager.run
-                ), patch.object(
-                    instance, "_wait_for_container_stop", manager.wait
+        # Mocks: the query, the cleanup, the commands, and the waits, which use
+        # up their whole time on a clock. The poweroff gets the first half of
+        # stop_timeout, and the terminate the rest; each command ends by its
+        # part too. down and rm use the default; the stop after the last
+        # session, under the lifecycle lock, uses CONTAINER_POWEROFF_TIMEOUT.
+        locked = sandy.CONTAINER_POWEROFF_TIMEOUT
+        for stop_timeout, half, command_timeout in (
+            (None, sandy.CONTAINER_POWEROFF_TIMEOUT, sandy.QUERY_COMMAND_TIMEOUT),
+            (locked, locked / 2, locked / 2),
+        ):
+            for stopped_after_terminate in (True, False):
+                with self.subTest(
+                    stop_timeout=stop_timeout,
+                    stopped_after_terminate=stopped_after_terminate,
                 ):
-                    with captured_output() as (stdout, _):
-                        stopped = instance._machine_poweroff("other")
-                # The callers need the result: rm keeps the image, and down
-                # exits 1, when the container did not stop.
-                self.assertIs(stopped, stopped_after_terminate)
-                self.assertEqual(
-                    manager.mock_calls[1:],
-                    [
-                        call.run(["machinectl", "poweroff", "other"]),
-                        call.wait("other"),
-                        call.run(
-                            ["machinectl", "terminate", "other"],
-                            stderr=subprocess.DEVNULL,
-                        ),
-                        call.wait("other"),
-                    ],
-                )
-                self.assertEqual(
-                    "did not stop" in stdout.getvalue(), not stopped_after_terminate
-                )
+                    instance = make_sandy()
+                    manager = MagicMock()
+                    clock = [100.0]
+                    results = iter([False, stopped_after_terminate])
+
+                    def wait(_name: str, timeout: float) -> bool:
+                        clock[0] += timeout
+                        return next(results)
+
+                    manager.wait.side_effect = wait
+                    options = {} if stop_timeout is None else {"stop_timeout": locked}
+                    with patch.object(
+                        instance, "_is_container_running", return_value="123"
+                    ), patch.object(
+                        instance,
+                        "_cleanup_port_mappings_for_container",
+                        manager.cleanup,
+                    ), patch.object(
+                        sandy, "_run_secure_subprocess", manager.run
+                    ), patch.object(
+                        instance, "_wait_for_container_stop", manager.wait
+                    ), patch.object(
+                        sandy.time, "monotonic", side_effect=lambda: clock[0]
+                    ):
+                        with captured_output() as (stdout, _):
+                            stopped = instance._machine_poweroff("other", **options)
+                    # The callers need the result: rm keeps the image, and down
+                    # exits 1, when the container did not stop.
+                    self.assertIs(stopped, stopped_after_terminate)
+                    self.assertEqual(
+                        manager.mock_calls[1:],
+                        [
+                            call.run(
+                                ["machinectl", "poweroff", "other"],
+                                timeout=command_timeout,
+                            ),
+                            call.wait("other", half),
+                            call.run(
+                                ["machinectl", "terminate", "other"],
+                                stderr=subprocess.DEVNULL,
+                                timeout=command_timeout,
+                            ),
+                            call.wait("other", half),
+                        ],
+                    )
+                    self.assertEqual(
+                        "did not stop" in stdout.getvalue(),
+                        not stopped_after_terminate,
+                    )
 
     def test_machine_poweroff_skips_stopped_container(self):
         instance = make_sandy()
@@ -11527,24 +11582,60 @@ class ExecutionTests(unittest.TestCase):
         ) as sleep:
             self.assertTrue(instance._wait_for_container_stop("ai-dev"))
         self.assertEqual(running.call_count, 3)
-        self.assertEqual(loaded.call_args_list, [call("ai-dev")] * 2)
+        self.assertEqual(
+            loaded.call_args_list,
+            [call("ai-dev", timeout=sandy.QUERY_COMMAND_TIMEOUT)] * 2,
+        )
         self.assertEqual(
             sleep.call_args_list, [call(sandy.CONTAINER_STOP_POLL_INTERVAL)] * 2
         )
 
+    def test_query_timeout_until_a_deadline(self):
+        # Mocks: the clock. A step far from the deadline gets the usual
+        # query timeout, a step near it the time left, and a step at or after
+        # it one short chance.
+        with patch.object(sandy.time, "monotonic", return_value=100.0):
+            self.assertEqual(
+                sandy._query_timeout_until(110.0), sandy.QUERY_COMMAND_TIMEOUT
+            )
+            self.assertEqual(sandy._query_timeout_until(101.5), 1.5)
+            for deadline in (100.0, 90.0):
+                with self.subTest(deadline=deadline):
+                    self.assertEqual(
+                        sandy._query_timeout_until(deadline),
+                        sandy.CONTAINER_STOP_POLL_INTERVAL,
+                    )
+
     def test_wait_for_container_stop_times_out(self):
+        # Mocks: the queries (the scope stays), and a clock that each sleep
+        # moves on by 2 s. Each query ends by the deadline (5 s); a query at
+        # or after it still gets one short chance.
         instance = make_sandy()
+        clock = [100.0]
+
+        def sleep_two_seconds(_seconds: float) -> None:
+            clock[0] += 2.0
+
         with patch.object(
             instance, "_is_container_running", return_value=None
-        ), patch.object(
+        ) as running, patch.object(
             sandy, "_supervisor_unit_loaded", return_value=True
+        ) as loaded, patch.object(
+            sandy.time, "monotonic", side_effect=lambda: clock[0]
         ), patch.object(
-            sandy.time, "monotonic", side_effect=[0, 0, 1, 6]
-        ), patch.object(
-            sandy.time, "sleep"
+            sandy.time, "sleep", side_effect=sleep_two_seconds
         ) as sleep:
             self.assertFalse(instance._wait_for_container_stop("ai-dev"))
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(sleep.call_count, 3)
+        timeouts = [3, 3, 1, sandy.CONTAINER_STOP_POLL_INTERVAL]
+        self.assertEqual(
+            running.call_args_list,
+            [call("ai-dev", timeout=timeout) for timeout in timeouts],
+        )
+        self.assertEqual(
+            loaded.call_args_list,
+            [call("ai-dev", timeout=timeout) for timeout in timeouts],
+        )
 
     @contextmanager
     def entry_script(self, instance):
@@ -15030,7 +15121,7 @@ class RunUpTests(unittest.TestCase):
                         side_effect=lambda ip: events.append(f"ports {ip}"),
                     ), patch.object(sandy.os, "fchown"):
                         mocks.stop.side_effect = (
-                            lambda supervisor, remove_ports=True: events.append("stop")
+                            lambda supervisor, **_options: events.append("stop")
                         )
                         with captured_output() as (stdout, _):
                             with self.assertRaises(
@@ -15056,7 +15147,7 @@ class RunUpTests(unittest.TestCase):
                 self.assertEqual(events, ["cleanup ai-dev", *started])
                 # The ports are gone already, so the stop leaves them alone.
                 mocks.stop.assert_called_once_with(
-                    mocks.popen.return_value, remove_ports=False
+                    mocks.popen.return_value, **LOCKED_STOP
                 )
                 if label == "interrupt":
                     self.assertIsInstance(raised.exception, KeyboardInterrupt)
@@ -15108,7 +15199,7 @@ class RunUpTests(unittest.TestCase):
                 side_effect=lambda ip: events.append(f"ports {ip}"),
             ), patch.object(sandy.os, "fchown"):
 
-                def stop(supervisor, remove_ports=True):
+                def stop(supervisor, **_options):
                     events.append("stop")
                     if stop_error is not None:
                         raise stop_error
@@ -15222,7 +15313,7 @@ class RunUpTests(unittest.TestCase):
             stop_error=KeyboardInterrupt(),
         )
         self.assertIsInstance(raised, KeyboardInterrupt)
-        mocks.stop.assert_called_once_with(mocks.popen.return_value, remove_ports=False)
+        mocks.stop.assert_called_once_with(mocks.popen.return_value, **LOCKED_STOP)
         self.assertEqual(
             output[output.index("I: Starting") :],
             "I: Starting 'ai-dev' in detached state \r\n"
@@ -15259,7 +15350,7 @@ class RunUpTests(unittest.TestCase):
                 started = ["stop"] if detach else ["enter", "stop", "exit"]
                 self.assertEqual(events, ["cleanup ai-dev", *started])
                 mocks.stop.assert_called_once_with(
-                    mocks.popen.return_value, remove_ports=False
+                    mocks.popen.return_value, **LOCKED_STOP
                 )
                 # No write after the "Starting" line reached the terminal.
                 mode = " in detached state" if detach else ""
@@ -15306,7 +15397,7 @@ class RunUpTests(unittest.TestCase):
                     ["cleanup ai-dev", *(hold if detach else ["enter", *hold, "exit"])],
                 )
                 mocks.stop.assert_called_once_with(
-                    mocks.popen.return_value, remove_ports=False
+                    mocks.popen.return_value, **LOCKED_STOP
                 )
                 # The terminal still names the failed start.
                 self.assertIn(
@@ -15484,7 +15575,7 @@ class RunUpTests(unittest.TestCase):
                             with self.assertRaises(expected):
                                 instance.run_up(self.arguments(detach=False))
                 # No ports, so no port removal and no wait for its lock.
-                stop.assert_called_once_with(popen.return_value, remove_ports=False)
+                stop.assert_called_once_with(popen.return_value, **LOCKED_STOP)
                 self.wait_for_container_ready.assert_not_called()
                 if expected is SystemExit:
                     self.assertIn("did not start", stdout.getvalue())
@@ -16561,7 +16652,7 @@ class RunUpTests(unittest.TestCase):
                                 instance.run_up(self.arguments(detach=detach))
                 # No ports, so no port removal and no wait for its lock.
                 mocks.stop.assert_called_once_with(
-                    mocks.popen.return_value, remove_ports=False
+                    mocks.popen.return_value, **LOCKED_STOP
                 )
                 # The console marker comes after the pending marker.
                 self.create_marker.assert_not_called()
@@ -17139,7 +17230,20 @@ class SupervisorScopeTests(unittest.TestCase):
                     sandy, "_systemctl_show_value", return_value=value
                 ) as show:
                     self.assertIs(sandy._supervisor_unit_loaded("ai-dev"), expected)
-                show.assert_called_once_with("sandy-ai-dev.scope", "LoadState")
+                    self.assertIs(
+                        sandy._supervisor_unit_loaded("ai-dev", timeout=0.5), expected
+                    )
+                self.assertEqual(
+                    show.call_args_list,
+                    [
+                        call(
+                            "sandy-ai-dev.scope",
+                            "LoadState",
+                            timeout=sandy.QUERY_COMMAND_TIMEOUT,
+                        ),
+                        call("sandy-ai-dev.scope", "LoadState", timeout=0.5),
+                    ],
+                )
         for value in ("", "Loaded", "not found", "x" * 40):
             with self.subTest(value=value):
                 with patch.object(sandy, "_systemctl_show_value", return_value=value):
@@ -17211,9 +17315,40 @@ class StartFailureTests(unittest.TestCase):
                 call.supervisor.terminate(),
                 call.supervisor.wait(timeout=sandy.CONTAINER_STOP_TIMEOUT),
                 call.supervisor.kill(),
-                call.supervisor.wait(),
+                call.supervisor.wait(timeout=sandy.CONTAINER_POWEROFF_TIMEOUT),
                 call.cleanup("ai-dev"),
             ],
+        )
+
+    def test_stop_failed_start_gives_up_after_its_timeouts(self):
+        # Regression test: after SIGKILL, the stop waited with no limit, and
+        # the stop after a failed pin or marker waited up to 30 s under the
+        # lifecycle lock. Mocks: the supervisor, which does not end, and the
+        # port cleanup.
+        instance = make_sandy()
+        manager = MagicMock()
+        manager.supervisor.pid = 4242
+        manager.supervisor.poll.return_value = None
+        manager.supervisor.wait.side_effect = subprocess.TimeoutExpired(
+            ["systemd-run"], 2.5
+        )
+        with patch.object(
+            instance, "_cleanup_port_mappings_for_container", manager.cleanup
+        ):
+            with captured_output() as (stdout, _):
+                instance._stop_failed_start(manager.supervisor, **LOCKED_STOP)
+        self.assertEqual(
+            manager.mock_calls[1:],
+            [
+                call.supervisor.terminate(),
+                call.supervisor.wait(timeout=sandy.CONTAINER_POWEROFF_TIMEOUT / 2),
+                call.supervisor.kill(),
+                call.supervisor.wait(timeout=sandy.CONTAINER_POWEROFF_TIMEOUT / 2),
+            ],
+        )
+        self.assertEqual(
+            stdout.getvalue(),
+            "W: The supervisor of 'ai-dev' did not stop (PID 4242)\n",
         )
 
     def test_stop_failed_start_can_leave_the_ports(self):
@@ -17720,6 +17855,8 @@ class AttachLifecycleTests(unittest.TestCase):
             manager.open_unit.side_effect = unit_error
         manager.count.return_value = remaining
         manager.marker.return_value = marker
+        # The stop works unless a test says otherwise.
+        manager.poweroff.return_value = True
         instance = make_sandy()
         with patch.object(sandy, "_lifecycle_lock", lock), patch.object(
             sandy, "_up_console_marker_exists", manager.marker
@@ -17754,7 +17891,7 @@ class AttachLifecycleTests(unittest.TestCase):
                 call.marker(70),
                 call.close(70),
                 call.attached("ai-dev"),
-                call.poweroff(port_lock_timeout=sandy.PORT_MAPPINGS_LOCK_TIMEOUT),
+                call.poweroff(**LAST_ATTACH_STOP),
                 call.lock_exit(),
                 call.sigmask(sandy.signal.SIG_UNBLOCK, sandy.ATTACH_HANGUP_SIGNALS),
             ],
@@ -17797,9 +17934,7 @@ class AttachLifecycleTests(unittest.TestCase):
         names = [entry[0] for entry in manager.mock_calls]
         self.assertLess(names.index("remove_marker"), names.index("count"))
         manager.remove_marker.assert_called_once_with(70)
-        manager.poweroff.assert_called_once_with(
-            port_lock_timeout=sandy.PORT_MAPPINGS_LOCK_TIMEOUT
-        )
+        manager.poweroff.assert_called_once_with(**LAST_ATTACH_STOP)
 
     def test_console_hangup_removes_marker_without_stop(self):
         with self.rule_mocks() as (instance, manager):
@@ -17853,9 +17988,7 @@ class AttachLifecycleTests(unittest.TestCase):
             )
             with captured_output() as (stdout, _):
                 instance._stop_if_last_attach()
-        manager.poweroff.assert_called_once_with(
-            port_lock_timeout=sandy.PORT_MAPPINGS_LOCK_TIMEOUT
-        )
+        manager.poweroff.assert_called_once_with(**LAST_ATTACH_STOP)
         manager.lock_exit.assert_called_once_with()
         self.assertEqual(
             manager.sigmask.call_args_list[-1],
@@ -17867,6 +18000,38 @@ class AttachLifecycleTests(unittest.TestCase):
             "W: Did not stop 'ai-dev': the port mapping lock stayed busy\n"
             "   Stop it with: sandy --container ai-dev down\n",
         )
+
+    def test_last_attach_stop_names_down_when_the_stop_fails(self):
+        # The stop under the lifecycle lock is short, so it can give up: the
+        # container did not stop in time, or a machinectl command of the stop
+        # did not answer. Both name the down command, and the second one says
+        # what failed, not "Could not check the sessions". Mocks: as above.
+        no_answer = subprocess.TimeoutExpired(["machinectl", "poweroff", "ai-dev"], 2.5)
+        for name, stopped, error, warning in (
+            ("did not stop", False, None, ""),
+            (
+                "no answer",
+                None,
+                no_answer,
+                "W: Could not stop 'ai-dev': "
+                "\"Command '['machinectl', 'poweroff', 'ai-dev']' timed out "
+                'after 2.5 seconds"\n',
+            ),
+        ):
+            with self.subTest(name=name):
+                with self.rule_mocks() as (instance, manager):
+                    manager.poweroff.return_value = stopped
+                    manager.poweroff.side_effect = error
+                    with captured_output() as (stdout, _):
+                        instance._stop_if_last_attach()
+                manager.poweroff.assert_called_once_with(**LAST_ATTACH_STOP)
+                manager.lock_exit.assert_called_once_with()
+                self.assertEqual(
+                    stdout.getvalue(),
+                    "I: Stopping 'ai-dev': no session is attached\n"
+                    f"{warning}"
+                    "   Stop it with: sandy --container ai-dev down\n",
+                )
 
     def test_last_attach_rule_lock_timeout_warns(self):
         # A timeout of the lifecycle lock is not one of the port mapping
