@@ -1438,6 +1438,39 @@ def test_main(context: E2EContext) -> None:
         if not (SYSTEMD_MACHINES / f"sandy.{name}" / "init.sh").is_file():
             raise E2EFailure("rm removed the image of the running container")
 
+    with context.case("rm keeps the image of a container that did not stop"):
+        # After "did not stop", rm removed the image of a container that
+        # still ran on it. In this sandy command, machinectl poweroff and
+        # terminate do nothing; the waits for the stop are real. The case
+        # uses a container of its own.
+        stuck = context.scan_name
+        context.build_minimal(stuck, context.main_user)
+        command, environment = context.with_a_machinectl_that_stops_nothing(
+            [
+                str(SANDY),
+                "--workspace",
+                context.workspace.name,
+                "--shared",
+                context.shared.name,
+                "--user",
+                context.main_user,
+                "--container",
+                stuck,
+                "rm",
+                "--force",
+            ]
+        )
+        refused = context.run(command, expected=1, environment=environment)
+        assert_contains(refused, f"W: Container '{stuck}' did not stop")
+        assert_contains(
+            refused, f"E: Did not remove container '{stuck}': it did not stop"
+        )
+        if not context.machine_running(stuck):
+            raise E2EFailure("The container stopped, so the case tested nothing")
+        if not (SYSTEMD_MACHINES / f"sandy.{stuck}" / "etc").is_dir():
+            raise E2EFailure("rm removed the image of the running container")
+        context.remove_container(stuck, context.main_user)
+
     with context.case("up -d is never stopped by an attach exit"):
         context.sandy(
             ["up", "--detach", "--persistent", "--network", "host"], name=second

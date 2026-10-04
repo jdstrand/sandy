@@ -11253,7 +11253,7 @@ class ExecutionTests(unittest.TestCase):
                     with patch.object(
                         instance, "_wait_for_container_stop", manager.wait
                     ):
-                        instance._machine_poweroff()
+                        self.assertIs(instance._machine_poweroff(), True)
         # A successful poweroff is not followed by terminate, which would
         # fail with "No machine known".
         self.assertEqual(
@@ -11303,7 +11303,10 @@ class ExecutionTests(unittest.TestCase):
                     instance, "_wait_for_container_stop", manager.wait
                 ):
                     with captured_output() as (stdout, _):
-                        instance._machine_poweroff("other")
+                        stopped = instance._machine_poweroff("other")
+                # The callers need the result: rm keeps the image, and down
+                # exits 1, when the container did not stop.
+                self.assertIs(stopped, stopped_after_terminate)
                 self.assertEqual(
                     manager.mock_calls[1:],
                     [
@@ -11325,7 +11328,7 @@ class ExecutionTests(unittest.TestCase):
         with patch.object(instance, "_is_container_running", return_value=None):
             with patch.object(sandy, "_run_secure_subprocess") as run:
                 with captured_output() as (stdout, _):
-                    instance._machine_poweroff()
+                    self.assertIs(instance._machine_poweroff(), True)
         run.assert_not_called()
         self.assertIn("not found or not running", stdout.getvalue())
 
@@ -12578,9 +12581,18 @@ class CommandMethodTests(unittest.TestCase):
 
     def test_down_powers_off(self):
         instance = make_sandy()
-        with patch.object(instance, "_machine_poweroff") as poweroff:
+        with patch.object(instance, "_machine_poweroff", return_value=True) as poweroff:
             instance.run_down(SimpleNamespace())
         poweroff.assert_called_once_with()
+
+    def test_down_exits_1_when_the_container_did_not_stop(self):
+        # Regression test: down exited 0 after "did not stop", so a script
+        # went on as if the container had stopped. Mocks: the poweroff.
+        instance = make_sandy()
+        with patch.object(instance, "_machine_poweroff", return_value=False):
+            with self.assertRaises(SystemExit) as exited:
+                instance.run_down(SimpleNamespace())
+        self.assertEqual(exited.exception.code, 1)
 
 
 class RemovalTests(unittest.TestCase):
@@ -12694,6 +12706,102 @@ class RemovalTests(unittest.TestCase):
             with captured_output():
                 with self.assertRaises(SystemExit):
                     instance.run_rm(args, network=True)
+
+    def test_rm_keeps_a_container_that_did_not_stop(self):
+        # Regression test: after "did not stop", rm still cleaned the ports
+        # again and removed the image of the container, which still ran on
+        # it. Mocks: the query (the container runs), the poweroff and
+        # terminate commands, the stop waits (both time out), the port
+        # cleanup, and the removal. _machine_poweroff is real.
+        instance = make_sandy()
+        args = SimpleNamespace(container="ai-dev", force=True)
+        events: list[object] = []
+        with patch.object(
+            instance,
+            "_get_machine_dir",
+            return_value="/var/lib/machines/sandy.ai-dev",
+        ):
+            with patch.object(sandy.os.path, "exists", return_value=True):
+                with patch.object(
+                    instance, "_is_container_running", return_value="123"
+                ):
+                    with patch.object(
+                        instance,
+                        "_cleanup_port_mappings_for_container",
+                        side_effect=lambda *a, **k: events.append(("cleanup", a, k)),
+                    ):
+                        with patch.object(
+                            sandy,
+                            "_run_secure_subprocess",
+                            side_effect=lambda command, **_: events.append(command),
+                        ):
+                            with patch.object(
+                                instance, "_wait_for_container_stop", return_value=False
+                            ):
+                                with patch.object(
+                                    instance, "_remove_machine_dir"
+                                ) as remove:
+                                    with captured_output() as (stdout, _):
+                                        with self.assertRaises(SystemExit) as exited:
+                                            instance.run_rm(args)
+        self.assertEqual(exited.exception.code, 1)
+        remove.assert_not_called()
+        # Only the cleanup of the poweroff ran; rm did not clean again.
+        self.assertEqual(
+            events,
+            [
+                ("cleanup", ("ai-dev",), {"lock_timeout": None}),
+                ["machinectl", "poweroff", "ai-dev"],
+                ["machinectl", "terminate", "ai-dev"],
+            ],
+        )
+        self.assertIn("W: Container 'ai-dev' did not stop\n", stdout.getvalue())
+        self.assertIn(
+            "E: Did not remove container 'ai-dev': it did not stop\n",
+            stdout.getvalue(),
+        )
+
+    def test_rm_all_removes_the_others_when_one_did_not_stop(self):
+        # Mocks: two running containers; the poweroff of "stuck" fails. rm
+        # --all keeps that one, removes the other, and exits 1 at the end.
+        instance = make_sandy()
+        args = SimpleNamespace(container=None, force=True)
+        directories = [
+            "/var/lib/machines/sandy.stuck",
+            "/var/lib/machines/sandy.other",
+        ]
+        with patch.object(sandy.os.path, "exists", return_value=True):
+            with patch.object(sandy.glob, "glob", return_value=directories):
+                with patch.object(
+                    instance,
+                    "_get_cache_dir",
+                    return_value="/var/lib/machines/sandy.__cache",
+                ):
+                    with patch.object(
+                        instance, "_is_container_running", return_value="123"
+                    ):
+                        with patch.object(
+                            instance,
+                            "_machine_poweroff",
+                            side_effect=lambda name: name != "stuck",
+                        ) as poweroff:
+                            with patch.object(
+                                instance, "_cleanup_port_mappings_for_container"
+                            ) as cleanup:
+                                with patch.object(
+                                    instance, "_remove_machine_dir"
+                                ) as remove:
+                                    with captured_output() as (stdout, _):
+                                        with self.assertRaises(SystemExit) as exited:
+                                            instance.run_rm(args, all=True)
+        self.assertEqual(exited.exception.code, 1)
+        self.assertEqual(poweroff.call_args_list, [call("stuck"), call("other")])
+        cleanup.assert_called_once_with("other")
+        remove.assert_called_once_with("/var/lib/machines/sandy.other", prompt=False)
+        self.assertIn(
+            "E: Did not remove container 'stuck': it did not stop\n",
+            stdout.getvalue(),
+        )
 
     def test_rm_removes_nothing_when_the_machine_query_fails(self):
         # Regression test: a failed query meant "not running", so rm removed

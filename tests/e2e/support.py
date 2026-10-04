@@ -125,6 +125,23 @@ SYSTEMD_RUN_BINARY_DIRS = (Path("/usr/bin"), Path("/bin"))
 # bus. machinectl then exits 1 with "Connection refused" (measured on systemd
 # 249 and 257). Other processes keep the bus.
 SYSTEM_BUS_SOCKET = Path("/run/dbus/system_bus_socket")
+# To make a stop fail, a second script binds the real machinectl at a side
+# path and a stand-in over machinectl, in a private mount namespace. The
+# stand-in does nothing for poweroff and terminate, and runs the real binary,
+# which SANDY_TEST_MACHINECTL names, for each other command. sandy passes that
+# variable on to machinectl. Measured on systemd 249 and 257.
+MACHINECTL_BINARY_DIRS = (Path("/usr/bin"), Path("/bin"))
+STAND_IN_MACHINECTL_SCRIPT = (
+    'mount --bind -- "$1" "$2" && mount --bind -- "$3" "$1" && shift 3 && exec "$@"'
+)
+STAND_IN_MACHINECTL = """#!/bin/sh
+# E2E stand-in: poweroff and terminate do nothing. Each other command runs
+# the real machinectl, which the harness binds at SANDY_TEST_MACHINECTL.
+case "$1" in
+poweroff | terminate) exit 0 ;;
+esac
+exec "$SANDY_TEST_MACHINECTL" "$@"
+"""
 # The locks of the host, with the processes that wait for them.
 PROC_LOCKS = Path("/proc/locks")
 NFTABLES_TABLES = (
@@ -536,6 +553,42 @@ class E2EContext:
             str(SYSTEM_BUS_SOCKET),
             *command,
         ]
+
+    def with_a_machinectl_that_stops_nothing(
+        self, command: Sequence[str]
+    ) -> tuple[list[str], dict[str, str]]:
+        """Return command wrapped so that machinectl poweroff and terminate do
+        nothing, and the environment that the stand-in needs."""
+        located = shutil.which("machinectl", path=self.safe_environment()["PATH"])
+        if located is None:
+            raise E2EFailure("machinectl is not installed")
+        target = Path(located).resolve()
+        if target.parent not in MACHINECTL_BINARY_DIRS or not target.is_file():
+            raise E2EFailure(f"Unexpected machinectl binary: {target}")
+        stand_in = self.root / "stand-in-machinectl"
+        real = self.root / "real-machinectl"
+        if not stand_in.exists():
+            stand_in.write_text(STAND_IN_MACHINECTL, encoding="ascii")
+            stand_in.chmod(0o755)
+        if not real.exists():
+            real.write_bytes(b"")
+            real.chmod(0o755)
+        command = [
+            "unshare",
+            "--mount",
+            "--propagation",
+            "private",
+            "--",
+            "/bin/sh",
+            "-c",
+            STAND_IN_MACHINECTL_SCRIPT,
+            "sh",
+            str(target),
+            str(real),
+            str(stand_in),
+            *command,
+        ]
+        return command, self.safe_environment({"SANDY_TEST_MACHINECTL": str(real)})
 
     def with_a_broken_systemd_run(self, command: Sequence[str]) -> list[str]:
         """Return command wrapped so that systemd-run is found but cannot run."""

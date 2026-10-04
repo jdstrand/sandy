@@ -156,9 +156,10 @@ $ sudo /path/to/sandy [GLOBAL OPTIONS] [COMMAND] [COMMAND OPTIONS]
   - `--pids-limit N`, `--tmp-size SIZE`, and `--oom-score-adj N` set limits
     of this container, with the names and units of `docker run` and `podman
     run`. See "Resource limits" below.
-- `down` - Stop the container
+- `down` - Stop the container. It exits 1 when the container does not stop.
 - `rm` - Remove containers, cache, or network artifacts. Accepts `--all`,
-  `--force`, `--cache`, `--network`.
+  `--force`, `--cache`, `--network`. A running container that does not stop
+  keeps its image, and `rm` exits 1.
 - `bash` - Launch an interactive shell inside the running container (default
   when no command is supplied).
 - `exec` - Execute a specific command in the running container

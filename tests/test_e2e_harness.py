@@ -32,6 +32,7 @@ from tests.e2e.support import (
     REPO_ROOT,
     SANDY,
     SANDY_SCRIPT_NAMES,
+    STAND_IN_MACHINECTL,
     CommandResult,
     E2EContext,
     E2EFailure,
@@ -1299,6 +1300,88 @@ class SandyInvocationTests(unittest.TestCase):
                         with self.assertRaises(E2EFailure):
                             context.with_a_hidden_system_bus(["sandy"])
             self.assertFalse((root / "hidden-system-bus").exists())
+
+    def test_stand_in_machinectl_wraps_sandy_in_a_private_mount_namespace(self):
+        # Mocks: the lookup of machinectl, a file in a temporary directory.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary = root / "machinectl"
+            binary.write_bytes(b"")
+            context = self.make_context()
+            context.root = root
+            with patch(
+                "tests.e2e.support.shutil.which", return_value=str(binary)
+            ), patch("tests.e2e.support.MACHINECTL_BINARY_DIRS", (root,)):
+                command, environment = context.with_a_machinectl_that_stops_nothing(
+                    ["sandy", "rm"]
+                )
+            stand_in = root / "stand-in-machinectl"
+            real = root / "real-machinectl"
+            self.assertEqual(
+                command,
+                [
+                    "unshare",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    'mount --bind -- "$1" "$2" && mount --bind -- "$3" "$1" '
+                    '&& shift 3 && exec "$@"',
+                    "sh",
+                    str(binary),
+                    str(real),
+                    str(stand_in),
+                    "sandy",
+                    "rm",
+                ],
+            )
+            self.assertEqual(environment["SANDY_TEST_MACHINECTL"], str(real))
+            self.assertEqual(environment["LC_ALL"], "C.UTF-8")
+            self.assertEqual(stand_in.read_text(encoding="ascii"), STAND_IN_MACHINECTL)
+            self.assertEqual(stat.S_IMODE(stand_in.stat().st_mode), 0o755)
+            self.assertEqual(real.read_bytes(), b"")
+            self.assertEqual(stat.S_IMODE(real.stat().st_mode), 0o755)
+
+    def test_stand_in_machinectl_rejects_unexpected_binary(self):
+        context = self.make_context()
+        context.root = Path("/tmp/sandy-e2e-test")
+        for located in (None, "/tmp/machinectl"):
+            with self.subTest(located=located):
+                with patch("tests.e2e.support.shutil.which", return_value=located):
+                    with self.assertRaises(E2EFailure):
+                        context.with_a_machinectl_that_stops_nothing(["sandy"])
+
+    def test_stand_in_machinectl_stops_nothing_and_runs_the_real_one(self):
+        # Mocks: the real machinectl, a script that prints its arguments.
+        # The stand-in itself runs in a real /bin/sh.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stand_in = root / "stand-in-machinectl"
+            stand_in.write_text(STAND_IN_MACHINECTL, encoding="ascii")
+            real = root / "real-machinectl"
+            real.write_text('#!/bin/sh\necho "real: $*"\n', encoding="ascii")
+            real.chmod(0o755)
+            environment = {"PATH": "/usr/bin:/bin", "SANDY_TEST_MACHINECTL": str(real)}
+            outputs = {}
+            for verb in ("poweroff", "terminate", "show"):
+                completed = subprocess.run(
+                    ["/bin/sh", str(stand_in), verb, "e2e-main-abc123"],
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                    check=False,
+                )
+                outputs[verb] = (completed.returncode, completed.stdout)
+        self.assertEqual(
+            outputs,
+            {
+                "poweroff": (0, ""),
+                "terminate": (0, ""),
+                "show": (0, "real: show e2e-main-abc123\n"),
+            },
+        )
 
     def test_broken_systemd_run_rejects_unexpected_binary(self):
         context = self.make_context()

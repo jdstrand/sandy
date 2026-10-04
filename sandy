@@ -7166,12 +7166,13 @@ class Sandy:
         self,
         container_name: Optional[str] = None,
         port_lock_timeout: Optional[float] = None,
-    ) -> None:
+    ) -> bool:
         """Stop the container if it's running.
 
-        With port_lock_timeout, raise TimeoutError when the port mapping lock
-        is not free in that time. That comes before any change: the container
-        keeps running, with its port rules and state.
+        Return True when the container is stopped or did not run, and False
+        when it did not stop. With port_lock_timeout, raise TimeoutError when
+        the port mapping lock is not free in that time. That comes before any
+        change: the container keeps running, with its port rules and state.
         """
         if container_name is None:
             container_name = self.container
@@ -7179,7 +7180,7 @@ class Sandy:
         pid = self._is_container_running(container_name)
         if not pid:
             print(f"W: Container '{container_name}' not found or not running")
-            return
+            return True
 
         # Clean up port forwarding rules before stopping container
         self._cleanup_port_mappings_for_container(
@@ -7192,12 +7193,14 @@ class Sandy:
         # too, so that a following up can start the same name.
         _run_secure_subprocess(["machinectl", "poweroff", container_name])
         if self._wait_for_container_stop(container_name):
-            return
+            return True
         _run_secure_subprocess(
             ["machinectl", "terminate", container_name], stderr=subprocess.DEVNULL
         )
-        if not self._wait_for_container_stop(container_name):
-            print(f"W: Container '{container_name}' did not stop")
+        if self._wait_for_container_stop(container_name):
+            return True
+        print(f"W: Container '{container_name}' did not stop")
+        return False
 
     def _wait_for_container_stop(
         self, container_name: str, timeout: float = CONTAINER_POWEROFF_TIMEOUT
@@ -9808,6 +9811,7 @@ class Sandy:
             mdirs_to_remove.append(mdir)
 
         # Process each container directory
+        not_stopped = False
         for mdir in mdirs_to_remove:
             try:
                 con_name = _container_name_from_machine_path(mdir)
@@ -9825,7 +9829,15 @@ class Sandy:
                 if args.force or self._confirm(
                     f"Container {safe_con_name} is running. Power off and remove the container"
                 ):
-                    self._machine_poweroff(con_name)
+                    if not self._machine_poweroff(con_name):
+                        # The container still runs on its image: keep the
+                        # image, go on with the others, and exit 1 at the end.
+                        print(
+                            f"E: Did not remove container {safe_con_name}: "
+                            "it did not stop"
+                        )
+                        not_stopped = True
+                        continue
                     container_was_powered_off = True
                 else:
                     print(f"I: Skipping removal of running container {safe_con_name}")
@@ -9838,11 +9850,14 @@ class Sandy:
             self._cleanup_port_mappings_for_container(con_name)
 
             self._remove_machine_dir(mdir, prompt=not skip_removal_prompt)
+        if not_stopped:
+            sys.exit(1)
 
     def run_down(self, args):
-        """Stop and remove container"""
+        """Stop the container. Exit 1 when it did not stop."""
         _ = args
-        self._machine_poweroff()
+        if not self._machine_poweroff():
+            sys.exit(1)
 
     def run_bash(self, args):
         """Launch bash shell in container"""
