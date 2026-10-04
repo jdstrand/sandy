@@ -194,6 +194,10 @@ TEMPORARY_FILE_OPEN_FLAGS: Final = (
 )
 LOCK_FILE_OPEN_FLAGS: Final = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
 READ_FILE_OPEN_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+# An image can hold a FIFO, and a blocking open of a FIFO waits for a writer.
+# _open_image_file rejects each file that is not a regular file after the
+# open; O_NONBLOCK does not change the reads of a regular file.
+IMAGE_FILE_OPEN_FLAGS: Final = READ_FILE_OPEN_FLAGS | os.O_NONBLOCK
 PATH_OPEN_FLAGS: Final = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
 # Sandy resolves only short, known image paths. Use the POSIX minimum limit to
 # bound work from an untrusted image without rejecting normal filesystem layouts.
@@ -1001,7 +1005,7 @@ def _open_image_file(image_root_fd: int, components: Tuple[str, ...]) -> int:
         try:
             file_fd = os.open(
                 basename,
-                READ_FILE_OPEN_FLAGS,
+                IMAGE_FILE_OPEN_FLAGS,
                 dir_fd=parent_fd,
             )
         except OSError as exc:
@@ -1060,6 +1064,27 @@ def _parse_container_ip_from_init_fd(init_script_fd: int) -> Optional[str]:
     if not _validate_ip_address(container_ip):
         raise PermissionError("Container init script contains an invalid IP address")
     return container_ip
+
+
+def _read_machine_container_ip(machine_dir: str) -> Optional[str]:
+    """Read CONTAINER_IP from the /init.sh of a managed machine image.
+
+    Root in the container controls the image, so the file must be a regular
+    file in the pinned image root, with no link, and only its first
+    INIT_SCRIPT_MAX_BYTES are read. Return None when the image has no
+    /init.sh or the file names no address.
+    """
+    machine_fd = _open_verified_dir(machine_dir)
+    try:
+        init_script_fd = _open_optional_image_file(machine_fd, ("init.sh",))
+        if init_script_fd is None:
+            return None
+        try:
+            return _parse_container_ip_from_init_fd(init_script_fd)
+        finally:
+            os.close(init_script_fd)
+    finally:
+        os.close(machine_fd)
 
 
 def _create_init_bind_copy(
@@ -4921,7 +4946,10 @@ def _create_guest_files(
             )
             return
 
-        # Find used IP addresses by scanning existing init.sh files
+        # Find used IP addresses by scanning existing init.sh files. Root in
+        # each container controls its image, so read each file through the
+        # pinned image root, with no link and with a size limit. A file that
+        # is not safe to read reserves no address.
         used_ips = set()
         if os.path.exists(SYSTEMD_MACHINES):
             for container_dir in glob.glob(f"{SYSTEMD_MACHINES}/sandy.*"):
@@ -4929,22 +4957,20 @@ def _create_guest_files(
                 if container_dir.endswith(".__cache"):
                     continue
 
-                init_script = os.path.join(container_dir, "init.sh")
-                if os.path.exists(init_script):
-                    try:
-                        with open(init_script, "r") as f:
-                            content = f.read()
-                        # Look for CONTAINER_IP variable
-                        match = re.search(
-                            r'CONTAINER_IP="(\d+\.\d+\.\d+\.\d+)"', content
-                        )
-                        if match:
-                            used_ip = ipaddress.ip_address(match.group(1))
-                            if used_ip in network:
-                                used_ips.add(used_ip)
-                    except (OSError, ValueError, ipaddress.AddressValueError):
-                        # Skip files we can't read or parse
-                        continue
+                try:
+                    address = _read_machine_container_ip(container_dir)
+                except (OSError, ValueError) as exc:
+                    init_script = os.path.join(container_dir, "init.sh")
+                    print(
+                        "W: Did not reserve the address in "
+                        f"{_terminal_safe_repr(init_script)}: "
+                        f"{_terminal_safe_repr(str(exc))}"
+                    )
+                    continue
+                if address is not None:
+                    used_ip = ipaddress.ip_address(address)
+                    if used_ip in network:
+                        used_ips.add(used_ip)
 
         # Find first available IP starting from .10
         container_ip = None
@@ -8402,35 +8428,19 @@ class Sandy:
         network_cidr = self.network.network_cidr if self.network else None
         return _validate_container_ip_for_cidr(container_ip, network_cidr)
 
-    def _get_container_ip_from_init_fd(self, init_script_fd: int) -> Optional[str]:
-        """Extract and validate the container IP from a verified init descriptor."""
-        container_ip = _parse_container_ip_from_init_fd(init_script_fd)
-        if container_ip is None:
-            return None
-        return self._validate_container_ip_for_network(container_ip)
-
     def _get_container_ip(self) -> Optional[str]:
         """Extract container IP from /init.sh using contained descriptor resolution."""
         mdir = self._get_machine_dir()
-        machine_fd: Optional[int] = None
-        init_script_fd: Optional[int] = None
-
         try:
-            machine_fd = _open_verified_dir(mdir)
-            init_script_fd = _open_optional_image_file(machine_fd, ("init.sh",))
-            if init_script_fd is None:
+            container_ip = _read_machine_container_ip(mdir)
+            if container_ip is None:
                 return None
-            return self._get_container_ip_from_init_fd(init_script_fd)
+            return self._validate_container_ip_for_network(container_ip)
         except Exception as e:
             print(
                 "W: Could not read container IP from init script: "
                 f"{_terminal_safe_repr(str(e))}"
             )
-        finally:
-            if init_script_fd is not None:
-                os.close(init_script_fd)
-            if machine_fd is not None:
-                os.close(machine_fd)
 
         return None
 

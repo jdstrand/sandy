@@ -29,6 +29,7 @@ from tests.e2e.support import (
     SHARED_LIMITS,
     SLICE,
     SLICE_CGROUP,
+    SYSTEMD_MACHINES,
     E2EContext,
     E2EFailure,
     assert_contains,
@@ -51,6 +52,11 @@ WAIT_TIMEOUT = 30
 SCOPE_MARKERS = ("mounts-pending", "up-console")
 # The host port that an up publishes when a check under the lock refuses it.
 REFUSED_UP_PORT = 18089
+# A FIFO that root in a container makes in its image, and links /init.sh to.
+INIT_FIFO = "e2e-init-fifo"
+# A lenient build from the cache takes about 20 seconds. A scan that blocks
+# on the FIFO must fail the case well before BUILD_TIMEOUT.
+INIT_SCAN_TIMEOUT = 300
 # The host port of an up that finds the port mapping lock busy.
 BUSY_LOCK_UP_PORT = 18090
 # up waits for the port mapping lock under the lifecycle lock for 5 seconds
@@ -541,6 +547,19 @@ def _wait_stopped(context: E2EContext, name: str) -> None:
     _wait_for(
         "the scope is gone", lambda: _show(context, name, "LoadState") == "not-found"
     )
+
+
+def _init_address(name: str) -> str:
+    """Return the CONTAINER_IP that sandy wrote in the /init.sh of an image."""
+    init_script = SYSTEMD_MACHINES / f"sandy.{name}" / "init.sh"
+    match = re.search(
+        r'^CONTAINER_IP="([0-9.]+)"$',
+        init_script.read_text(encoding="ascii"),
+        re.MULTILINE,
+    )
+    if match is None:
+        raise E2EFailure(f"{init_script} names no CONTAINER_IP")
+    return match.group(1)
 
 
 @contextmanager
@@ -1347,6 +1366,43 @@ def test_main(context: E2EContext) -> None:
         actual = {prop: _show(context, second, prop) for prop in _default_limits()}
         if actual != _default_limits():
             raise E2EFailure(f"Scope properties after update {actual!r}")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("the address scan of a new image follows no /init.sh link"):
+        # Root in a container controls its image. A new image reserves the
+        # addresses in the /init.sh of the other images, and that scan must
+        # not follow a link there with host semantics. Here the link names a
+        # FIFO in the image, and a reader of a FIFO waits for a writer: the
+        # scan blocked up for good. The main image keeps its address.
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "host"], name=second
+        )
+        context.wait_for_machine(second, running=True)
+        context.sandy(
+            ["exec", "--", f"mkfifo /{INIT_FIFO} && ln -s {INIT_FIFO} /init.sh"],
+            name=second,
+            user="root",
+        )
+        planted = SYSTEMD_MACHINES / f"sandy.{second}" / "init.sh"
+        if not planted.is_symlink():
+            raise E2EFailure(f"The container did not make the link {planted}")
+        built = context.build_lenient(
+            context.scan_name, context.main_user, timeout=INIT_SCAN_TIMEOUT
+        )
+        assert_contains(
+            built,
+            f"W: Did not reserve the address in '{planted}': "
+            "\"Unsafe image file path component 'init.sh'\"",
+        )
+        main_init = SYSTEMD_MACHINES / f"sandy.{name}" / "init.sh"
+        assert_not_contains(built, f"W: Did not reserve the address in '{main_init}'")
+        if _init_address(context.scan_name) == _init_address(name):
+            raise E2EFailure("The new image got the address of the main image")
+        context.remove_container(context.scan_name, context.main_user)
+        context.sandy(
+            ["exec", "--", f"rm /init.sh /{INIT_FIFO}"], name=second, user="root"
+        )
         context.sandy(["down"], name=second)
         _wait_stopped(context, second)
 

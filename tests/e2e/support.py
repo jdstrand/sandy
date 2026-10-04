@@ -294,6 +294,7 @@ class E2EContext:
         self.mounts_name = f"e2e-mounts-{suffix}"
         self.nft_name = f"e2e-nft-{suffix}"
         self.nft_other_name = f"e2e-nft-other-{suffix}"
+        self.scan_name = f"e2e-scan-{suffix}"
         self.cache_user = "developer"
         self.cache_miss_user = "e2emiss"
         self.main_user = "developer"
@@ -347,6 +348,7 @@ class E2EContext:
             self.mounts_name,
             self.nft_name,
             self.nft_other_name,
+            self.scan_name,
         ):
             if not NAME_PATTERN.fullmatch(name):
                 raise E2EFailure(f"Generated unsafe container name: {name!r}")
@@ -1357,14 +1359,20 @@ class E2EContext:
         self.wait_for_machine(self.main_name, running=True)
         return result
 
-    def build_lenient(self, name: str, user: str) -> CommandResult:
-        """Build a persistent machine with the bridge network; leave it running."""
+    def build_lenient(
+        self, name: str, user: str, timeout: int = BUILD_TIMEOUT
+    ) -> CommandResult:
+        """Build a persistent machine with the bridge network; leave it running.
+
+        A case that expects a short build passes a shorter timeout, so that a
+        build that blocks fails soon.
+        """
         self.register_container(name, user)
         result = self.sandy(
             ["up", "--build", "--detach", "--persistent", "--network", "lenient"],
             name=name,
             user=user,
-            timeout=BUILD_TIMEOUT,
+            timeout=timeout,
             environment=self.minimal_environment(),
         )
         self.wait_for_machine(name, running=True)

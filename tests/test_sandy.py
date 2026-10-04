@@ -105,6 +105,42 @@ def state_file_handle(raw_state):
     yield handle
 
 
+def run_with_fifo_release(
+    target: Callable[[], object], fifos: list[Path], timeout: float = 5.0
+) -> tuple[object, BaseException | None, bool]:
+    """Run target in a thread; return its result, its exception, and blocked.
+
+    A blocking open of a FIFO for reading waits for a writer. When the thread
+    still runs after timeout, open each FIFO for writing without blocking, so
+    that the open returns, and report blocked. The test then fails at once,
+    with no hang.
+    """
+    outcome: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            outcome["result"] = target()
+        except BaseException as exc:  # the test checks each exception
+            outcome["exception"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    blocked = worker.is_alive()
+    if blocked:
+        for fifo in fifos:
+            try:
+                writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            os.close(writer)
+        worker.join(timeout)
+    exception = outcome.get("exception")
+    if not isinstance(exception, BaseException):
+        exception = None
+    return outcome.get("result"), exception, blocked
+
+
 class CliSmokeTests(unittest.TestCase):
     def test_executable_help_smoke(self):
         result = subprocess.run(
@@ -2268,6 +2304,28 @@ class FilesystemSafetyTests(unittest.TestCase):
             finally:
                 os.close(image_fd)
 
+    def test_image_file_resolution_rejects_a_fifo_without_blocking(self):
+        # Root in a container can put a FIFO at an image path. A blocking
+        # open of a FIFO waits for a writer, so the open must not block, and
+        # the file check must refuse the FIFO. Nothing is mocked: the FIFO,
+        # the open, and the check are real.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir)
+            fifo = image / "init.sh"
+            os.mkfifo(fifo, 0o644)
+            image_fd = os.open(image, sandy.DIRECTORY_OPEN_FLAGS)
+            try:
+                result, exception, blocked = run_with_fifo_release(
+                    lambda: sandy._open_image_file(image_fd, ("init.sh",)), [fifo]
+                )
+            finally:
+                os.close(image_fd)
+        if isinstance(result, int):
+            os.close(result)
+        self.assertFalse(blocked, "the open of the FIFO blocked")
+        self.assertIsInstance(exception, PermissionError)
+        self.assertEqual(str(exception), "Image file 'init.sh' is not a regular file")
+
     def test_image_file_resolution_rejects_mount_boundaries(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             image = Path(temp_dir)
@@ -2853,12 +2911,8 @@ class GuestFileTests(unittest.TestCase):
             writes.append((path, content, mode))
 
         def exists(path):
-            return (
-                path == sandy.SYSTEMD_MACHINES
-                or path == "/var/lib/machines/sandy.old/init.sh"
-            )
+            return path == sandy.SYSTEMD_MACHINES
 
-        opened = mock_open(read_data='CONTAINER_IP="10.20.30.10"\n')
         with patch.object(sandy, "_write", side_effect=record_write):
             with patch.object(sandy.os.path, "exists", side_effect=exists):
                 with patch.object(
@@ -2866,7 +2920,11 @@ class GuestFileTests(unittest.TestCase):
                     "glob",
                     return_value=["/var/lib/machines/sandy.old"],
                 ):
-                    with patch("builtins.open", opened):
+                    with patch.object(
+                        sandy,
+                        "_read_machine_container_ip",
+                        return_value="10.20.30.10",
+                    ) as read_address:
                         with captured_output():
                             sandy._create_guest_files(
                                 "/machine",
@@ -2875,6 +2933,7 @@ class GuestFileTests(unittest.TestCase):
                                 "10.20.30.1",
                             )
 
+        read_address.assert_called_once_with("/var/lib/machines/sandy.old")
         self.assertIn('CONTAINER_IP="10.20.30.11"', writes[-1][1])
 
     def test_create_guest_files_copies_utc_or_preserves_localtime(self):
@@ -2929,41 +2988,65 @@ class GuestFileTests(unittest.TestCase):
             "/var/lib/machines/sandy.__cache",
             "/var/lib/machines/sandy.missing",
             "/var/lib/machines/sandy.unreadable",
+            "/var/lib/machines/sandy.malformed",
         ]
 
-        def exists(path):
-            if path.endswith("sandy.missing/init.sh"):
-                return False
-            return True
+        def read_address(path):
+            if path.endswith("sandy.unreadable"):
+                raise OSError("unreadable\nforged")
+            if path.endswith("sandy.malformed"):
+                raise ValueError("malformed")
+            return None
 
-        opened = mock_open()
-        opened.side_effect = OSError("unreadable")
-        with patch.object(sandy.os.path, "exists", side_effect=exists):
+        with patch.object(sandy.os.path, "exists", return_value=True):
             with patch.object(sandy.glob, "glob", return_value=directories):
-                with patch("builtins.open", opened):
+                with patch.object(
+                    sandy,
+                    "_read_machine_container_ip",
+                    side_effect=read_address,
+                ) as read:
                     with patch.object(sandy, "_write") as write:
-                        with captured_output():
+                        with captured_output() as (stdout, _):
                             sandy._create_guest_files(
                                 "/machine",
                                 "test-box",
                                 "10.20.30.0/24",
                                 "10.20.30.1",
                             )
+        # The cache is not an image. An image with no /init.sh reserves no
+        # address, with no warning; an error gives one warning line.
+        self.assertEqual(read.call_args_list, [call(path) for path in directories[1:]])
         self.assertIn('CONTAINER_IP="10.20.30.10"', write.call_args.args[1])
+        output = stdout.getvalue()
+        self.assertIn(
+            "W: Did not reserve the address in "
+            "'/var/lib/machines/sandy.unreadable/init.sh': 'unreadable\\nforged'\n",
+            output,
+        )
+        self.assertIn(
+            "W: Did not reserve the address in "
+            "'/var/lib/machines/sandy.malformed/init.sh': 'malformed'\n",
+            output,
+        )
+        self.assertNotIn("unreadable\nforged", output)
+        self.assertNotIn("sandy.missing", output)
 
     def test_create_guest_files_reports_exhausted_address_pool(self):
         directories = [
             f"/var/lib/machines/sandy.container-{number}" for number in range(10, 254)
         ]
 
-        def open_init(path, *_args, **_kwargs):
-            container = Path(path).parent.name
-            number = int(container.rsplit("-", 1)[1])
-            return io.StringIO(f'CONTAINER_IP="10.20.30.{number}"\n')
+        def read_address(path):
+            number = int(path.rsplit("-", 1)[1])
+            return f"10.20.30.{number}"
 
         with patch.object(sandy.os.path, "exists", return_value=True):
             with patch.object(sandy.glob, "glob", return_value=directories):
-                with patch("builtins.open", side_effect=open_init):
+                with patch.object(
+                    sandy,
+                    "_read_machine_container_ip",
+                    side_effect=read_address,
+                ):
                     with patch.object(sandy, "_write") as write:
                         with captured_output() as (stdout, _):
                             sandy._create_guest_files(
@@ -2974,6 +3057,177 @@ class GuestFileTests(unittest.TestCase):
                             )
         self.assertEqual(write.call_count, 1)
         self.assertIn("No available IP addresses", stdout.getvalue())
+
+    def allocate_beside_images(
+        self, prepare: Callable[[Path, Path], list[Path]]
+    ) -> tuple[str, str, bool, str]:
+        """Allocate an address beside real images made by prepare.
+
+        prepare gets the machines directory and a directory outside it, and
+        returns the FIFOs that it made. Return the new /init.sh, the output,
+        whether the scan blocked, and the machines directory. Mocks:
+        SYSTEMD_MACHINES is a temporary directory, _open_verified_dir opens
+        an image there with no ownership check (the test user owns it, not
+        root), and _write records the guest files. The glob, the opens of
+        the image files, and the reads are real.
+        """
+        writes: list[tuple[str, str, int]] = []
+
+        def record_write(path: str, content: str, mode: int = 0o600) -> None:
+            writes.append((path, content, mode))
+
+        def open_machine(path: str) -> int:
+            return os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            machines = root / "machines"
+            outside = root / "outside"
+            new_image = root / "new"
+            for directory in (machines, outside, new_image / "etc"):
+                directory.mkdir(parents=True)
+            (new_image / "etc" / "localtime").write_text("", encoding="utf-8")
+            fifos = prepare(machines, outside)
+            with patch.object(sandy, "SYSTEMD_MACHINES", str(machines)):
+                with patch.object(
+                    sandy, "_open_verified_dir", side_effect=open_machine
+                ):
+                    with patch.object(sandy, "_write", side_effect=record_write):
+                        with captured_output() as (stdout, _):
+                            _, exception, blocked = run_with_fifo_release(
+                                lambda: sandy._create_guest_files(
+                                    str(new_image),
+                                    "new",
+                                    "10.20.30.0/24",
+                                    "10.20.30.1",
+                                ),
+                                fifos,
+                            )
+        if exception is not None:
+            raise exception
+        init_scripts = [
+            content for path, content, _ in writes if path.endswith("/init.sh")
+        ]
+        self.assertEqual(len(init_scripts), 1)
+        return init_scripts[0], stdout.getvalue(), blocked, str(machines)
+
+    def test_address_scan_reserves_the_address_of_a_safe_init_script(self):
+        def prepare(machines: Path, _outside: Path) -> list[Path]:
+            # The address of another network reserves nothing here.
+            for name, address in (("old", "10.20.30.10"), ("other", "10.99.0.11")):
+                image = machines / f"sandy.{name}"
+                image.mkdir()
+                init_script = image / "init.sh"
+                init_script.write_text(f'CONTAINER_IP="{address}"\n', encoding="utf-8")
+                init_script.chmod(0o644)
+            # An image of a host-network container has no /init.sh.
+            (machines / "sandy.host").mkdir()
+            return []
+
+        init_script, output, blocked, _ = self.allocate_beside_images(prepare)
+        self.assertFalse(blocked)
+        self.assertIn('CONTAINER_IP="10.20.30.11"', init_script)
+        self.assertNotIn("W:", output)
+
+    def test_address_scan_does_not_follow_an_init_script_link(self):
+        # Root in a container controls its image. Before the fix, the scan
+        # followed a link at /init.sh with host semantics: here it reserved
+        # the address in a file outside the image.
+        def prepare(machines: Path, outside: Path) -> list[Path]:
+            target = outside / "init.sh"
+            target.write_text('CONTAINER_IP="10.20.30.10"\n', encoding="utf-8")
+            target.chmod(0o644)
+            image = machines / "sandy.linked"
+            image.mkdir()
+            (image / "init.sh").symlink_to(target)
+            return []
+
+        init_script, output, blocked, machines = self.allocate_beside_images(prepare)
+        self.assertFalse(blocked)
+        self.assertIn('CONTAINER_IP="10.20.30.10"', init_script)
+        self.assertIn(
+            f"W: Did not reserve the address in '{machines}/sandy.linked/init.sh': "
+            "\"Unsafe image file path component 'init.sh'\"\n",
+            output,
+        )
+
+    def test_address_scan_reads_at_most_the_init_script_limit(self):
+        # Before the fix, the scan read the whole file. A link to /dev/zero,
+        # or a large file, then used memory with no limit.
+        def prepare(machines: Path, _outside: Path) -> list[Path]:
+            image = machines / "sandy.large"
+            image.mkdir()
+            init_script = image / "init.sh"
+            init_script.write_text(
+                'CONTAINER_IP="10.20.30.10"\n' + "#" * sandy.INIT_SCRIPT_MAX_BYTES,
+                encoding="utf-8",
+            )
+            init_script.chmod(0o644)
+            return []
+
+        init_script, output, blocked, machines = self.allocate_beside_images(prepare)
+        self.assertFalse(blocked)
+        self.assertIn('CONTAINER_IP="10.20.30.10"', init_script)
+        self.assertIn(
+            f"W: Did not reserve the address in '{machines}/sandy.large/init.sh': "
+            "'Container init script is too large'\n",
+            output,
+        )
+
+    def test_address_scan_does_not_block_on_a_fifo(self):
+        # Before the fix, the open of a FIFO at /init.sh waited for a writer,
+        # and up blocked for good.
+        def prepare(machines: Path, _outside: Path) -> list[Path]:
+            image = machines / "sandy.fifo"
+            image.mkdir()
+            fifo = image / "init.sh"
+            os.mkfifo(fifo, 0o644)
+            return [fifo]
+
+        init_script, output, blocked, machines = self.allocate_beside_images(prepare)
+        self.assertFalse(blocked, "the scan blocked in the open of a FIFO")
+        self.assertIn('CONTAINER_IP="10.20.30.10"', init_script)
+        self.assertIn(
+            f"W: Did not reserve the address in '{machines}/sandy.fifo/init.sh': "
+            "\"Image file 'init.sh' is not a regular file\"\n",
+            output,
+        )
+
+    def test_read_machine_container_ip_closes_its_descriptors(self):
+        # Mock: _open_verified_dir opens the temporary image with no
+        # ownership check. Each path must close each descriptor it opened.
+        def open_machine(path: str) -> int:
+            return os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+
+        def open_descriptors() -> int:
+            return len(os.listdir("/proc/self/fd"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir)
+            init_script = image / "init.sh"
+            cases = (
+                ('CONTAINER_IP="10.20.30.10"\n', "10.20.30.10", None),
+                ("no address\n", None, None),
+                ("#" * (sandy.INIT_SCRIPT_MAX_BYTES + 1), None, "too large"),
+                (None, None, None),
+            )
+            with patch.object(sandy, "_open_verified_dir", side_effect=open_machine):
+                for content, expected, error in cases:
+                    with self.subTest(expected=expected, error=error):
+                        if content is None:
+                            init_script.unlink()
+                        else:
+                            init_script.write_text(content, encoding="utf-8")
+                            init_script.chmod(0o644)
+                        before = open_descriptors()
+                        if error is None:
+                            self.assertEqual(
+                                sandy._read_machine_container_ip(temp_dir), expected
+                            )
+                        else:
+                            with self.assertRaisesRegex(PermissionError, error):
+                                sandy._read_machine_container_ip(temp_dir)
+                        self.assertEqual(open_descriptors(), before)
 
 
 class SandyInitializationTests(unittest.TestCase):

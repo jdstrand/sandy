@@ -1489,6 +1489,25 @@ class SandyInvocationTests(unittest.TestCase):
         for entry in sandy_call.call_args_list:
             self.assertNotIn("input_text", entry.kwargs)
 
+    def test_build_lenient_passes_its_timeout_to_sandy(self):
+        # A case that expects a short build passes a shorter timeout, so that
+        # a build that blocks fails soon. Mocks: sandy(), wait_for_machine().
+        context = self.make_context()
+        context.owned_containers = {}
+        with patch.object(E2EContext, "sandy") as sandy_call, patch.object(
+            E2EContext, "wait_for_machine"
+        ), patch.object(E2EContext, "minimal_environment", return_value={}):
+            context.build_lenient("e2e-lenient-abc123", "developer")
+            context.build_lenient("e2e-scan-abc123", "developer", timeout=300)
+        self.assertEqual(
+            [entry.kwargs["timeout"] for entry in sandy_call.call_args_list],
+            [support.BUILD_TIMEOUT, 300],
+        )
+        self.assertEqual(
+            context.owned_containers,
+            {"e2e-lenient-abc123": "developer", "e2e-scan-abc123": "developer"},
+        )
+
 
 class EnvironmentSettingTests(unittest.TestCase):
     """The host ids and the base image settings: strict parsing, nothing else."""
