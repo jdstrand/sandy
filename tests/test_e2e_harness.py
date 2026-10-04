@@ -1216,6 +1216,143 @@ class SandyInvocationTests(unittest.TestCase):
                     with self.assertRaises(E2EFailure):
                         context.without_iptables(["sandy"])
 
+    def test_broken_systemd_run_wraps_sandy_in_a_private_mount_namespace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            binary = root / "systemd-run"
+            binary.write_bytes(b"")
+            context = self.make_context()
+            context.root = root
+            with patch(
+                "tests.e2e.support.shutil.which", return_value=str(binary)
+            ), patch("tests.e2e.support.SYSTEMD_RUN_BINARY_DIRS", (root,)):
+                command = context.with_a_broken_systemd_run(["sandy", "up"])
+            blocker = root / "broken-systemd-run"
+            self.assertEqual(
+                command,
+                [
+                    "unshare",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    'mount --bind -- "$1" "$2" && shift 2 && exec "$@"',
+                    "sh",
+                    str(blocker),
+                    str(binary),
+                    "sandy",
+                    "up",
+                ],
+            )
+            # sandy finds the tool, and the exec of the supervisor fails with
+            # ENOEXEC.
+            self.assertEqual(stat.S_IMODE(blocker.stat().st_mode), 0o755)
+            self.assertEqual(blocker.read_bytes(), b"not an executable\n")
+
+    def test_broken_systemd_run_rejects_unexpected_binary(self):
+        context = self.make_context()
+        context.root = Path("/tmp/sandy-e2e-test")
+        for located in (None, "/tmp/systemd-run"):
+            with self.subTest(located=located):
+                with patch("tests.e2e.support.shutil.which", return_value=located):
+                    with self.assertRaises(E2EFailure):
+                        context.with_a_broken_systemd_run(["sandy"])
+
+    def test_start_up_runs_sandy_in_the_background_with_a_log(self):
+        # Mocks: subprocess.Popen.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context = self.make_context()
+            context.root = Path(temp_dir)
+            with patch("tests.e2e.support.subprocess.Popen") as popen:
+                named = context.start_up(
+                    "e2e-box",
+                    "developer",
+                    ["up", "--detach"],
+                    "interrupted-no-mounts",
+                    workspace="no-such-directory",
+                    shared="no-such-directory",
+                )
+                default = context.start_up("e2e-box", "developer", ["up"], "up")
+            self.assertEqual(
+                named,
+                (
+                    popen.return_value,
+                    context.root / "interrupted-no-mounts-e2e-box.log",
+                ),
+            )
+            self.assertEqual(default[1], context.root / "up-e2e-box.log")
+            self.assertTrue(named[1].is_file())
+            self.assertEqual(
+                [entry.args[0] for entry in popen.call_args_list],
+                [
+                    (
+                        str(SANDY),
+                        "--workspace",
+                        "no-such-directory",
+                        "--shared",
+                        "no-such-directory",
+                        "--user",
+                        "developer",
+                        "--container",
+                        "e2e-box",
+                        "up",
+                        "--detach",
+                    ),
+                    (
+                        str(SANDY),
+                        "--workspace",
+                        "workspace",
+                        "--shared",
+                        "shared",
+                        "--user",
+                        "developer",
+                        "--container",
+                        "e2e-box",
+                        "up",
+                    ),
+                ],
+            )
+            options = popen.call_args_list[0].kwargs
+            self.assertEqual(options["stdin"], subprocess.DEVNULL)
+            self.assertEqual(options["stdout"].name, str(named[1]))
+            self.assertEqual(options["stderr"], subprocess.STDOUT)
+            self.assertEqual(options["cwd"], context.root)
+            self.assertEqual(options["env"], context.safe_environment())
+            for name, log_name in (("box", "up"), ("e2e-box", "../up")):
+                with self.subTest(name=name, log_name=log_name):
+                    with self.assertRaises(E2EFailure):
+                        context.start_up(name, "developer", ["up"], log_name)
+            self.assertEqual(popen.call_count, 2)
+
+    def test_waits_for_flock_finds_only_a_flock_waiter_for_the_path(self):
+        # Mocks: the /proc/locks file, in the form that Linux 5.15 and 6.12
+        # print for a process that waits in flock(2).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "port_mappings.lock"
+            path.write_bytes(b"")
+            inode = path.stat().st_ino
+            other = inode + 1
+            locks = root / "locks"
+            locks.write_text(
+                f"1: FLOCK  ADVISORY  WRITE 100 08:02:{inode} 0 EOF\n"
+                f"1: -> FLOCK  ADVISORY  WRITE 200 08:02:{inode} 0 EOF\n"
+                f"2: POSIX  ADVISORY  WRITE 300 08:02:{inode} 0 EOF\n"
+                f"2: -> POSIX  ADVISORY  WRITE 400 08:02:{inode} 0 EOF\n"
+                f"3: FLOCK  ADVISORY  WRITE 500 00:22:{other} 0 EOF\n"
+                f"3: -> FLOCK  ADVISORY  WRITE 600 00:22:{other} 0 EOF\n",
+                encoding="utf-8",
+            )
+            with patch("tests.e2e.support.PROC_LOCKS", locks):
+                self.assertTrue(support.waits_for_flock(200, path))
+                # The holder, POSIX locks, and the waiters for another file
+                # do not count.
+                for pid in (100, 300, 400, 500, 600, 700):
+                    with self.subTest(pid=pid):
+                        self.assertFalse(support.waits_for_flock(pid, path))
+
     def test_sandy_passes_the_environment_unchanged(self):
         # Regression test: sandy no longer reads SUDO_UID (the ACL path is
         # gone), so the harness must not set it. Mocks: run().

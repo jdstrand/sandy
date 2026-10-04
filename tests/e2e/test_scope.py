@@ -8,18 +8,22 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import json
 import os
 import re
 import shlex
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from typing import BinaryIO
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from tests.e2e.support import (
     LIFECYCLE_LOCK,
+    PORT_LOCK,
     PORT_STATE,
     SANDY,
     SHARED_LIMITS,
@@ -29,6 +33,7 @@ from tests.e2e.support import (
     E2EFailure,
     assert_contains,
     assert_not_contains,
+    waits_for_flock,
 )
 
 CGROUP_SLICE = SLICE_CGROUP
@@ -45,6 +50,100 @@ WAIT_TIMEOUT = 30
 SCOPE_MARKERS = ("mounts-pending", "up-console")
 # The host port that an up publishes when a check under the lock refuses it.
 REFUSED_UP_PORT = 18089
+# The host port of an up that finds the port mapping lock busy.
+BUSY_LOCK_UP_PORT = 18090
+# up waits for the port mapping lock under the lifecycle lock for 5 seconds
+# (PORT_MAPPINGS_LOCK_TIMEOUT of sandy), and attaches wait for the lifecycle
+# lock for 10 (LIFECYCLE_LOCK_TIMEOUT).
+PORT_LOCK_WAIT = 5
+LIFECYCLE_LOCK_WAIT = 10
+# The host port of an up that gets SIGINT while it waits for the port mapping
+# lock, and how long it may take to exit then.
+INTERRUPTED_UP_PORT = 18091
+INTERRUPTED_UP_EXIT = 3
+# The host port of an up whose supervisor does not start.
+FAILED_START_PORT = 18092
+
+
+def _wait_for_the_publish_wait(
+    up: subprocess.Popen[bytes], lock: BinaryIO, log_path: Path, *, blocking: bool
+) -> None:
+    """Return when up waits for the port mapping lock to publish its ports.
+
+    The caller holds the lock through lock. At its start, up also waits for
+    the lock, to remove the stale port rules and state of its name. Let that
+    removal through, and take the lock back at once: up then needs only some
+    milliseconds to come to the publish. A woken waiter must try again, so
+    the caller can get the lock first; up then waits again, and the loop lets
+    it through again. "I: Limits of this container" is the last line before
+    the publish. Without the lifecycle lock, up then waits in flock(2), and
+    /proc/locks shows it as a waiter. Under the lifecycle lock, up polls with
+    LOCK_NB for PORT_LOCK_WAIT seconds; it starts in much less than one
+    second.
+    """
+    deadline = time.monotonic() + WAIT_TIMEOUT
+    while True:
+        if up.poll() is not None or time.monotonic() >= deadline:
+            raise E2EFailure("up did not wait to publish its ports")
+        # Look at the waits first: up prints nothing while it waits.
+        waiting = waits_for_flock(up.pid, PORT_LOCK)
+        limits = "I: Limits of this container" in log_path.read_text(
+            encoding="utf-8", errors="replace"
+        )
+        if limits and not blocking:
+            time.sleep(1)
+            break
+        if waiting:
+            if limits:
+                break
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            continue
+        time.sleep(0.01)
+    if up.poll() is not None:
+        raise E2EFailure("up did not wait to publish its ports")
+
+
+class _PortStateReader:
+    """Read the port state under the port mapping lock in a loop, as up does.
+
+    Count the reads, and the reads that find one key.
+    """
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self.reads = 0
+        self.found = 0
+        self.errors: list[BaseException] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._read, daemon=True)
+
+    def __enter__(self) -> "_PortStateReader":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=WAIT_TIMEOUT)
+        if self._thread.is_alive():
+            raise E2EFailure("The port state reader did not stop")
+
+    def _read(self) -> None:
+        try:
+            while not self._stop.is_set():
+                with PORT_LOCK.open("rb") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_SH)
+                    try:
+                        if PORT_STATE.exists():
+                            state = json.loads(PORT_STATE.read_text(encoding="utf-8"))
+                            if self.key in state:
+                                self.found += 1
+                        self.reads += 1
+                    finally:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                time.sleep(0.001)
+        except BaseException as exc:  # reported by the case
+            self.errors.append(exc)
 
 
 def _unit(name: str) -> str:
@@ -1239,6 +1338,184 @@ def test_main(context: E2EContext) -> None:
             key = f"tcp:{REFUSED_UP_PORT}"
             if PORT_STATE.exists() and key in context.port_state():
                 raise E2EFailure("The refused up left its port state")
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=context.main_user,
+        )
+        context.wait_for_machine(name, running=True)
+
+    with context.case("an up waits for a busy port mapping lock for a short time"):
+        # up publishes its ports under the lifecycle lock, which each attach
+        # waits for. Hold the port mapping lock from the time that up waits
+        # for the lifecycle lock: up must then fail before the start, with no
+        # port rule and no port state, and free the lifecycle lock in time.
+        context.stop_container(name, context.main_user)
+        _wait_stopped(context, name)
+        port = f"tcp:{BUSY_LOCK_UP_PORT}:80"
+        with ExitStack() as held:
+            taken: list[float] = []
+
+            def hold_the_port_lock() -> None:
+                lock = held.enter_context(PORT_LOCK.open("rb"))
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                taken.append(time.monotonic())
+
+            refused = context.up_with_a_change_while_it_waits(
+                name,
+                context.main_user,
+                [
+                    "up",
+                    "--detach",
+                    "--persistent",
+                    "--network",
+                    "lenient",
+                    "--port",
+                    port,
+                ],
+                hold_the_port_lock,
+            )
+            # The lifecycle lock is free now: up exited.
+            waited = time.monotonic() - taken[0]
+        if refused.returncode != 1:
+            raise E2EFailure(
+                f"up exited {refused.returncode}: {refused.output[-2000:]}"
+            )
+        assert_contains(
+            refused,
+            f"E: Could not publish the ports of '{name}': Timed out waiting for "
+            "the Sandy port mapping lock",
+        )
+        assert_not_contains(refused, "Starting")
+        if not PORT_LOCK_WAIT <= waited < LIFECYCLE_LOCK_WAIT:
+            raise E2EFailure(f"up held the lifecycle lock for {waited:.1f} seconds")
+        rules = context.run(["iptables", "-t", "nat", "-S", "sandy-nat-out"])
+        assert_not_contains(rules, f"--dport {BUSY_LOCK_UP_PORT}")
+        if PORT_STATE.exists() and f"tcp:{BUSY_LOCK_UP_PORT}" in context.port_state():
+            raise E2EFailure("The up with a busy lock left its port state")
+        if context.machine_running(name):
+            raise E2EFailure("The up with a busy lock started the container")
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=context.main_user,
+        )
+        context.wait_for_machine(name, running=True)
+
+    with context.case("a Ctrl-C while up waits for the port mapping lock stops up"):
+        # Regression test: up removed its ports on each exit after it began
+        # the publish, also on a Ctrl-C in the wait for the port mapping lock.
+        # That removal waited for the busy lock again, so the first Ctrl-C did
+        # not stop up. Hold the port mapping lock, and send SIGINT to an up
+        # that waits for it to publish its ports: up must exit at once, with
+        # no port rule and no port state. Without directories to mount (they
+        # do not exist), up waits in flock(2) with no limit; with them, it
+        # polls under the lifecycle lock.
+        context.stop_container(name, context.main_user)
+        _wait_stopped(context, name)
+        arguments = [
+            "up",
+            "--detach",
+            "--persistent",
+            "--network",
+            "lenient",
+            "--port",
+            f"tcp:{INTERRUPTED_UP_PORT}:80",
+        ]
+        for label, directory in (("no-mounts", "no-such-directory"), ("mounts", None)):
+            with PORT_LOCK.open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                up, log_path = context.start_up(
+                    name,
+                    context.main_user,
+                    arguments,
+                    f"interrupted-{label}",
+                    workspace=directory,
+                    shared=directory,
+                )
+                try:
+                    _wait_for_the_publish_wait(
+                        up, lock, log_path, blocking=directory is not None
+                    )
+                    up.send_signal(signal.SIGINT)
+                    try:
+                        up.wait(timeout=INTERRUPTED_UP_EXIT)
+                    except subprocess.TimeoutExpired:
+                        raise E2EFailure(
+                            f"up ({label}) did not stop at the first Ctrl-C"
+                        ) from None
+                finally:
+                    if up.poll() is None:
+                        up.kill()
+                        up.wait(timeout=10)
+            output = log_path.read_text(encoding="utf-8", errors="replace")
+            if up.returncode == 0 or "Starting" in output:
+                raise E2EFailure(
+                    f"up ({label}) exited {up.returncode}: {output[-2000:]}"
+                )
+            rules = context.run(["iptables", "-t", "nat", "-S", "sandy-nat-out"])
+            assert_not_contains(rules, f"--dport {INTERRUPTED_UP_PORT}")
+            key = f"tcp:{INTERRUPTED_UP_PORT}"
+            if PORT_STATE.exists() and key in context.port_state():
+                raise E2EFailure(f"up ({label}) left its port state")
+            if context.machine_running(name):
+                raise E2EFailure(f"up ({label}) started the container")
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=context.main_user,
+        )
+        context.wait_for_machine(name, running=True)
+
+    with context.case("no other process finds the ports of a start that failed"):
+        # Regression test: up released the port mapping lock after the publish
+        # of its ports, and then its start failed. A process that took the
+        # lock before the removal found the ports of that start, so an up of
+        # another name could refuse its own start ("already allocated"). Read
+        # the port state under the lock in a loop, as each up reads it, while
+        # an up publishes its ports and its supervisor does not start: no read
+        # may find those ports.
+        context.stop_container(name, context.main_user)
+        _wait_stopped(context, name)
+        key = f"tcp:{FAILED_START_PORT}"
+        command = context.with_a_broken_systemd_run(
+            [
+                str(SANDY),
+                "--workspace",
+                context.workspace.name,
+                "--shared",
+                context.shared.name,
+                "--user",
+                context.main_user,
+                "--container",
+                name,
+                "up",
+                "--detach",
+                "--persistent",
+                "--network",
+                "lenient",
+                "--port",
+                f"{key}:80",
+            ]
+        )
+        with _PortStateReader(key) as reader:
+            failed = context.run(command, expected=1)
+        if reader.errors:
+            raise E2EFailure(f"The port state reader failed: {reader.errors[0]!r}")
+        # The ports were published: "Starting" comes after the publish.
+        assert_contains(failed, f"I: Starting '{name}'")
+        assert_contains(failed, f"E: Could not start '{name}': ")
+        if reader.reads == 0 or reader.found:
+            raise E2EFailure(
+                f"{reader.found} of {reader.reads} reads found the ports of the "
+                "start that failed"
+            )
+        rules = context.run(["iptables", "-t", "nat", "-S", "sandy-nat-out"])
+        assert_not_contains(rules, f"--dport {FAILED_START_PORT}")
+        if PORT_STATE.exists() and key in context.port_state():
+            raise E2EFailure("The start that failed left its port state")
+        if context.machine_running(name):
+            raise E2EFailure("The start that failed started the container")
         context.sandy(
             ["up", "--detach", "--persistent", "--network", "lenient"],
             name=name,

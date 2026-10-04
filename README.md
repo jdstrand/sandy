@@ -417,8 +417,16 @@ Port mapping state uses a persistent `0600` coordination lock in
 empty lock and its directory so concurrent Sandy processes always coordinate
 on the same inode; it contains no port mappings or cache payload. The
 `lifecycle.lock`, `shared_limits.lock`, and `up-<name>.lock` files in the same
-directory are retained in the same way. `rm --cache` also keeps `shared_limits.json`, the
-shared limits that `update --shared` saved.
+directory are retained in the same way. `rm --cache` also keeps
+`shared_limits.json`, the shared limits that `update --shared` saved. `up`
+without `-d`, or with directories to mount, publishes its ports under the
+lifecycle lock, so it waits for the port mapping lock there for at most 5
+seconds. When that lock stays busy (for example, during `rm --cache`), `up`
+fails before it starts the container. `up -d` with no directories to mount
+takes no lifecycle lock, so it waits until the port mapping lock is free.
+`up` holds the port mapping lock from the publish until the container
+process starts. When that process does not start, `up` removes the ports
+before it releases the lock, so no other `up` finds them.
 
 
 ## Security

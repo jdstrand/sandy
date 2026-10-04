@@ -10,21 +10,17 @@ same way (up --detach --persistent --network lenient).
 
 from __future__ import annotations
 
-import fcntl
 import os
 import re
 import shlex
 import shutil
 import stat
-import subprocess
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from pathlib import Path
 
 from tests.e2e.support import (
-    LIFECYCLE_LOCK,
     MOUNTINFO,
-    SANDY,
     SLICE_CGROUP,
     SYSTEMD_MACHINES,
     CommandResult,
@@ -46,10 +42,6 @@ MOUNTS_PENDING = "mounts-pending"
 OWNER_LINE = re.compile(r"([0-9]+):([0-9]+) (/\S+)")
 SCOPE_GONE_TIMEOUT = 30
 FILE_PREFIX = "e2e-mounts-"
-# up waits for the lifecycle lock for at most 10 seconds
-# (LIFECYCLE_LOCK_TIMEOUT of sandy); it gets to the lock in a few.
-LOCK_WAIT_TIMEOUT = 60
-UP_TIMEOUT = 120
 
 
 def _parse_owners(text: str) -> dict[str, tuple[int, int]]:
@@ -280,66 +272,6 @@ def _assert_refused_before_start(
     assert_not_contains(result, "Limits of")
     _assert_not_started(context, name)
     _assert_no_new_temporary_directories(temporary_before)
-
-
-def _up_with_a_change_while_it_waits(
-    context: E2EContext,
-    name: str,
-    user: str,
-    arguments: list[str],
-    change: Callable[[], None],
-) -> CommandResult:
-    """Run up of name, and make a change while up waits for the lifecycle lock.
-
-    up checks the mount targets in the image before it waits for the lock
-    ("Limits of this container" is its last line before the lock). Hold the
-    lock until up waits for it, make the change, and release the lock. So
-    the change comes after the check of the targets and before the mounts.
-    """
-    log_path = context.root / f"lock-wait-mounts-{name}.log"
-    command = (
-        str(SANDY),
-        "--workspace",
-        context.workspace.name,
-        "--shared",
-        context.shared.name,
-        "--user",
-        user,
-        "--container",
-        name,
-        *arguments,
-    )
-    up: subprocess.Popen[bytes] | None = None
-    try:
-        with LIFECYCLE_LOCK.open("rb") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            print(f"    $ {shlex.join(command)} &", flush=True)
-            with log_path.open("w", encoding="utf-8") as stream:
-                up = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stream,
-                    stderr=subprocess.STDOUT,
-                    cwd=context.root,
-                    env=context.safe_environment(),
-                )
-            deadline = time.monotonic() + LOCK_WAIT_TIMEOUT
-            while "I: Limits of this container" not in log_path.read_text(
-                encoding="utf-8", errors="replace"
-            ):
-                if up.poll() is not None or time.monotonic() >= deadline:
-                    raise E2EFailure("up did not wait for the lifecycle lock")
-                time.sleep(0.1)
-            change()
-        # The close released the lock; up takes it now.
-        returncode = up.wait(timeout=UP_TIMEOUT)
-        return CommandResult(
-            command, returncode, log_path.read_text(encoding="utf-8"), ""
-        )
-    finally:
-        if up is not None and up.poll() is None:
-            up.kill()
-            up.wait(timeout=10)
 
 
 def _assert_no_new_temporary_directories(before: set[Path]) -> None:
@@ -729,8 +661,7 @@ def test_main(context: E2EContext) -> None:
                 os.symlink(moved.name, replaced)
 
             try:
-                refused = _up_with_a_change_while_it_waits(
-                    context,
+                refused = context.up_with_a_change_while_it_waits(
                     main,
                     user,
                     ["up", "--detach", "--persistent", "--network", "lenient"],

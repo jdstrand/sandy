@@ -9681,6 +9681,136 @@ class PortStateTests(unittest.TestCase):
         state_handle.close.assert_called_once_with()
         lock_handle.close.assert_called_once_with()
 
+    def test_port_mapping_lock_with_a_timeout_does_not_wait_longer(self):
+        # Mocks: the clock and the opens. The flock calls are real, on a
+        # temporary lock file that another descriptor holds.
+        instance = make_sandy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lock_path = Path(temp_dir) / "ports.lock"
+            opened = []
+
+            def open_lock(_path):
+                handle = lock_path.open("a+", encoding="utf-8")
+                opened.append(handle)
+                return handle
+
+            with patch.object(instance, "_ensure_cache_dir"), patch.object(
+                sandy, "_open_stable_lock_file", side_effect=open_lock
+            ), patch.object(
+                sandy, "_open_existing_managed_text_file", return_value=None
+            ) as open_state:
+                with lock_path.open("a+", encoding="utf-8") as holder:
+                    sandy.fcntl.flock(holder.fileno(), sandy.fcntl.LOCK_EX)
+                    body = MagicMock()
+                    with patch.object(
+                        sandy.time, "monotonic", side_effect=[100.0, 104.0, 106.0]
+                    ), patch.object(sandy.time, "sleep") as sleep:
+                        with self.assertRaisesRegex(
+                            TimeoutError,
+                            "^Timed out waiting for the Sandy port mapping lock$",
+                        ):
+                            with instance._port_mapping_lock(exclusive=True, timeout=5):
+                                body()
+                    body.assert_not_called()
+                    sleep.assert_called_once_with(sandy.LIFECYCLE_LOCK_RETRY_INTERVAL)
+                    open_state.assert_not_called()
+                    self.assertTrue(opened[0].closed)
+                # The lock is free now: the same call takes it at once.
+                with instance._port_mapping_lock(exclusive=True, timeout=5) as handle:
+                    self.assertIsNone(handle)
+                open_state.assert_called_once()
+
+    def test_port_mapping_lock_passes_its_timeout_and_name(self):
+        instance = make_sandy()
+        lock_path = instance._get_port_mappings_lock_path()
+        state_path = instance._get_port_mappings_path()
+        with patch.object(instance, "_ensure_cache_dir"), patch.object(
+            sandy, "_locked_state_file"
+        ) as locked:
+            with instance._port_mapping_lock(exclusive=False, timeout=3):
+                pass
+            with instance._port_mapping_lock(exclusive=True):
+                pass
+        self.assertEqual(
+            locked.call_args_list,
+            [
+                call(lock_path, state_path, False, 3, "port mapping"),
+                call(lock_path, state_path, True, None, "port mapping"),
+            ],
+        )
+
+    def test_port_mapping_lock_does_not_lock_again_in_an_exclusive_hold(self):
+        # up publishes its ports, and removes them when the start fails, in
+        # one hold of the lock. A second flock(2) on a new open of the lock
+        # file would wait for that hold. Mocks: the paths and the opens
+        # (temporary files); the flock calls are real and recorded. Another
+        # thread does not share the hold (see the waiter test below).
+        instance = make_sandy()
+        locks = []
+        real_flock = sandy.fcntl.flock
+
+        def flock(fd, operation):
+            locks.append(operation)
+            return real_flock(fd, operation)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "ports.json"
+            lock_path = Path(temp_dir) / "ports.lock"
+
+            def open_state(_path):
+                try:
+                    return state_path.open("r", encoding="utf-8")
+                except FileNotFoundError:
+                    return None
+
+            with patch.object(instance, "_ensure_cache_dir"), patch.object(
+                instance, "_get_port_mappings_path", return_value=str(state_path)
+            ), patch.object(
+                instance, "_get_port_mappings_lock_path", return_value=str(lock_path)
+            ), patch.object(
+                sandy,
+                "_open_stable_lock_file",
+                side_effect=lambda _path: lock_path.open("a+", encoding="utf-8"),
+            ), patch.object(
+                sandy, "_open_existing_managed_text_file", side_effect=open_state
+            ), patch.object(
+                sandy.fcntl, "flock", side_effect=flock
+            ):
+                with instance._port_mapping_lock(exclusive=True) as handle:
+                    self.assertIsNone(handle)
+                    with instance._port_mapping_lock(
+                        exclusive=True, timeout=5
+                    ) as inner:
+                        self.assertIsNone(inner)
+                    # A write in the hold replaces the state file. A call in
+                    # the hold opens the new file, and closes it.
+                    state_path.write_text("{}\n", encoding="utf-8")
+                    with instance._port_mapping_lock(exclusive=False) as inner:
+                        self.assertEqual(inner.read(), "{}\n")
+                    self.assertTrue(inner.closed)
+                    self.assertEqual(locks, [sandy.fcntl.LOCK_EX])
+                self.assertIsNone(instance._port_mapping_lock_holder)
+                # After the hold, a call locks again. A body that raises ends
+                # its hold, and a shared hold is never reentrant.
+                with self.assertRaisesRegex(ValueError, "^body failed$"):
+                    with instance._port_mapping_lock(exclusive=True):
+                        raise ValueError("body failed")
+                self.assertIsNone(instance._port_mapping_lock_holder)
+                with instance._port_mapping_lock(exclusive=False):
+                    self.assertIsNone(instance._port_mapping_lock_holder)
+        unlock = sandy.fcntl.LOCK_UN
+        self.assertEqual(
+            locks,
+            [
+                sandy.fcntl.LOCK_EX,
+                unlock,
+                sandy.fcntl.LOCK_EX,
+                unlock,
+                sandy.fcntl.LOCK_SH,
+                unlock,
+            ],
+        )
+
     def test_port_mapping_waiter_reads_state_only_after_stable_lock(self):
         instance = make_sandy()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -13133,9 +13263,28 @@ class RunUpTests(unittest.TestCase):
         self.pin_supervisor = self.start_patch(sandy, "_pin_supervisor", None)
         self.pin_supervisor.side_effect = pin_supervisor
         # The stale port rule cleanup at the start of up.
+        self.real_cleanup = sandy.Sandy._cleanup_port_mappings_for_container
         self.stale_cleanup = self.start_patch(
             sandy.Sandy, "_cleanup_port_mappings_for_container", None
         )
+        # The port mapping lock, which up holds from the publish of its ports
+        # until the supervisor starts. A test can make it raise. PortStateTests
+        # cover the lock itself.
+        self.real_port_lock = sandy.Sandy._port_mapping_lock
+        self.port_lock_error = None
+
+        @contextmanager
+        def port_lock(exclusive, timeout=None):
+            if self.port_lock_error is not None:
+                raise self.port_lock_error
+            self.lock_events.append(f"port lock {timeout}")
+            try:
+                yield None
+            finally:
+                self.lock_events.append("port unlock")
+
+        self.port_lock = self.start_patch(sandy.Sandy, "_port_mapping_lock", None)
+        self.port_lock.side_effect = port_lock
         reader = patch.object(
             sandy,
             "_read_keepalive_script",
@@ -13153,6 +13302,11 @@ class RunUpTests(unittest.TestCase):
     def nspawn_command(command):
         """Return the nspawn part of a systemd-run command."""
         return command[command.index("systemd-nspawn") :]
+
+    @staticmethod
+    def record_cleanup(events):
+        """Return a port cleanup mock that records each call in events."""
+        return lambda name: events.append(f"cleanup {name}")
 
     def arguments(self, **overrides):
         values = {
@@ -13546,6 +13700,478 @@ class RunUpTests(unittest.TestCase):
                 popen.assert_not_called()
                 self.wait_for_container_ready.assert_not_called()
 
+    def test_a_failed_supervisor_start_removes_the_ports_that_up_added(self):
+        # Regression test: up published its ports, the start failed, and up
+        # exited with the port rules and state still there. Then up removed
+        # them only after it released the port mapping lock, so another up
+        # could find the ports of a start that failed. Now the removal comes
+        # in the hold of the port mapping lock that the publish took. Mocks:
+        # the lifecycle lock and the port mapping lock (setUp), the port
+        # setup and its cleanup (the port forwarding tests cover the rules),
+        # the OOM score adjustment, and the start.
+        limit = sandy.PORT_MAPPINGS_LOCK_TIMEOUT
+        oom_score_adj = self.oom_score_adj.side_effect
+        for label, oom_error, popen_error, published, detach in (
+            ("oom score", ValueError("Malformed oom_score_adj"), None, True, True),
+            ("start", None, OSError(errno.ENOENT, "systemd-run"), True, True),
+            ("interrupt", None, KeyboardInterrupt(), True, True),
+            ("no ports", None, OSError(errno.ENOENT, "systemd-run"), False, True),
+            # Without -d, up holds the lifecycle lock while it starts.
+            ("oom score", ValueError("Malformed oom_score_adj"), None, True, False),
+            ("start", None, OSError(errno.ENOENT, "systemd-run"), True, False),
+            ("interrupt", None, KeyboardInterrupt(), True, False),
+        ):
+            with self.subTest(label=label, detach=detach):
+                events = self.lock_events
+                events.clear()
+                instance = make_sandy()
+                instance.workspace = None
+                instance.network = make_network()
+                instance.port_mappings = [("tcp", 8080, 80)] if published else []
+                self.stale_cleanup.reset_mock()
+                self.stale_cleanup.side_effect = self.record_cleanup(events)
+                self.oom_score_adj.side_effect = oom_error or oom_score_adj
+                with tempfile.TemporaryDirectory() as machine:
+                    init_script = Path(machine) / "init.sh"
+                    init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+                    init_script.chmod(0o644)
+                    with self.up_mocks(instance, machine) as mocks, patch.object(
+                        instance,
+                        "_setup_port_forwarding_rules",
+                        side_effect=lambda ip: events.append(f"ports {ip}"),
+                    ), patch.object(sandy.os, "fchown"):
+                        mocks.popen.side_effect = popen_error
+                        with captured_output() as (stdout, _):
+                            with self.assertRaises(
+                                (SystemExit, KeyboardInterrupt)
+                            ) as raised:
+                                instance.run_up(
+                                    self.arguments(network="lenient", detach=detach)
+                                )
+                if label == "interrupt":
+                    self.assertIsInstance(raised.exception, KeyboardInterrupt)
+                else:
+                    self.assertEqual(
+                        (type(raised.exception), getattr(raised.exception, "code")),
+                        (SystemExit, 1),
+                    )
+                    self.assertIn("E: Could not start 'ai-dev': ", stdout.getvalue())
+                mocks.stop.assert_not_called()
+                # The removal comes in the hold of the publish. Without the
+                # lifecycle lock, up waits for the port mapping lock with no
+                # limit.
+                hold = [
+                    f"port lock {None if detach else limit}",
+                    "ports 10.200.1.10",
+                    "cleanup ai-dev",
+                    "port unlock",
+                ]
+                started = hold if published else []
+                if not detach:
+                    started = ["enter", *started, "exit"]
+                # The first cleanup is the one of stale rules, at the start.
+                self.assertEqual(events, ["cleanup ai-dev", *started])
+
+    def test_up_removes_its_ports_on_each_exit_before_the_start(self):
+        # Regression test: an interrupt or an error after the port state was
+        # written and before the start (in the port rules, or in the print of
+        # "Starting") left the port rules and state. Mocks: the lifecycle lock
+        # and the port mapping lock (setUp), the port setup and its cleanup
+        # (the port forwarding tests cover the rules), and the start
+        # (up_mocks).
+        limit = sandy.PORT_MAPPINGS_LOCK_TIMEOUT
+        for label, error, in_print, detach in (
+            ("rules interrupted", KeyboardInterrupt(), False, True),
+            ("rules failed", OSError(errno.EPERM, "iptables"), False, True),
+            ("print failed", OSError(errno.EIO, "Input/output error"), True, True),
+            # Without -d, up holds the lifecycle lock while it publishes.
+            ("rules interrupted", KeyboardInterrupt(), False, False),
+            ("rules failed", OSError(errno.EPERM, "iptables"), False, False),
+            ("print failed", OSError(errno.EIO, "Input/output error"), True, False),
+        ):
+            with self.subTest(label=label, detach=detach):
+                events = self.lock_events
+                events.clear()
+                instance = make_sandy()
+                instance.workspace = None
+                instance.network = make_network()
+                instance.port_mappings = [("tcp", 8080, 80)]
+                self.stale_cleanup.reset_mock()
+                self.stale_cleanup.side_effect = self.record_cleanup(events)
+
+                def publish(ip):
+                    # The port state is written; the rules come next.
+                    events.append(f"ports {ip}")
+                    if not in_print:
+                        raise error
+
+                with tempfile.TemporaryDirectory() as machine:
+                    init_script = Path(machine) / "init.sh"
+                    init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+                    init_script.chmod(0o644)
+                    with self.up_mocks(instance, machine) as mocks, patch.object(
+                        instance, "_setup_port_forwarding_rules", side_effect=publish
+                    ), patch.object(sandy.os, "fchown"):
+                        with captured_output() as (stdout, _):
+                            write = stdout.write
+
+                            def failing_write(text):
+                                if in_print and text.startswith("I: Starting"):
+                                    raise error
+                                return write(text)
+
+                            stdout.write = failing_write
+                            with self.assertRaises(type(error)):
+                                instance.run_up(
+                                    self.arguments(network="lenient", detach=detach)
+                                )
+                mocks.popen.assert_not_called()
+                mocks.stop.assert_not_called()
+                # The removal comes in the hold of the publish.
+                hold = [
+                    f"port lock {None if detach else limit}",
+                    "ports 10.200.1.10",
+                    "cleanup ai-dev",
+                    "port unlock",
+                ]
+                if not detach:
+                    hold = ["enter", *hold, "exit"]
+                # The first cleanup is the one of stale rules, at the start.
+                self.assertEqual(events, ["cleanup ai-dev", *hold])
+
+    def test_an_exit_before_the_port_state_write_does_not_wait_again(self):
+        # Regression test: up removed its ports on each exit after it began
+        # the publish, also on an exit before the port state write: a Ctrl-C
+        # in the wait for the port mapping lock, or a port conflict. That
+        # removal waited for the busy lock again, so the first Ctrl-C did not
+        # stop up. Now up takes the lock once, before the publish, and
+        # removes the ports in that hold. Mocks: the lifecycle lock and the
+        # port mapping lock (setUp; a Ctrl-C in the wait raises
+        # KeyboardInterrupt there), the port state (a conflict exits before
+        # the write), the rules, and the start (up_mocks).
+        limit = sandy.PORT_MAPPINGS_LOCK_TIMEOUT
+        for label, detach in (
+            ("interrupt", True),
+            ("conflict", True),
+            # Without -d, up waits for the port mapping lock under the
+            # lifecycle lock.
+            ("interrupt", False),
+            ("conflict", False),
+        ):
+            with self.subTest(label=label, detach=detach):
+                events = self.lock_events
+                events.clear()
+                instance = make_sandy()
+                instance.workspace = None
+                instance.network = make_network()
+                instance.port_mappings = [("tcp", 8080, 80)]
+                self.stale_cleanup.reset_mock()
+                self.stale_cleanup.side_effect = self.record_cleanup(events)
+                self.port_lock.reset_mock()
+                interrupted = label == "interrupt"
+                self.port_lock_error = KeyboardInterrupt() if interrupted else None
+
+                def update(name, ip):
+                    # The check finds the port of another container.
+                    events.append(f"conflict {name} {ip}")
+                    sys.exit(1)
+
+                with tempfile.TemporaryDirectory() as machine, ExitStack() as stack:
+                    init_script = Path(machine) / "init.sh"
+                    init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+                    init_script.chmod(0o644)
+                    mocks = stack.enter_context(self.up_mocks(instance, machine))
+                    if not interrupted:
+                        stack.enter_context(
+                            patch.object(
+                                instance,
+                                "_update_port_mapping_state",
+                                side_effect=update,
+                            )
+                        )
+                    rules = stack.enter_context(
+                        patch.object(instance, "_setup_port_forwarding_ipt")
+                    )
+                    stack.enter_context(patch.object(sandy.os, "fchown"))
+                    stack.enter_context(captured_output())
+                    with self.assertRaises((SystemExit, KeyboardInterrupt)) as raised:
+                        instance.run_up(
+                            self.arguments(network="lenient", detach=detach)
+                        )
+                timeout = None if detach else limit
+                # One wait for the port mapping lock, before the publish.
+                self.port_lock.assert_called_once_with(exclusive=True, timeout=timeout)
+                rules.assert_not_called()
+                mocks.popen.assert_not_called()
+                if interrupted:
+                    self.assertIsInstance(raised.exception, KeyboardInterrupt)
+                    hold = []
+                else:
+                    self.assertEqual(
+                        (type(raised.exception), getattr(raised.exception, "code")),
+                        (SystemExit, 1),
+                    )
+                    hold = [
+                        f"port lock {timeout}",
+                        "conflict ai-dev 10.200.1.10",
+                        "cleanup ai-dev",
+                        "port unlock",
+                    ]
+                if not detach:
+                    hold = ["enter", *hold, "exit"]
+                # The first cleanup is the one of stale rules, at the start.
+                self.assertEqual(events, ["cleanup ai-dev", *hold])
+
+    def test_no_other_process_finds_the_ports_of_a_failed_start(self):
+        # Regression test: up released the port mapping lock after the publish
+        # of its ports, and then the start failed. A process that took the
+        # lock before the removal found the ports of a start that failed, so
+        # an up of another name refused its own start ("already allocated").
+        # Now up holds the lock from the publish until the start, and removes
+        # the ports in that hold. Mocks: the lifecycle lock (setUp), the paths
+        # and the opens of the lock and the state file (temporary files; the
+        # flock calls are real), the state write, the rules, and the start,
+        # which fails. A thread with a second instance takes the lock on its
+        # own open of the lock file, as another process does.
+        real_flock = sandy.fcntl.flock
+        for detach in (True, False):
+            with self.subTest(detach=detach):
+                self.lock_events.clear()
+                instance = make_sandy()
+                instance.workspace = None
+                instance.network = make_network()
+                instance.port_mappings = [("tcp", 8080, 80)]
+                other = make_sandy()
+                found = []
+                other_tried = threading.Event()
+
+                def flock(fd, operation):
+                    if threading.current_thread() is threading.main_thread():
+                        return real_flock(fd, operation)
+                    try:
+                        return real_flock(fd, operation)
+                    finally:
+                        other_tried.set()
+
+                def other_process():
+                    with self.real_port_lock(
+                        other, exclusive=True, timeout=5
+                    ) as handle:
+                        found.append(other._load_port_mapping_state(handle))
+
+                waiter = threading.Thread(target=other_process)
+
+                def start(*_args, **_kwargs):
+                    # The ports are published. The other process tries the
+                    # lock now, and up then fails to start.
+                    waiter.start()
+                    self.assertTrue(other_tried.wait(timeout=5))
+                    raise OSError(errno.ENOENT, "systemd-run")
+
+                with tempfile.TemporaryDirectory() as temp_dir, ExitStack() as stack:
+                    root = Path(temp_dir)
+                    state_path = root / "ports.json"
+                    lock_path = root / "ports.lock"
+                    machine = root / "machine"
+                    machine.mkdir()
+                    init_script = machine / "init.sh"
+                    init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+                    init_script.chmod(0o644)
+
+                    def open_state(_path):
+                        try:
+                            return state_path.open("r", encoding="utf-8")
+                        except FileNotFoundError:
+                            return None
+
+                    def write(path, content, mode):
+                        self.assertEqual(mode, 0o600)
+                        new_path = Path(path).with_suffix(".new")
+                        new_path.write_text(content, encoding="utf-8")
+                        os.replace(new_path, path)
+
+                    def published(container_ip):
+                        state = json.loads(state_path.read_text(encoding="utf-8"))
+                        self.assertEqual(list(state), ["tcp:8080"])
+                        self.lock_events.append(f"rules {container_ip}")
+
+                    mocks = stack.enter_context(self.up_mocks(instance, machine))
+                    for target in (instance, other):
+                        stack.enter_context(
+                            patch.object(
+                                target,
+                                "_get_port_mappings_path",
+                                return_value=str(state_path),
+                            )
+                        )
+                        stack.enter_context(
+                            patch.object(
+                                target,
+                                "_get_port_mappings_lock_path",
+                                return_value=str(lock_path),
+                            )
+                        )
+                    stack.enter_context(
+                        patch.object(
+                            sandy,
+                            "_open_stable_lock_file",
+                            side_effect=lambda _path: lock_path.open(
+                                "a+", encoding="utf-8"
+                            ),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            sandy,
+                            "_open_existing_managed_text_file",
+                            side_effect=open_state,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(sandy, "_write", side_effect=write)
+                    )
+                    stack.enter_context(
+                        patch.object(sandy.fcntl, "flock", side_effect=flock)
+                    )
+                    # The real removal of the state, which up_mocks replaces.
+                    stack.enter_context(
+                        patch.object(
+                            instance,
+                            "_remove_port_mappings_from_state",
+                            side_effect=lambda name: (
+                                sandy.Sandy._remove_port_mappings_from_state(
+                                    instance, name
+                                )
+                            ),
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            instance,
+                            "_setup_port_forwarding_ipt",
+                            side_effect=published,
+                        )
+                    )
+                    removed = stack.enter_context(
+                        patch.object(instance, "_cleanup_port_forwarding_ipt")
+                    )
+                    stack.enter_context(patch.object(sandy.os, "fchown"))
+                    self.port_lock.side_effect = lambda **kwargs: (
+                        self.real_port_lock(instance, **kwargs)
+                    )
+                    self.stale_cleanup.side_effect = lambda name: self.real_cleanup(
+                        instance, name
+                    )
+                    mocks.popen.side_effect = start
+                    stdout = stack.enter_context(captured_output())[0]
+                    with self.assertRaises(SystemExit) as exited:
+                        instance.run_up(
+                            self.arguments(network="lenient", detach=detach)
+                        )
+                    waiter.join(timeout=10)
+                    self.assertFalse(state_path.exists())
+                self.assertFalse(waiter.is_alive())
+                self.assertEqual(exited.exception.code, 1)
+                self.assertIn("E: Could not start 'ai-dev': ", stdout.getvalue())
+                # The other process got the lock only after the removal.
+                self.assertEqual(found, [{}])
+                removed.assert_called_once_with("10.200.1.10")
+                mocks.stop.assert_not_called()
+                rules = ["rules 10.200.1.10"]
+                self.assertEqual(
+                    self.lock_events, rules if detach else ["enter", *rules, "exit"]
+                )
+                self.assertIsNone(instance._port_mapping_lock_holder)
+
+    def test_up_stops_when_the_port_mapping_lock_stays_busy(self):
+        # Regression test: up waited for the port mapping lock without a limit
+        # while it held the lifecycle lock, so each attach failed after
+        # LIFECYCLE_LOCK_TIMEOUT. Mocks: the port mapping lock (setUp), which
+        # times out.
+        self.assertLess(sandy.PORT_MAPPINGS_LOCK_TIMEOUT, sandy.LIFECYCLE_LOCK_TIMEOUT)
+        self.port_lock_error = TimeoutError(
+            "Timed out waiting for the Sandy port mapping lock"
+        )
+        instance = make_sandy()
+        instance.workspace = None
+        instance.network = make_network()
+        instance.port_mappings = [("tcp", 8080, 80)]
+        with tempfile.TemporaryDirectory() as machine:
+            init_script = Path(machine) / "init.sh"
+            init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+            init_script.chmod(0o644)
+            with self.up_mocks(instance, machine) as mocks, patch.object(
+                instance, "_setup_port_forwarding_rules"
+            ) as publish, patch.object(sandy.os, "fchown"):
+                with captured_output() as (stdout, _):
+                    with self.assertRaises(SystemExit) as exited:
+                        instance.run_up(self.arguments(network="lenient", detach=False))
+        self.assertEqual(exited.exception.code, 1)
+        self.port_lock.assert_called_once_with(
+            exclusive=True, timeout=sandy.PORT_MAPPINGS_LOCK_TIMEOUT
+        )
+        publish.assert_not_called()
+        self.assertIn(
+            "E: Could not publish the ports of 'ai-dev': Timed out waiting for "
+            "the Sandy port mapping lock\n",
+            stdout.getvalue(),
+        )
+        mocks.popen.assert_not_called()
+        mocks.stop.assert_not_called()
+        # The lifecycle lock is free again. The state did not change, so only
+        # the cleanup of stale rules at the start ran.
+        self.assertEqual(self.lock_events, ["enter", "exit"])
+        self.stale_cleanup.assert_called_once_with("ai-dev")
+
+    def test_up_limits_the_port_lock_wait_only_under_the_lifecycle_lock(self):
+        # Regression test: up -d with no directories to mount holds no
+        # lifecycle lock, but it also waited for the port mapping lock for at
+        # most 5 seconds. So it failed while rm --cache held that lock, where
+        # it had waited and started before. Mocks: the lifecycle lock and the
+        # port mapping lock (setUp), the port setup, and the start (up_mocks).
+        limit = sandy.PORT_MAPPINGS_LOCK_TIMEOUT
+        hold = [f"port lock {limit}", "ports", "port unlock"]
+        for label, detach, mount, expected in (
+            # No process waits for an up without the lifecycle lock.
+            ("up -d", True, False, ["port lock None", "ports", "port unlock"]),
+            (
+                "up -d with mounts",
+                True,
+                True,
+                ["enter", *hold, "pending ai-dev", "exit"],
+            ),
+            ("up", False, False, ["enter", *hold, "marker ai-dev", "exit"]),
+        ):
+            with self.subTest(label=label):
+                events = self.lock_events
+                events.clear()
+                instance = make_sandy()
+                instance.network = make_network()
+                instance.port_mappings = [("tcp", 8080, 80)]
+                with ExitStack() as stack:
+                    if mount:
+                        machine, _, _ = stack.enter_context(self.mount_dirs(instance))
+                    else:
+                        instance.workspace = None
+                        machine = Path(
+                            stack.enter_context(tempfile.TemporaryDirectory())
+                        )
+                    init_script = machine / "init.sh"
+                    init_script.write_text('CONTAINER_IP="10.200.1.10"\n')
+                    init_script.chmod(0o644)
+                    stack.enter_context(self.up_mocks(instance, machine))
+                    stack.enter_context(
+                        patch.object(
+                            instance,
+                            "_setup_port_forwarding_rules",
+                            side_effect=lambda ip: events.append("ports"),
+                        )
+                    )
+                    stack.enter_context(patch.object(sandy.os, "fchown"))
+                    stack.enter_context(captured_output())
+                    instance.run_up(self.arguments(network="lenient", detach=detach))
+                self.assertEqual(events, expected)
+
     def test_keepalive_open_is_not_awaited_before_ready(self):
         instance = make_sandy()
         instance.workspace = None
@@ -13831,6 +14457,9 @@ class RunUpTests(unittest.TestCase):
                                     instance.run_up(args)
 
         self.assertEqual(instance.port_mappings, [("tcp", 8080, 80)])
+        # up -d with no directories to mount holds no lifecycle lock, so it
+        # waits for the port mapping lock with no limit.
+        self.port_lock.assert_called_once_with(exclusive=True, timeout=None)
         forwarding.assert_called_once_with(None)
         command = popen.call_args.args[0]
         self.assertIn("--network-bridge=sandybr0", command)
@@ -13912,9 +14541,18 @@ class RunUpTests(unittest.TestCase):
         # the stop removes the port forwarding rules.
         self.exec.assert_called_once_with(None, login_shell=True, console=True)
         # The pending marker and the console marker exist before the lock is
-        # released, in that order.
+        # released, in that order. The port mapping lock is held only from
+        # the publish until the start.
         self.assertEqual(
-            self.lock_events, ["enter", "pending ai-dev", "marker ai-dev", "exit"]
+            self.lock_events,
+            [
+                "enter",
+                f"port lock {sandy.PORT_MAPPINGS_LOCK_TIMEOUT}",
+                "port unlock",
+                "pending ai-dev",
+                "marker ai-dev",
+                "exit",
+            ],
         )
         self.machine_poweroff.assert_not_called()
         cleanup.assert_not_called()
@@ -14415,7 +15053,15 @@ class RunUpTests(unittest.TestCase):
             (
                 "started",
                 None,
-                ["enter", "ports 10.200.1.10", "popen", "pending ai-dev", "exit"],
+                [
+                    "enter",
+                    f"port lock {sandy.PORT_MAPPINGS_LOCK_TIMEOUT}",
+                    "ports 10.200.1.10",
+                    "popen",
+                    "port unlock",
+                    "pending ai-dev",
+                    "exit",
+                ],
             ),
         ):
             with self.subTest(label=label):

@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 import tty
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from typing import (
     Any,
     Callable,
@@ -60,6 +60,13 @@ LIFECYCLE_LOCK_TIMEOUT: Final = 10
 UP_LOCK_FILENAME_PREFIX: Final = "up-"
 UP_LOCK_FILENAME_SUFFIX: Final = ".lock"
 LIFECYCLE_LOCK_RETRY_INTERVAL: Final = 0.05
+# An up that publishes its ports under the lifecycle lock (without -d, or with
+# directories to mount) waits for the port mapping lock there for at most this
+# long. It stays below LIFECYCLE_LOCK_TIMEOUT, the wait of each attach for the
+# lifecycle lock. Without the lifecycle lock, up waits with no limit. up holds
+# the port mapping lock until its supervisor starts; when the supervisor does
+# not start, up removes its ports before it releases the lock, with no wait.
+PORT_MAPPINGS_LOCK_TIMEOUT: Final = 5
 INIT_SCRIPT_MAX_BYTES: Final = 8192
 # The container payload (PID 2) is the image's bash, started through a symlink
 # named sandy-keepalive, reading a copy of sandy-keepalive.sh. Both are in a
@@ -2356,19 +2363,27 @@ def _open_stable_lock_file(path: str) -> Any:
 
 @contextmanager  # ensures flock acquisition/release is paired at the call site
 def _locked_state_file(
-    lock_path: str, state_path: str, exclusive: bool
+    lock_path: str,
+    state_path: str,
+    exclusive: bool,
+    timeout: Optional[float] = None,
+    name: str = "state",
 ) -> Iterator[Optional[Any]]:
     """Hold a stable lock inode and yield its state file, or None without one.
 
     The state file opens only after the lock is held. Opening it before
     flock() would pin an obsolete inode while another holder atomically
-    replaces the state path.
+    replaces the state path. Without a timeout, wait for the lock as long
+    as it takes; with one, raise TimeoutError when it is not free in time.
     """
     lock_handle = _open_stable_lock_file(lock_path)
     state_handle = None
     try:
         lock_type = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        fcntl.flock(lock_handle.fileno(), lock_type)
+        if timeout is None:
+            fcntl.flock(lock_handle.fileno(), lock_type)
+        else:
+            _flock_within(lock_handle.fileno(), lock_type, timeout, name)
         state_handle = _open_existing_managed_text_file(state_path)
         yield state_handle
     finally:
@@ -2972,6 +2987,21 @@ def _move_mount_in_namespace(mnt_ns_fd: int, tree_fd: int, target: str) -> None:
     _check_helper_result(message)
 
 
+def _flock_within(fd: int, operation: int, timeout: float, name: str) -> None:
+    """Take a flock, or raise TimeoutError when it is not free within timeout."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, operation | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for the Sandy {name} lock"
+                ) from None
+            time.sleep(LIFECYCLE_LOCK_RETRY_INTERVAL)
+
+
 @contextmanager  # ensures flock acquisition/release is paired at the call site
 def _lifecycle_lock(timeout: float = LIFECYCLE_LOCK_TIMEOUT) -> Iterator[None]:
     """Hold the global lifecycle lock exclusively, or fail after timeout.
@@ -2983,17 +3013,7 @@ def _lifecycle_lock(timeout: float = LIFECYCLE_LOCK_TIMEOUT) -> Iterator[None]:
     lock_path = os.path.join(SYSTEMD_MACHINES, "sandy.__cache", LIFECYCLE_LOCK_FILENAME)
     lock_handle = _open_stable_lock_file(lock_path)
     try:
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        "Timed out waiting for the Sandy lifecycle lock"
-                    ) from None
-                time.sleep(LIFECYCLE_LOCK_RETRY_INTERVAL)
+        _flock_within(lock_handle.fileno(), fcntl.LOCK_EX, timeout, "lifecycle")
         try:
             yield
         finally:
@@ -7206,21 +7226,51 @@ class Sandy:
         os.chmod(cache_dir, 0o700, follow_symlinks=False)
         return cache_dir
 
+    # The thread that holds the port mapping lock exclusively through this
+    # instance, or None.
+    _port_mapping_lock_holder: Optional[int] = None
+
     @contextmanager  # ensures flock acquisition/release is paired at the call site
-    def _port_mapping_lock(self, exclusive: bool):
+    def _port_mapping_lock(self, exclusive: bool, timeout: Optional[float] = None):
         """
         Acquire the stable port mapping coordination lock.
 
         Args:
             exclusive: When True, take an exclusive lock suitable for writes.
+            timeout: When set, raise TimeoutError if the lock is not free in
+                this many seconds. Without it, wait as long as it takes.
+
+        Inside an exclusive hold of the same thread through this instance, do
+        not lock again: a second flock(2) on a new open of the lock file would
+        wait for that hold. Open the current state file only, because a write
+        in the hold replaces it. up holds the lock from the publish of its
+        ports until its supervisor starts (see run_up).
         """
+        if self._port_mapping_lock_holder == threading.get_ident():
+            state_handle = _open_existing_managed_text_file(
+                self._get_port_mappings_path()
+            )
+            try:
+                yield state_handle
+            finally:
+                if state_handle is not None:
+                    state_handle.close()
+            return
         self._ensure_cache_dir()
         with _locked_state_file(
             self._get_port_mappings_lock_path(),
             self._get_port_mappings_path(),
             exclusive,
+            timeout,
+            "port mapping",
         ) as state_handle:
-            yield state_handle
+            self._port_mapping_lock_holder = (
+                threading.get_ident() if exclusive else None
+            )
+            try:
+                yield state_handle
+            finally:
+                self._port_mapping_lock_holder = None
 
     def _get_shared_limits_path(self) -> str:
         """Return the path of the saved shared limits."""
@@ -7526,7 +7576,7 @@ class Sandy:
 
             self._persist_port_mapping_state(state)
 
-    def _cleanup_port_mappings_for_container(self, container_name: str):
+    def _cleanup_port_mappings_for_container(self, container_name: str) -> None:
         """Remove firewall rules and state for a specific container.
 
         Use only the network that exists now. When the bridge is gone (for
@@ -9293,34 +9343,72 @@ class Sandy:
                     if error:
                         print(error)
                         sys.exit(1)
-                # Publish the ports only now. An up that the check above
-                # refuses then adds no rule for the container of another start.
-                if publish_ports:
-                    self._setup_port_forwarding_rules(init_container_ip)
-                print(f"I: Starting '{self.container}'{mode} ", end="", flush=True)
-                try:
-                    # The container inherits the OOM score adjustment.
-                    with _oom_score_adj_for_children(limits.oom_score_adj):
-                        supervisor = _run_secure_subprocess_popen(
-                            scope_cmd,
-                            start_new_session=True,
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            env=container_environment,
-                            pass_fds=tuple(runtime_fds),
+                # Publish the ports only now. An up that the check above refuses
+                # then adds no rule for the container of another start. No
+                # container owns the port rules and state that up adds until
+                # the supervisor starts, and no _stop_failed_start removes
+                # them. So hold the port mapping lock from the publish until
+                # the supervisor starts. When it does not start, up removes
+                # them before it releases the lock: no other process finds
+                # them, and the removal does not wait for the lock again.
+                # Each attach waits for the lifecycle lock, so an up that holds
+                # it waits for the port mapping lock for at most
+                # PORT_MAPPINGS_LOCK_TIMEOUT. Without it, up holds only its up
+                # lock, which no process waits for, so up waits for the port
+                # mapping lock as long as it takes.
+                port_lock_timeout = PORT_MAPPINGS_LOCK_TIMEOUT if hold_lock else None
+                with ExitStack() as port_lock:
+                    if publish_ports:
+                        try:
+                            port_lock.enter_context(
+                                self._port_mapping_lock(
+                                    exclusive=True, timeout=port_lock_timeout
+                                )
+                            )
+                        except TimeoutError as exc:
+                            print(
+                                "E: Could not publish the ports of "
+                                f"'{self.container}': {exc}"
+                            )
+                            sys.exit(1)
+                    started = False
+                    try:
+                        if publish_ports:
+                            self._setup_port_forwarding_rules(init_container_ip)
+                        print(
+                            f"I: Starting '{self.container}'{mode} ", end="", flush=True
                         )
-                except (OSError, ValueError) as exc:
-                    # The value could not be set, or the start failed; the
-                    # restore raises nothing. So no supervisor runs.
-                    _finish_spinner_line(spinner_line_event)
-                    print(
-                        f"E: Could not start '{self.container}': "
-                        f"{_terminal_safe_repr(str(exc))}"
-                    )
-                    sys.exit(1)
-                finally:
-                    close_runtime_fds()
+                        try:
+                            # The container inherits the OOM score adjustment.
+                            with _oom_score_adj_for_children(limits.oom_score_adj):
+                                supervisor = _run_secure_subprocess_popen(
+                                    scope_cmd,
+                                    start_new_session=True,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    env=container_environment,
+                                    pass_fds=tuple(runtime_fds),
+                                )
+                            # From now on, the stop of the container removes
+                            # the ports, or _stop_failed_start does.
+                            started = True
+                        except (OSError, ValueError) as exc:
+                            # The value could not be set, or the start failed;
+                            # the restore raises nothing. So no supervisor runs.
+                            _finish_spinner_line(spinner_line_event)
+                            print(
+                                f"E: Could not start '{self.container}': "
+                                f"{_terminal_safe_repr(str(exc))}"
+                            )
+                            sys.exit(1)
+                        finally:
+                            close_runtime_fds()
+                    finally:
+                        if publish_ports and not started:
+                            # This removal runs in the hold of the publish, so
+                            # it does not take the lock again.
+                            self._cleanup_port_mappings_for_container(self.container)
                 # Pin the supervisor before anything can reap it. The markers
                 # and the mounts go only into a scope that holds it: the
                 # scope of the name can be another start's.

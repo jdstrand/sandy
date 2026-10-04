@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -20,7 +21,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SANDY = REPO_ROOT / "sandy"
@@ -45,6 +46,10 @@ SHARED_LIMITS_LOCK = CACHE_DIR / "shared_limits.lock"
 PERSISTENT_LOCKS = (PORT_LOCK, LIFECYCLE_LOCK, SHARED_LIMITS_LOCK)
 # Nor the saved shared limits, which are configuration (rm --cache keeps them).
 PERSISTENT_FILES = (*PERSISTENT_LOCKS, SHARED_LIMITS)
+# up waits for the lifecycle lock for at most 10 seconds (LIFECYCLE_LOCK_TIMEOUT
+# of sandy); it gets to the lock in a few.
+LIFECYCLE_WAIT_TIMEOUT = 60
+BACKGROUND_UP_TIMEOUT = 120
 # The up lock of a container name (_acquire_up_lock of sandy). Sandy never
 # removes one either.
 UP_LOCK_PATTERN = re.compile(r"up-[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\.lock")
@@ -111,6 +116,12 @@ IP6TABLES_CHAINS = (
 # static; the paths and the sandy command are positional arguments.
 HIDE_IPTABLES_SCRIPT = 'mount --bind -- "$1" "$2" && shift 2 && exec "$@"'
 IPTABLES_BINARY_DIRS = (Path("/usr/sbin"), Path("/sbin"))
+# To make the start of the supervisor fail, the same script binds a file that
+# has mode 0755 but is not an executable over systemd-run. sandy finds the
+# tool, and the exec of the supervisor fails with ENOEXEC.
+SYSTEMD_RUN_BINARY_DIRS = (Path("/usr/bin"), Path("/bin"))
+# The locks of the host, with the processes that wait for them.
+PROC_LOCKS = Path("/proc/locks")
 NFTABLES_TABLES = (
     ("ip", "sandy"),
     ("ip6", "sandy"),
@@ -172,6 +183,25 @@ def assert_not_contains(result: CommandResult, unexpected: str) -> None:
             f"Did not expect {unexpected!r} in output from "
             f"{shlex.join(result.command)}:\n{_bounded_tail(result.output)}"
         )
+
+
+def waits_for_flock(pid: int, path: Path) -> bool:
+    """Return True when process pid waits in flock(2) for the lock of path.
+
+    /proc/locks shows each waiter after the lock that blocks it, as
+    "N: -> FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF".
+    """
+    inode = str(path.stat().st_ino)
+    for line in PROC_LOCKS.read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if (
+            len(fields) >= 7
+            and fields[1:3] == ["->", "FLOCK"]
+            and fields[5] == str(pid)
+            and fields[6].rsplit(":", 1)[-1] == inode
+        ):
+            return True
+    return False
 
 
 def up_temporary_directories() -> list[Path]:
@@ -453,6 +483,77 @@ class E2EContext:
             str(target),
             *command,
         ]
+
+    def with_a_broken_systemd_run(self, command: Sequence[str]) -> list[str]:
+        """Return command wrapped so that systemd-run is found but cannot run."""
+        located = shutil.which("systemd-run", path=self.safe_environment()["PATH"])
+        if located is None:
+            raise E2EFailure("systemd-run is not installed")
+        target = Path(located).resolve()
+        if target.parent not in SYSTEMD_RUN_BINARY_DIRS or not target.is_file():
+            raise E2EFailure(f"Unexpected systemd-run binary: {target}")
+        blocker = self.root / "broken-systemd-run"
+        if not blocker.exists():
+            blocker.write_bytes(b"not an executable\n")
+            blocker.chmod(0o755)
+        return [
+            "unshare",
+            "--mount",
+            "--propagation",
+            "private",
+            "--",
+            "/bin/sh",
+            "-c",
+            HIDE_IPTABLES_SCRIPT,
+            "sh",
+            str(blocker),
+            str(target),
+            *command,
+        ]
+
+    def start_up(
+        self,
+        name: str,
+        user: str,
+        arguments: Sequence[str],
+        log_name: str,
+        *,
+        workspace: str | None = None,
+        shared: str | None = None,
+    ) -> tuple[subprocess.Popen[bytes], Path]:
+        """Start up of name in the background; return the process and its log.
+
+        workspace and shared name other directories, relative to the run root
+        where sandy runs, as for sandy(). The caller waits for the process.
+        """
+        if not NAME_PATTERN.fullmatch(name):
+            raise E2EFailure(f"Refusing unsafe container name: {name!r}")
+        if not re.fullmatch(r"[a-z0-9-]{1,48}", log_name):
+            raise E2EFailure(f"Refusing unsafe log name: {log_name!r}")
+        log_path = self.root / f"{log_name}-{name}.log"
+        command = (
+            str(SANDY),
+            "--workspace",
+            workspace or self.workspace.name,
+            "--shared",
+            shared or self.shared.name,
+            "--user",
+            user,
+            "--container",
+            name,
+            *arguments,
+        )
+        print(f"    $ {shlex.join(command)} &", flush=True)
+        with log_path.open("w", encoding="utf-8") as stream:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                cwd=self.root,
+                env=self.safe_environment(),
+            )
+        return process, log_path
 
     @contextmanager
     def case(self, name: str) -> Iterator[None]:
@@ -1257,6 +1358,66 @@ class E2EContext:
         )
         self.wait_for_machine(self.full_name, running=True)
         return result
+
+    def up_with_a_change_while_it_waits(
+        self,
+        name: str,
+        user: str,
+        arguments: list[str],
+        change: Callable[[], None],
+    ) -> CommandResult:
+        """Run up of name, and make a change while up waits for the lifecycle lock.
+
+        Before up waits for the lock ("Limits of this container" is its last
+        line before it), it checks the mount targets in the image and removes
+        stale port rules and state. Hold the lock until up waits for it, make
+        the change, and release the lock. So the change comes after those
+        steps and before everything that up does under the lock.
+        """
+        log_path = self.root / f"lock-wait-{change.__name__}-{name}.log"
+        command = (
+            str(SANDY),
+            "--workspace",
+            self.workspace.name,
+            "--shared",
+            self.shared.name,
+            "--user",
+            user,
+            "--container",
+            name,
+            *arguments,
+        )
+        up: subprocess.Popen[bytes] | None = None
+        try:
+            with LIFECYCLE_LOCK.open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                print(f"    $ {shlex.join(command)} &", flush=True)
+                with log_path.open("w", encoding="utf-8") as stream:
+                    up = subprocess.Popen(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=stream,
+                        stderr=subprocess.STDOUT,
+                        cwd=self.root,
+                        env=self.safe_environment(),
+                    )
+                deadline = time.monotonic() + LIFECYCLE_WAIT_TIMEOUT
+                while "I: Limits of this container" not in log_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ):
+                    if up.poll() is not None or time.monotonic() >= deadline:
+                        raise E2EFailure("up did not wait for the lifecycle lock")
+                    time.sleep(0.1)
+                change()
+            # The close released the lock; up takes it now.
+            returncode = up.wait(timeout=BACKGROUND_UP_TIMEOUT)
+            return CommandResult(
+                command, returncode, log_path.read_text(encoding="utf-8"), ""
+            )
+        finally:
+            if up is not None and up.poll() is None:
+                up.kill()
+                up.wait(timeout=10)
 
     def machine_running(self, name: str) -> bool:
         return self.machine_leader(name) is not None
