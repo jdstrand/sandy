@@ -1406,6 +1406,38 @@ def test_main(context: E2EContext) -> None:
         context.sandy(["down"], name=second)
         _wait_stopped(context, second)
 
+    with context.case("a machine query that fails does not mean a stopped container"):
+        # machinectl exits 1 for each failure. With no system bus, sandy read
+        # the failure as "not running", and rm removed the image of a running
+        # container. Only these sandy commands lose the bus. update comes
+        # first: it changes nothing, and the old code failed there.
+        if not context.machine_running(name):
+            raise E2EFailure(f"{name} must run for this case")
+        for arguments in (["update", "--pids-limit", "256"], ["rm", "--force"]):
+            refused = context.run(
+                context.with_a_hidden_system_bus(
+                    [
+                        str(SANDY),
+                        "--workspace",
+                        context.workspace.name,
+                        "--shared",
+                        context.shared.name,
+                        "--user",
+                        context.main_user,
+                        "--container",
+                        name,
+                        *arguments,
+                    ]
+                ),
+                expected=1,
+            )
+            assert_contains(refused, f"E: Could not query machine '{name}': ")
+            assert_contains(refused, "Connection refused")
+        if not context.machine_running(name):
+            raise E2EFailure("rm stopped the container")
+        if not (SYSTEMD_MACHINES / f"sandy.{name}" / "init.sh").is_file():
+            raise E2EFailure("rm removed the image of the running container")
+
     with context.case("up -d is never stopped by an attach exit"):
         context.sandy(
             ["up", "--detach", "--persistent", "--network", "host"], name=second

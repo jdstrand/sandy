@@ -7,13 +7,14 @@ from __future__ import annotations
 import ctypes
 import os
 import signal
+import socket
 import stat
 import subprocess
 import tempfile
 import threading
 import unittest
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -1250,6 +1251,54 @@ class SandyInvocationTests(unittest.TestCase):
             # ENOEXEC.
             self.assertEqual(stat.S_IMODE(blocker.stat().st_mode), 0o755)
             self.assertEqual(blocker.read_bytes(), b"not an executable\n")
+
+    def test_hidden_system_bus_wraps_sandy_in_a_private_mount_namespace(self):
+        # Mocks: the path of the system bus socket, a real socket in a
+        # temporary directory.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bus = root / "system_bus_socket"
+            with closing(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as server:
+                server.bind(str(bus))
+                context = self.make_context()
+                context.root = root
+                with patch("tests.e2e.support.SYSTEM_BUS_SOCKET", bus):
+                    command = context.with_a_hidden_system_bus(["sandy", "rm"])
+            blocker = root / "hidden-system-bus"
+            self.assertEqual(
+                command,
+                [
+                    "unshare",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    'mount --bind -- "$1" "$2" && shift 2 && exec "$@"',
+                    "sh",
+                    str(blocker),
+                    str(bus),
+                    "sandy",
+                    "rm",
+                ],
+            )
+            self.assertEqual(blocker.read_bytes(), b"")
+            self.assertEqual(stat.S_IMODE(blocker.stat().st_mode), 0o644)
+
+    def test_hidden_system_bus_rejects_a_missing_or_unexpected_socket(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            regular = root / "regular"
+            regular.write_bytes(b"")
+            context = self.make_context()
+            context.root = root
+            for bus in (root / "missing", regular):
+                with self.subTest(bus=bus.name):
+                    with patch("tests.e2e.support.SYSTEM_BUS_SOCKET", bus):
+                        with self.assertRaises(E2EFailure):
+                            context.with_a_hidden_system_bus(["sandy"])
+            self.assertFalse((root / "hidden-system-bus").exists())
 
     def test_broken_systemd_run_rejects_unexpected_binary(self):
         context = self.make_context()

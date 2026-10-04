@@ -120,6 +120,11 @@ IPTABLES_BINARY_DIRS = (Path("/usr/sbin"), Path("/sbin"))
 # has mode 0755 but is not an executable over systemd-run. sandy finds the
 # tool, and the exec of the supervisor fails with ENOEXEC.
 SYSTEMD_RUN_BINARY_DIRS = (Path("/usr/bin"), Path("/bin"))
+# To make a machine query fail with an error that does not mean "no such
+# machine", the same script binds an empty file over the socket of the system
+# bus. machinectl then exits 1 with "Connection refused" (measured on systemd
+# 249 and 257). Other processes keep the bus.
+SYSTEM_BUS_SOCKET = Path("/run/dbus/system_bus_socket")
 # The locks of the host, with the processes that wait for them.
 PROC_LOCKS = Path("/proc/locks")
 NFTABLES_TABLES = (
@@ -502,6 +507,33 @@ class E2EContext:
             "sh",
             str(blocker),
             str(target),
+            *command,
+        ]
+
+    def with_a_hidden_system_bus(self, command: Sequence[str]) -> list[str]:
+        """Return command wrapped so that it cannot connect to the system bus."""
+        try:
+            socket_mode = SYSTEM_BUS_SOCKET.lstat().st_mode
+        except FileNotFoundError:
+            raise E2EFailure(f"No system bus socket at {SYSTEM_BUS_SOCKET}")
+        if not stat.S_ISSOCK(socket_mode):
+            raise E2EFailure(f"Unexpected system bus socket: {SYSTEM_BUS_SOCKET}")
+        blocker = self.root / "hidden-system-bus"
+        if not blocker.exists():
+            blocker.write_bytes(b"")
+            blocker.chmod(0o644)
+        return [
+            "unshare",
+            "--mount",
+            "--propagation",
+            "private",
+            "--",
+            "/bin/sh",
+            "-c",
+            HIDE_IPTABLES_SCRIPT,
+            "sh",
+            str(blocker),
+            str(SYSTEM_BUS_SOCKET),
             *command,
         ]
 

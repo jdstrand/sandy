@@ -488,6 +488,19 @@ def _proc_self_fd_path(fd: int) -> str:
     return f"/proc/self/fd/{fd}"
 
 
+def _c_locale_environment() -> Dict[str, str]:
+    """Return the environment of sandy with the C locale.
+
+    Use it for a host command whose message text sandy parses, so that a
+    translation cannot change that text.
+    """
+    environment = dict(os.environ)
+    environment.pop("LANGUAGE", None)
+    environment["LANG"] = "C"
+    environment["LC_ALL"] = "C"
+    return environment
+
+
 def _run_secure_subprocess(cmd: list, **kwargs) -> subprocess.CompletedProcess:
     """Run subprocess with security hardening.
 
@@ -536,6 +549,20 @@ class _AttachHangup(Exception):
     def __init__(self, signum: int) -> None:
         super().__init__(signum)
         self.signum = signum
+
+
+class _MachineQueryError(subprocess.SubprocessError):
+    """machinectl failed, so sandy cannot tell whether a machine runs.
+
+    A failed query must not look like a stopped container: rm, for example,
+    then removed the image of a running one. main reports it and exits 1.
+    """
+
+    def __init__(self, machine_name: str, detail: str) -> None:
+        super().__init__(
+            f"Could not query machine '{machine_name}': {_terminal_safe_repr(detail)}"
+        )
+        self.machine_name = machine_name
 
 
 @contextmanager  # installs and restores the hangup handlers around an attach
@@ -7223,7 +7250,9 @@ class Sandy:
         """Check if container is running and return PID if so, None otherwise
 
         A query that does not answer in QUERY_COMMAND_TIMEOUT raises
-        subprocess.TimeoutExpired: no answer does not mean "not running".
+        subprocess.TimeoutExpired, and a query that fails for another reason
+        than an unknown machine raises _MachineQueryError: neither one means
+        "not running".
         """
         if container_name is None:
             container_name = self.container
@@ -7235,11 +7264,20 @@ class Sandy:
                 text=True,
                 check=True,
                 timeout=QUERY_COMMAND_TIMEOUT,
+                env=_c_locale_environment(),
             )
-            pid = result.stdout.strip()
-            return pid if pid else None
-        except subprocess.CalledProcessError:
-            return None
+        except subprocess.CalledProcessError as exc:
+            # machinectl exits 1 for each failure, also when the system bus
+            # is gone. Only the error of machined for this name means that
+            # the machine does not run (measured on systemd 249 and 257).
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            if exc.returncode == 1 and f"No machine '{container_name}' known" in stderr:
+                return None
+            raise _MachineQueryError(
+                container_name, stderr.strip() or f"exit status {exc.returncode}"
+            ) from exc
+        pid = result.stdout.strip()
+        return pid if pid else None
 
     def _get_running_sandy_containers(self):
         """Get list of all running sandy containers"""
@@ -8346,6 +8384,7 @@ class Sandy:
             except (
                 subprocess.CalledProcessError,
                 subprocess.TimeoutExpired,
+                _MachineQueryError,
                 ValueError,
             ):
                 pass
@@ -9639,6 +9678,8 @@ class Sandy:
         """
         try:
             running = self._is_container_running()
+        except _MachineQueryError as exc:
+            return f"E: {exc}"
         except subprocess.SubprocessError as exc:
             return (
                 f"E: Could not query machine '{self.container}': "
@@ -10341,8 +10382,9 @@ def main():
             )
             sys.exit(1)
 
-    # Execute command. A query that does not answer in QUERY_COMMAND_TIMEOUT
-    # ends the command, after the cleanup of the command has run.
+    # Execute command. A query that does not answer in QUERY_COMMAND_TIMEOUT,
+    # or a machine query that fails, ends the command, after the cleanup of
+    # the command has run.
     try:
         if args.command == "up":
             sandy.run_up(args)
@@ -10370,6 +10412,9 @@ def main():
             f"E: '{_strip_control_characters(str(program))}' did not answer in "
             f"{exc.timeout:g} seconds"
         )
+        sys.exit(1)
+    except _MachineQueryError as exc:
+        print(f"E: {exc}")
         sys.exit(1)
 
 

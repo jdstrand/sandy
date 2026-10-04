@@ -1227,6 +1227,23 @@ class MainDispatchTests(unittest.TestCase):
             stdout.getvalue(), "E: 'machinectl' did not answer in 3 seconds\n"
         )
 
+    def test_a_failed_machine_query_ends_the_command(self):
+        # Mocks: the command, which raises the error of a failed query.
+        instance = MagicMock()
+        instance.run_rm.side_effect = sandy._MachineQueryError(
+            "ai-dev", "Failed to connect to bus: Connection refused"
+        )
+        args = self.make_args("rm", all=False, cache=False, network=False)
+        with captured_output() as (stdout, _):
+            with self.assertRaises(SystemExit) as exited:
+                self.run_main(args, instance)
+        self.assertEqual(exited.exception.code, 1)
+        self.assertEqual(
+            stdout.getvalue(),
+            "E: Could not query machine 'ai-dev': "
+            "'Failed to connect to bus: Connection refused'\n",
+        )
+
     def test_root_and_safe_directory_checks_precede_construction(self):
         args = self.make_args("status")
         instance = MagicMock(container="ai-dev", user="developer")
@@ -11127,14 +11144,90 @@ class ExecutionTests(unittest.TestCase):
             text=True,
             check=True,
             timeout=sandy.QUERY_COMMAND_TIMEOUT,
+            env=ANY,
         )
+        # sandy parses the error text, so the query runs in the C locale.
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual((environment["LANG"], environment["LC_ALL"]), ("C", "C"))
 
-        with patch.object(
-            sandy,
-            "_run_secure_subprocess",
-            side_effect=subprocess.CalledProcessError(1, ["machinectl"]),
-        ):
+        # The error of machined for an unknown name, as systemd 249 and 257
+        # print it, is the only failure that means "not running".
+        unknown = subprocess.CalledProcessError(
+            1,
+            ["machinectl"],
+            stderr="Could not get path to machine: No machine 'ai-dev' known\n",
+        )
+        with patch.object(sandy, "_run_secure_subprocess", side_effect=unknown):
             self.assertIsNone(instance._is_container_running())
+        with patch.object(sandy, "_run_secure_subprocess", side_effect=unknown):
+            self.assertIsNone(instance._is_container_running("ai-dev"))
+
+    def test_is_container_running_does_not_read_a_failed_query_as_stopped(self):
+        # Regression test: each machinectl failure meant "not running", so rm,
+        # for example, removed the image of a running container when the
+        # system bus was gone. Mocks: machinectl, which exits 1 for each
+        # failure (measured on systemd 249 and 257).
+        instance = make_sandy()
+        cases = (
+            (
+                1,
+                "Failed to connect to bus: No such file or directory\n",
+                "'Failed to connect to bus: No such file or directory'",
+            ),
+            (
+                1,
+                "Failed to connect to system scope bus via local transport: "
+                "Connection refused\n",
+                "'Failed to connect to system scope bus via local transport: "
+                "Connection refused'",
+            ),
+            (
+                1,
+                "Could not get path to machine: No machine 'other' known\n",
+                "\"Could not get path to machine: No machine 'other' known\"",
+            ),
+            (
+                2,
+                "Could not get path to machine: No machine 'ai-dev' known\n",
+                "\"Could not get path to machine: No machine 'ai-dev' known\"",
+            ),
+            (1, "", "'exit status 1'"),
+            (1, None, "'exit status 1'"),
+            (1, "denied\x1b[31m\nforged\n", "'denied\\x1b[31m\\nforged'"),
+        )
+        for returncode, stderr, detail in cases:
+            with self.subTest(returncode=returncode, stderr=stderr):
+                failure = subprocess.CalledProcessError(
+                    returncode, ["machinectl"], stderr=stderr
+                )
+                with patch.object(sandy, "_run_secure_subprocess", side_effect=failure):
+                    with self.assertRaises(subprocess.SubprocessError) as raised:
+                        instance._is_container_running()
+                self.assertIsInstance(raised.exception, sandy._MachineQueryError)
+                self.assertIs(raised.exception.__cause__, failure)
+                self.assertEqual(
+                    str(raised.exception),
+                    f"Could not query machine 'ai-dev': {detail}",
+                )
+
+    def test_c_locale_environment_keeps_the_rest_of_the_environment(self):
+        # Mocks: the environment of sandy, with a German locale.
+        with patch.dict(
+            sandy.os.environ,
+            {
+                "LANG": "de_DE.UTF-8",
+                "LANGUAGE": "de",
+                "LC_ALL": "de_DE.UTF-8",
+                "PATH": "/usr/sbin:/usr/bin",
+            },
+        ):
+            environment = sandy._c_locale_environment()
+            self.assertEqual(sandy.os.environ["LANG"], "de_DE.UTF-8")
+            self.assertEqual(sandy.os.environ["LANGUAGE"], "de")
+        self.assertEqual(environment["LANG"], "C")
+        self.assertEqual(environment["LC_ALL"], "C")
+        self.assertNotIn("LANGUAGE", environment)
+        self.assertEqual(environment["PATH"], "/usr/sbin:/usr/bin")
 
     def test_is_container_running_does_not_read_a_timeout_as_stopped(self):
         # Regression test: the query had no timeout. A timeout must not mean
@@ -11689,6 +11782,18 @@ class ExecutionTests(unittest.TestCase):
             run_as_root.call_args_list,
             [call("true", capture_output=True, timeout=5)] * 2,
         )
+
+    def test_wait_for_container_ready_retries_a_failed_machine_query(self):
+        # A failed query during the start is a state that the wait does not
+        # know yet, as a query that does not answer is: it tries again until
+        # its deadline. Mocks: _run_as_root and the sleep.
+        instance = make_sandy()
+        result = SimpleNamespace(returncode=0)
+        failure = sandy._MachineQueryError("ai-dev", "Connection refused")
+        with patch.object(instance, "_run_as_root", side_effect=[failure, result]):
+            with patch("time.sleep") as sleep:
+                self.assertTrue(instance._wait_for_container_ready())
+        sleep.assert_called_once_with(sandy.CONTAINER_READY_INTERVAL)
 
     def test_wait_for_container_ready_retries_while_the_container_starts(self):
         # The entry helper refuses an attach before the payload exists
@@ -12589,6 +12694,81 @@ class RemovalTests(unittest.TestCase):
             with captured_output():
                 with self.assertRaises(SystemExit):
                     instance.run_rm(args, network=True)
+
+    def test_rm_removes_nothing_when_the_machine_query_fails(self):
+        # Regression test: a failed query meant "not running", so rm removed
+        # the image of a running container when the system bus was gone.
+        # Mocks: machinectl fails as systemd 257 does with no system bus; the
+        # poweroff, the port cleanup, and the removal record their calls.
+        instance = make_sandy()
+        args = SimpleNamespace(container="ai-dev", force=True)
+        failure = subprocess.CalledProcessError(
+            1,
+            ["machinectl"],
+            stderr="Failed to connect to system scope bus via local transport: "
+            "Connection refused\n",
+        )
+        with patch.object(
+            instance,
+            "_get_machine_dir",
+            return_value="/var/lib/machines/sandy.ai-dev",
+        ):
+            with patch.object(sandy.os.path, "exists", return_value=True):
+                with patch.object(
+                    sandy, "_run_secure_subprocess", side_effect=failure
+                ) as run:
+                    with patch.object(instance, "_machine_poweroff") as poweroff:
+                        with patch.object(
+                            instance, "_cleanup_port_mappings_for_container"
+                        ) as cleanup:
+                            with patch.object(
+                                instance, "_remove_machine_dir"
+                            ) as remove:
+                                with self.assertRaises(
+                                    subprocess.SubprocessError
+                                ) as raised:
+                                    instance.run_rm(args)
+        self.assertIsInstance(raised.exception, sandy._MachineQueryError)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["machinectl", "show", "ai-dev", "-p", "Leader", "--value"],
+        )
+        poweroff.assert_not_called()
+        cleanup.assert_not_called()
+        remove.assert_not_called()
+
+    def test_rm_network_keeps_the_network_when_a_machine_query_fails(self):
+        # Regression test: a failed query meant "not running", so rm
+        # --network removed the bridge and the rules of a running container.
+        # Mocks: one image; machinectl fails as systemd 249 does with no
+        # system bus; the network cleanup records its calls.
+        instance = make_sandy()
+        instance.network = make_network()
+        args = SimpleNamespace(container=None, force=True)
+        failure = subprocess.CalledProcessError(
+            1,
+            ["machinectl"],
+            stderr="Failed to connect to bus: Connection refused\n",
+        )
+        with patch.object(sandy.os.path, "exists", return_value=True):
+            with patch.object(
+                sandy.glob,
+                "glob",
+                return_value=["/var/lib/machines/sandy.ai-dev"],
+            ):
+                with patch.object(sandy, "_run_secure_subprocess", side_effect=failure):
+                    with patch.object(instance.network, "cleanup") as cleanup:
+                        with patch.object(
+                            instance, "_clear_port_mapping_state"
+                        ) as clear:
+                            with captured_output():
+                                with self.assertRaises(
+                                    subprocess.SubprocessError
+                                ) as raised:
+                                    instance.run_rm(args, network=True)
+        self.assertIsInstance(raised.exception, sandy._MachineQueryError)
+        cleanup.assert_not_called()
+        clear.assert_not_called()
 
     def test_rm_single_container_cleans_and_removes(self):
         instance = make_sandy()
@@ -15699,6 +15879,29 @@ class RunUpTests(unittest.TestCase):
                     instance.run_up(self.arguments())
         self.assertEqual(exited.exception.code, 1)
         self.assertIn("E: Could not query machine 'ai-dev': ", stdout.getvalue())
+        self.supervisor_unit_loaded.assert_not_called()
+        self.set_shared_limits.assert_not_called()
+
+    def test_up_refuses_when_the_machine_query_fails(self):
+        # Mocks: the machine query, which fails with the error that
+        # _is_container_running raises. The error line names the cause once.
+        instance = make_sandy()
+        with patch.object(
+            instance,
+            "_is_container_running",
+            side_effect=sandy._MachineQueryError(
+                "ai-dev", "Failed to connect to bus: Connection refused"
+            ),
+        ):
+            with captured_output() as (stdout, _):
+                with self.assertRaises(SystemExit) as exited:
+                    instance.run_up(self.arguments())
+        self.assertEqual(exited.exception.code, 1)
+        self.assertIn(
+            "E: Could not query machine 'ai-dev': "
+            "'Failed to connect to bus: Connection refused'\n",
+            stdout.getvalue(),
+        )
         self.supervisor_unit_loaded.assert_not_called()
         self.set_shared_limits.assert_not_called()
 
