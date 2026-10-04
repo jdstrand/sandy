@@ -141,6 +141,9 @@ $ sudo /path/to/sandy [GLOBAL OPTIONS] [COMMAND] [COMMAND OPTIONS]
 - `up` - Build and start the container, then attach a console session.
   When the console exits, the container stops, unless another `bash` or
   `exec` session is still attached; then the last session to exit stops it.
+  If the port mapping lock stays busy for 5 seconds at that time (for
+  example, during `rm --cache`), the container keeps running and the session
+  says so; stop it with `down`.
   Key flags:
   - `--build` to create a container
   - `--detach` starts the container without a console and leaves it running
@@ -426,7 +429,12 @@ fails before it starts the container. `up -d` with no directories to mount
 takes no lifecycle lock, so it waits until the port mapping lock is free.
 `up` holds the port mapping lock from the publish until the container
 process starts. When that process does not start, `up` removes the ports
-before it releases the lock, so no other `up` finds them.
+before it releases the lock, so no other `up` finds them. The stop after the
+last session also waits for the port mapping lock under the lifecycle lock
+for at most 5 seconds, less than the 10 seconds that each attach waits for
+the lifecycle lock. When the port mapping lock stays busy for that time, the
+container keeps running with its ports (see `up` above). `down` and `rm`
+take no lifecycle lock, so they wait until the port mapping lock is free.
 
 
 ## Security

@@ -60,12 +60,14 @@ LIFECYCLE_LOCK_TIMEOUT: Final = 10
 UP_LOCK_FILENAME_PREFIX: Final = "up-"
 UP_LOCK_FILENAME_SUFFIX: Final = ".lock"
 LIFECYCLE_LOCK_RETRY_INTERVAL: Final = 0.05
-# An up that publishes its ports under the lifecycle lock (without -d, or with
-# directories to mount) waits for the port mapping lock there for at most this
-# long. It stays below LIFECYCLE_LOCK_TIMEOUT, the wait of each attach for the
-# lifecycle lock. Without the lifecycle lock, up waits with no limit. up holds
-# the port mapping lock until its supervisor starts; when the supervisor does
-# not start, up removes its ports before it releases the lock, with no wait.
+# Under the lifecycle lock, up waits for the port mapping lock for at most this
+# long to publish its ports (without -d, or with directories to mount), and so
+# does the stop after the last session. It stays below LIFECYCLE_LOCK_TIMEOUT,
+# the wait of each attach for the lifecycle lock. Without the lifecycle lock
+# (up -d with no directories to mount, down, rm), the wait has no limit. up
+# holds the port mapping lock until its supervisor starts; when the supervisor
+# does not start, up removes its ports before it releases the lock, with no
+# wait.
 PORT_MAPPINGS_LOCK_TIMEOUT: Final = 5
 INIT_SCRIPT_MAX_BYTES: Final = 8192
 # The container payload (PID 2) is the image's bash, started through a symlink
@@ -7084,8 +7086,17 @@ class Sandy:
             sys.exit(1)
         return tuple(kept), image_ids
 
-    def _machine_poweroff(self, container_name=None):
-        """Stop the container if it's running"""
+    def _machine_poweroff(
+        self,
+        container_name: Optional[str] = None,
+        port_lock_timeout: Optional[float] = None,
+    ) -> None:
+        """Stop the container if it's running.
+
+        With port_lock_timeout, raise TimeoutError when the port mapping lock
+        is not free in that time. That comes before any change: the container
+        keeps running, with its port rules and state.
+        """
         if container_name is None:
             container_name = self.container
 
@@ -7095,7 +7106,9 @@ class Sandy:
             return
 
         # Clean up port forwarding rules before stopping container
-        self._cleanup_port_mappings_for_container(container_name)
+        self._cleanup_port_mappings_for_container(
+            container_name, lock_timeout=port_lock_timeout
+        )
 
         # Actually stop the container. After a successful poweroff, the
         # machine is gone and terminate would fail, so terminate only a
@@ -7471,9 +7484,15 @@ class Sandy:
             return {}
         return data
 
-    def _remove_port_mappings_from_state(self, container_name: str) -> list:
-        """Remove a container's entry from state and return its ports."""
-        with self._port_mapping_lock(exclusive=True) as handle:
+    def _remove_port_mappings_from_state(
+        self, container_name: str, lock_timeout: Optional[float] = None
+    ) -> list:
+        """Remove a container's entry from state and return its ports.
+
+        With lock_timeout, raise TimeoutError when the port mapping lock is
+        not free in that time; the state then stays as it was.
+        """
+        with self._port_mapping_lock(exclusive=True, timeout=lock_timeout) as handle:
             if handle is None:
                 return []
 
@@ -7576,7 +7595,9 @@ class Sandy:
 
             self._persist_port_mapping_state(state)
 
-    def _cleanup_port_mappings_for_container(self, container_name: str) -> None:
+    def _cleanup_port_mappings_for_container(
+        self, container_name: str, lock_timeout: Optional[float] = None
+    ) -> None:
         """Remove firewall rules and state for a specific container.
 
         Use only the network that exists now. When the bridge is gone (for
@@ -7584,6 +7605,9 @@ class Sandy:
         deleted by comment, which needs no bridge. iptables rules need the
         gateway of the bridge to rebuild their text, so they stay until the
         next bridge setup, which flushes every Sandy chain, or `rm --network`.
+
+        With lock_timeout, raise TimeoutError when the port mapping lock is
+        not free in that time; the state and the rules then stay as they were.
         """
         saved_container = self.container
         saved_mappings = list(self.port_mappings)
@@ -7592,7 +7616,9 @@ class Sandy:
         saved_network = self.network
         try:
             self.container = container_name
-            state_ports = self._remove_port_mappings_from_state(container_name)
+            state_ports = self._remove_port_mappings_from_state(
+                container_name, lock_timeout
+            )
             if not state_ports:
                 return
 
@@ -8124,7 +8150,18 @@ class Sandy:
                 if not _supervisor_started_attached(self.container):
                     return
                 print(f"I: Stopping '{self.container}': no session is attached")
-                self._machine_poweroff()
+                try:
+                    self._machine_poweroff(port_lock_timeout=PORT_MAPPINGS_LOCK_TIMEOUT)
+                except TimeoutError:
+                    # Each attach waits for the lifecycle lock, so the stop
+                    # waits for the port mapping lock only for a short time.
+                    # Then the container keeps running with its ports: a stop
+                    # that left them would make other ups refuse those ports.
+                    print(
+                        f"W: Did not stop '{self.container}': the port mapping "
+                        "lock stayed busy"
+                    )
+                    print(f"   Stop it with: sandy --container {self.container} down")
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             print(
                 f"W: Could not check the sessions of '{self.container}': "

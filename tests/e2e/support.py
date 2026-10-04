@@ -204,6 +204,25 @@ def waits_for_flock(pid: int, path: Path) -> bool:
     return False
 
 
+def holds_flock(pid: int, path: Path) -> bool:
+    """Return True when process pid holds a flock(2) lock of path.
+
+    /proc/locks shows a held lock as
+    "N: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF".
+    """
+    inode = str(path.stat().st_ino)
+    for line in PROC_LOCKS.read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if (
+            len(fields) >= 6
+            and fields[1] == "FLOCK"
+            and fields[4] == str(pid)
+            and fields[5].rsplit(":", 1)[-1] == inode
+        ):
+            return True
+    return False
+
+
 def up_temporary_directories() -> list[Path]:
     """Return the directories that up made for its binds, sorted."""
     return sorted(

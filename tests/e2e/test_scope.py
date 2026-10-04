@@ -33,6 +33,7 @@ from tests.e2e.support import (
     E2EFailure,
     assert_contains,
     assert_not_contains,
+    holds_flock,
     waits_for_flock,
 )
 
@@ -1061,6 +1062,52 @@ def test_main(context: E2EContext) -> None:
         if attach_returncode != 0:
             raise E2EFailure(f"Attach exited {attach_returncode}: {attach_output}")
         assert_contains_text(attach_output, "no session is attached")
+        _wait_stopped(context, second)
+
+    with context.case("the last attach out does not wait long for the port lock"):
+        # Regression test: the stop after the last session waited for the port
+        # mapping lock with no limit under the lifecycle lock. While another
+        # process held the port mapping lock (for example, rm --cache), each
+        # attach, to any container, then failed after 10 s. Hold the port
+        # mapping lock while the console of an attached up exits: the stop
+        # must give up after 5 s and keep the container running, and an
+        # attach to another container must work meanwhile.
+        if not context.machine_running(name):
+            raise E2EFailure(f"The other container {name} is not running")
+        console = _Console(context, second)
+        _wait_for_console(context, second)
+        returncode, output = None, ""
+        with PORT_LOCK.open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            console.send("exit\n")
+            # The stop decides under the lifecycle lock, and then waits for
+            # the port mapping lock there.
+            _wait_for(
+                "the stop holds the lifecycle lock",
+                lambda: holds_flock(console.process.pid, LIFECYCLE_LOCK),
+            )
+            attached = context.sandy(["exec", "--", "true"], name=name, expected=None)
+            try:
+                returncode, output = console.finish(timeout=LIFECYCLE_LOCK_WAIT)
+            except subprocess.TimeoutExpired:
+                raise E2EFailure(
+                    "The stop waited for the port mapping lock with no limit"
+                ) from None
+        if attached.returncode != 0:
+            raise E2EFailure(
+                f"An attach to {name} failed during the stop: "
+                f"{attached.output[-2000:]}"
+            )
+        if returncode != 0 or (
+            f"W: Did not stop '{second}': the port mapping lock stayed busy"
+            not in output
+        ):
+            raise E2EFailure(f"Console up exited {returncode}: {output[-2000:]}")
+        if not context.machine_running(second):
+            raise E2EFailure(
+                "The stop with a busy port mapping lock stopped the container"
+            )
+        context.sandy(["down"], name=second)
         _wait_stopped(context, second)
 
     with context.case("an entry setup failure stops up with an error"):

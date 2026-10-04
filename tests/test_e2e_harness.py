@@ -1326,7 +1326,7 @@ class SandyInvocationTests(unittest.TestCase):
                         context.start_up(name, "developer", ["up"], log_name)
             self.assertEqual(popen.call_count, 2)
 
-    def test_waits_for_flock_finds_only_a_flock_waiter_for_the_path(self):
+    def test_flock_checks_find_only_the_flock_entries_of_the_path(self):
         # Mocks: the /proc/locks file, in the form that Linux 5.15 and 6.12
         # print for a process that waits in flock(2).
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1352,6 +1352,11 @@ class SandyInvocationTests(unittest.TestCase):
                 for pid in (100, 300, 400, 500, 600, 700):
                     with self.subTest(pid=pid):
                         self.assertFalse(support.waits_for_flock(pid, path))
+                # Only the holder of the flock(2) lock of the path holds it.
+                self.assertTrue(support.holds_flock(100, path))
+                for pid in (200, 300, 400, 500, 600, 700):
+                    with self.subTest(holder=pid):
+                        self.assertFalse(support.holds_flock(pid, path))
 
     def test_sandy_passes_the_environment_unchanged(self):
         # Regression test: sandy no longer reads SUDO_UID (the ACL path is

@@ -10240,7 +10240,8 @@ class PortStateTests(unittest.TestCase):
                     stack.enter_context(captured_output())
                     instance._cleanup_port_mappings_for_container("target")
 
-                remove.assert_called_once_with("target")
+                # No limit on the wait for the port mapping lock.
+                remove.assert_called_once_with("target", None)
                 setup.assert_not_called()
                 ipt.assert_not_called()
                 if backend == "nftables" and table_exists:
@@ -10882,11 +10883,33 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(
             manager.mock_calls,
             [
-                call.cleanup("ai-dev"),
+                call.cleanup("ai-dev", lock_timeout=None),
                 call.run(["machinectl", "poweroff", "ai-dev"]),
                 call.wait("ai-dev"),
             ],
         )
+
+    def test_machine_poweroff_with_a_busy_port_lock_changes_nothing(self):
+        # The stop after the last session passes a limit. Mocks: the query,
+        # the port cleanup, which times out on the port mapping lock, and the
+        # machinectl commands.
+        instance = make_sandy()
+        manager = MagicMock()
+        manager.cleanup.side_effect = TimeoutError(
+            "Timed out waiting for the Sandy port mapping lock"
+        )
+        with patch.object(
+            instance, "_is_container_running", return_value="123"
+        ), patch.object(
+            instance, "_cleanup_port_mappings_for_container", manager.cleanup
+        ), patch.object(
+            sandy, "_run_secure_subprocess", manager.run
+        ), patch.object(
+            instance, "_wait_for_container_stop", manager.wait
+        ):
+            with self.assertRaises(TimeoutError):
+                instance._machine_poweroff(port_lock_timeout=5)
+        self.assertEqual(manager.mock_calls, [call.cleanup("ai-dev", lock_timeout=5)])
 
     def test_machine_poweroff_terminates_only_after_timeout(self):
         for stopped_after_terminate in (True, False):
@@ -11715,6 +11738,32 @@ class PortForwardingTests(unittest.TestCase):
         get_ip.assert_not_called()
         update.assert_called_once_with("ai-dev", "10.20.30.10")
         setup.assert_called_once_with("10.20.30.10")
+
+    def test_port_cleanup_with_a_busy_lock_removes_no_state_and_no_rule(self):
+        # The stop after the last session removes the ports with a limit.
+        # Mocks: the lock, which stays busy, and the backends.
+        instance = self.configured_instance()
+        network = instance.network
+        with patch.object(
+            instance,
+            "_port_mapping_lock",
+            side_effect=TimeoutError(
+                "Timed out waiting for the Sandy port mapping lock"
+            ),
+        ) as lock, patch.object(
+            instance, "_persist_port_mapping_state"
+        ) as persist, patch.object(
+            instance, "_cleanup_port_forwarding_ipt"
+        ) as cleanup:
+            with self.assertRaises(TimeoutError):
+                instance._cleanup_port_mappings_for_container("other", lock_timeout=2)
+        lock.assert_called_once_with(exclusive=True, timeout=2)
+        persist.assert_not_called()
+        cleanup.assert_not_called()
+        # The container, the ports, and the network of the caller come back.
+        self.assertEqual(instance.container, "ai-dev")
+        self.assertEqual(instance.port_mappings, [("tcp", 8080, 80)])
+        self.assertIs(instance.network, network)
 
     def test_iptables_setup_and_cleanup_create_five_rules(self):
         instance = self.configured_instance()
@@ -14038,9 +14087,9 @@ class RunUpTests(unittest.TestCase):
                         patch.object(
                             instance,
                             "_remove_port_mappings_from_state",
-                            side_effect=lambda name: (
+                            side_effect=lambda name, lock_timeout=None: (
                                 sandy.Sandy._remove_port_mappings_from_state(
-                                    instance, name
+                                    instance, name, lock_timeout
                                 )
                             ),
                         )
@@ -14059,8 +14108,10 @@ class RunUpTests(unittest.TestCase):
                     self.port_lock.side_effect = lambda **kwargs: (
                         self.real_port_lock(instance, **kwargs)
                     )
-                    self.stale_cleanup.side_effect = lambda name: self.real_cleanup(
-                        instance, name
+                    self.stale_cleanup.side_effect = (
+                        lambda name, lock_timeout=None: self.real_cleanup(
+                            instance, name, lock_timeout
+                        )
                     )
                     mocks.popen.side_effect = start
                     stdout = stack.enter_context(captured_output())[0]
@@ -16448,7 +16499,7 @@ class AttachLifecycleTests(unittest.TestCase):
                 call.marker(70),
                 call.close(70),
                 call.attached("ai-dev"),
-                call.poweroff(),
+                call.poweroff(port_lock_timeout=sandy.PORT_MAPPINGS_LOCK_TIMEOUT),
                 call.lock_exit(),
                 call.sigmask(sandy.signal.SIG_UNBLOCK, sandy.ATTACH_HANGUP_SIGNALS),
             ],
@@ -16491,7 +16542,9 @@ class AttachLifecycleTests(unittest.TestCase):
         names = [entry[0] for entry in manager.mock_calls]
         self.assertLess(names.index("remove_marker"), names.index("count"))
         manager.remove_marker.assert_called_once_with(70)
-        manager.poweroff.assert_called_once_with()
+        manager.poweroff.assert_called_once_with(
+            port_lock_timeout=sandy.PORT_MAPPINGS_LOCK_TIMEOUT
+        )
 
     def test_console_hangup_removes_marker_without_stop(self):
         with self.rule_mocks() as (instance, manager):
@@ -16527,7 +16580,44 @@ class AttachLifecycleTests(unittest.TestCase):
                 self.assertIn("W: Could not check the sessions", stdout.getvalue())
                 self.assertNotIn("\x1b", stdout.getvalue())
 
+    def test_last_attach_rule_keeps_the_container_when_the_port_lock_stays_busy(
+        self,
+    ):
+        # Regression test: the stop after the last session waited for the
+        # port mapping lock with no limit under the lifecycle lock. While
+        # another process held the port mapping lock (for example, rm
+        # --cache), each attach, to any container, failed after
+        # LIFECYCLE_LOCK_TIMEOUT. Now the stop waits for at most
+        # PORT_MAPPINGS_LOCK_TIMEOUT, and the container keeps running with its
+        # ports. Mocks: the lifecycle lock, the cgroup checks, and the
+        # poweroff, which times out on the port mapping lock before any change.
+        self.assertLess(sandy.PORT_MAPPINGS_LOCK_TIMEOUT, sandy.LIFECYCLE_LOCK_TIMEOUT)
+        with self.rule_mocks() as (instance, manager):
+            manager.poweroff.side_effect = TimeoutError(
+                "Timed out waiting for the Sandy port mapping lock"
+            )
+            with captured_output() as (stdout, _):
+                instance._stop_if_last_attach()
+        manager.poweroff.assert_called_once_with(
+            port_lock_timeout=sandy.PORT_MAPPINGS_LOCK_TIMEOUT
+        )
+        manager.lock_exit.assert_called_once_with()
+        self.assertEqual(
+            manager.sigmask.call_args_list[-1],
+            call(sandy.signal.SIG_UNBLOCK, sandy.ATTACH_HANGUP_SIGNALS),
+        )
+        self.assertEqual(
+            stdout.getvalue(),
+            "I: Stopping 'ai-dev': no session is attached\n"
+            "W: Did not stop 'ai-dev': the port mapping lock stayed busy\n"
+            "   Stop it with: sandy --container ai-dev down\n",
+        )
+
     def test_last_attach_rule_lock_timeout_warns(self):
+        # A timeout of the lifecycle lock is not one of the port mapping
+        # lock: the warning names the session check, not a stop that the
+        # port mapping lock kept from running. Mocks: the lifecycle lock,
+        # which times out, the signal mask, and the poweroff.
         instance = make_sandy()
         with patch.object(
             sandy, "_lifecycle_lock", side_effect=TimeoutError("busy")
@@ -16537,7 +16627,9 @@ class AttachLifecycleTests(unittest.TestCase):
             with captured_output() as (stdout, _):
                 instance._stop_if_last_attach()
         poweroff.assert_not_called()
-        self.assertIn("busy", stdout.getvalue())
+        self.assertEqual(
+            stdout.getvalue(), "W: Could not check the sessions of 'ai-dev': 'busy'\n"
+        )
         self.assertEqual(sigmask.call_count, 2)
 
     def test_exec_applies_rule_after_normal_exit_only(self):
