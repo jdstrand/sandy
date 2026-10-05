@@ -7268,6 +7268,7 @@ class Sandy:
         container_name: Optional[str] = None,
         port_lock_timeout: Optional[float] = None,
         stop_timeout: float = 2 * CONTAINER_POWEROFF_TIMEOUT,
+        quiet: bool = False,
     ) -> bool:
         """Stop the container if it's running.
 
@@ -7276,7 +7277,9 @@ class Sandy:
         the port mapping lock is not free in that time. That comes before any
         change: the container keeps running, with its port rules and state.
         The poweroff and the terminate, with their machinectl commands and
-        waits, take at most stop_timeout in all after the port cleanup.
+        waits, take at most stop_timeout in all after the port cleanup. With
+        quiet, machinectl gets /dev/null for its output, for a caller that
+        holds back its own output.
         """
         if container_name is None:
             container_name = self.container
@@ -7298,9 +7301,15 @@ class Sandy:
         # gets the first half of stop_timeout, and the terminate the rest.
         deadline = time.monotonic() + stop_timeout
         poweroff_deadline = deadline - stop_timeout / 2
+        output: Dict[str, int] = (
+            {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+            if quiet
+            else {}
+        )
         _run_secure_subprocess(
             ["machinectl", "poweroff", container_name],
             timeout=_query_timeout_until(poweroff_deadline),
+            **output,
         )
         if self._wait_for_container_stop(
             container_name, max(poweroff_deadline - time.monotonic(), 0.0)
@@ -7308,8 +7317,8 @@ class Sandy:
             return True
         _run_secure_subprocess(
             ["machinectl", "terminate", container_name],
-            stderr=subprocess.DEVNULL,
             timeout=_query_timeout_until(deadline),
+            **{**output, "stderr": subprocess.DEVNULL},
         )
         if self._wait_for_container_stop(
             container_name, max(deadline - time.monotonic(), 0.0)
@@ -8368,61 +8377,76 @@ class Sandy:
         count also removes empty attach leaves, for -d containers too. While
         the up-console marker exists, the console has not exited, so no
         stop; the console's own exit (console=True) removes the marker first.
+        The output waits until the end, and machinectl gets no terminal: a
+        terminal write can block.
         """
         blocked = threading.current_thread() is threading.main_thread()
+        # A terminal write can block, for example after the STOP character,
+        # and each attach waits for the lifecycle lock. So hold back the
+        # output of the decision and the stop, and write it at the end: with
+        # the lock free, and with SIGHUP and SIGTERM unblocked, so that they
+        # can end a write that blocks.
+        held_output = io.StringIO()
         if blocked:
             signal.pthread_sigmask(signal.SIG_BLOCK, ATTACH_HANGUP_SIGNALS)
         try:
-            with _lifecycle_lock():
+            with redirect_stdout(held_output):
                 try:
-                    unit_fd = _open_supervisor_cgroup(self.container)
-                except FileNotFoundError:
-                    return
-                try:
-                    if console:
-                        _remove_up_console_marker(unit_fd)
-                    remaining = _count_populated_attaches(unit_fd)
-                    console_running = _up_console_marker_exists(unit_fd)
-                finally:
-                    os.close(unit_fd)
-                if remaining or console_running:
-                    return
-                if not _supervisor_started_attached(self.container):
-                    return
-                print(f"I: Stopping '{self.container}': no session is attached")
-                try:
-                    # Each attach waits for the lifecycle lock, so the stop
-                    # itself also takes only a short time.
-                    stopped = self._machine_poweroff(
-                        port_lock_timeout=PORT_MAPPINGS_LOCK_TIMEOUT,
-                        stop_timeout=CONTAINER_POWEROFF_TIMEOUT,
-                    )
-                except TimeoutError:
-                    # Each attach waits for the lifecycle lock, so the stop
-                    # waits for the port mapping lock only for a short time.
-                    # Then the container keeps running with its ports: a stop
-                    # that left them would make other ups refuse those ports.
+                    with _lifecycle_lock():
+                        try:
+                            unit_fd = _open_supervisor_cgroup(self.container)
+                        except FileNotFoundError:
+                            return
+                        try:
+                            if console:
+                                _remove_up_console_marker(unit_fd)
+                            remaining = _count_populated_attaches(unit_fd)
+                            console_running = _up_console_marker_exists(unit_fd)
+                        finally:
+                            os.close(unit_fd)
+                        if remaining or console_running:
+                            return
+                        if not _supervisor_started_attached(self.container):
+                            return
+                        print(f"I: Stopping '{self.container}': no session is attached")
+                        try:
+                            # Each attach waits for the lifecycle lock, so the stop
+                            # itself also takes only a short time.
+                            stopped = self._machine_poweroff(
+                                port_lock_timeout=PORT_MAPPINGS_LOCK_TIMEOUT,
+                                stop_timeout=CONTAINER_POWEROFF_TIMEOUT,
+                                quiet=True,
+                            )
+                        except TimeoutError:
+                            # Each attach waits for the lifecycle lock, so the stop
+                            # waits for the port mapping lock only for a short time.
+                            # Then the container keeps running with its ports: a stop
+                            # that left them would make other ups refuse those ports.
+                            print(
+                                f"W: Did not stop '{self.container}': the port mapping "
+                                "lock stayed busy"
+                            )
+                            stopped = False
+                        except subprocess.SubprocessError as exc:
+                            print(
+                                f"W: Could not stop '{self.container}': "
+                                f"{_terminal_safe_repr(str(exc))}"
+                            )
+                            stopped = False
+                        if not stopped:
+                            print(
+                                "   Stop it with: sandy --container "
+                                f"{self.container} down"
+                            )
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     print(
-                        f"W: Did not stop '{self.container}': the port mapping "
-                        "lock stayed busy"
-                    )
-                    stopped = False
-                except subprocess.SubprocessError as exc:
-                    print(
-                        f"W: Could not stop '{self.container}': "
+                        f"W: Could not check the sessions of '{self.container}': "
                         f"{_terminal_safe_repr(str(exc))}"
                     )
-                    stopped = False
-                if not stopped:
-                    print(f"   Stop it with: sandy --container {self.container} down")
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            print(
-                f"W: Could not check the sessions of '{self.container}': "
-                f"{_terminal_safe_repr(str(exc))}"
-            )
         finally:
             if blocked:
                 signal.pthread_sigmask(signal.SIG_UNBLOCK, ATTACH_HANGUP_SIGNALS)
+            _write_held_output(held_output)
 
     def _end_up_console(self) -> None:
         """After a console hangup: remove the marker, but never stop."""

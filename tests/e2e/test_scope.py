@@ -426,11 +426,21 @@ def _wait_for_leaf_commands(
 
 
 class _Attach:
-    """A background `sandy exec` whose processes can be found and signaled."""
+    """A background `sandy exec` whose processes can be found and signaled.
 
-    def __init__(self, context: E2EContext, name: str, command: str) -> None:
+    With terminal, its stdout and stderr go to that pty, not to a file.
+    """
+
+    def __init__(
+        self,
+        context: E2EContext,
+        name: str,
+        command: str,
+        terminal: StoppableTerminal | None = None,
+    ) -> None:
         self.context = context
         self.name = name
+        self.terminal = terminal
         arguments = [
             str(SANDY),
             "--workspace",
@@ -448,8 +458,8 @@ class _Attach:
             self.process = subprocess.Popen(
                 arguments,
                 stdin=subprocess.DEVNULL,
-                stdout=stream,
-                stderr=subprocess.STDOUT,
+                stdout=stream if terminal is None else terminal.slave,
+                stderr=subprocess.STDOUT if terminal is None else terminal.slave,
                 cwd=context.root,
                 env=context.safe_environment(),
             )
@@ -497,6 +507,9 @@ class _Attach:
             if self.process.poll() is None:
                 self.process.kill()
                 self.process.wait(timeout=10)
+        if self.terminal is not None:
+            # The reader of the terminal can still get the last bytes.
+            return returncode, self.terminal.output()
         return returncode, self.output.read_text(encoding="utf-8", errors="replace")
 
 
@@ -1244,11 +1257,13 @@ def test_main(context: E2EContext) -> None:
             lambda: not holds_flock(console.process.pid, LIFECYCLE_LOCK),
             timeout=LIFECYCLE_LOCK_WAIT + STOP_UNDER_LOCK_WAIT,
         )
-        held = time.monotonic() - held_from
+        held_seconds = time.monotonic() - held_from
         attach.join(timeout=WAIT_TIMEOUT)
         returncode, output = console.finish(timeout=WAIT_TIMEOUT)
-        if held >= STOP_UNDER_LOCK_WAIT:
-            raise E2EFailure(f"The stop held the lifecycle lock for {held:.1f} s")
+        if held_seconds >= STOP_UNDER_LOCK_WAIT:
+            raise E2EFailure(
+                f"The stop held the lifecycle lock for {held_seconds:.1f} s"
+            )
         if not attaches or attaches[0].returncode != 0:
             raise E2EFailure(
                 f"An attach to {name} failed during the stop: "
@@ -1305,6 +1320,89 @@ def test_main(context: E2EContext) -> None:
             raise E2EFailure(f"up exited {returncode}: {output[-2000:]}")
         assert_contains_text(output, f"I: Starting '{second}' in detached state")
         context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("the stop after the last attach writes nothing under its lock"):
+        # Regression test: the stop after the last session printed its
+        # "Stopping" line while it held the lifecycle lock. A write to a
+        # stopped terminal (Ctrl-S) blocks, so that session kept the lock,
+        # and each attach, to any container, failed after 10 s. Stop the
+        # terminal of the last attach to a console up, and end the console
+        # first. When the attach ends, its stop must stop the container and
+        # free the lock while its terminal is stopped, and an attach to
+        # another container must work. When the terminal starts again, the
+        # attach must end as usual.
+        if not context.machine_running(name):
+            raise E2EFailure(f"The other container {name} is not running")
+        release = context.workspace / "e2e-release-last-attach"
+        console = _Console(context, second)
+        _wait_for_console(context, second)
+        attach_returncode, output = None, ""
+        with StoppableTerminal() as terminal:
+            # The command writes nothing, and script runs with -q, so only
+            # the stop writes to this terminal. The host ends the command
+            # through the workspace, with no other attach.
+            attach = _Attach(
+                context,
+                second,
+                f'while [ ! -e "$HOME/workspace/{release.name}" ]; do sleep 0.1; done',
+                terminal=terminal,
+            )
+            try:
+                attach.leaf()
+                terminal.stop()
+                before = terminal.output()
+                console.send("exit\n")
+                returncode, console_output = console.finish()
+                if returncode != 0:
+                    raise E2EFailure(
+                        f"Console up exited {returncode}: {console_output[-2000:]}"
+                    )
+                if not context.machine_running(second):
+                    raise E2EFailure("The console exit stopped the container")
+                release.touch()
+                _wait_for(
+                    "the last attach stops the container and frees the lock",
+                    lambda: not context.machine_running(second)
+                    and not holds_flock(attach.process.pid, LIFECYCLE_LOCK),
+                )
+                attached = context.sandy(
+                    ["exec", "--", "true"], name=name, expected=None
+                )
+                if attached.returncode != 0:
+                    raise E2EFailure(
+                        f"An attach to {name} failed while the terminal of the "
+                        f"last attach was stopped: {attached.output[-2000:]}"
+                    )
+                # The attach still waits to write: the case tested a stopped
+                # terminal.
+                if attach.process.poll() is not None or not terminal.stopped():
+                    raise E2EFailure("The attach did not wait to write")
+                if terminal.output() != before:
+                    raise E2EFailure("Output came while the terminal was stopped")
+                terminal.start()
+                attach_returncode, _ = attach.finish()
+                _wait_for(
+                    "the output of the stop arrives",
+                    lambda: "no session is attached" in terminal.output(),
+                )
+                output = terminal.output()
+            except E2EFailure as exc:
+                raise E2EFailure(
+                    f"{exc}\nOutput of the attach: {terminal.output()[-2000:]!r}"
+                ) from None
+            finally:
+                for process in (attach.process, console.process):
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=10)
+                release.unlink(missing_ok=True)
+        if attach_returncode != 0:
+            raise E2EFailure(f"The attach exited {attach_returncode}: {output}")
+        assert_contains_text(output, f"I: Stopping '{second}': no session is attached")
+        for warning in ("did not stop", "Could not"):
+            if warning in output:
+                raise E2EFailure(f"Unexpected warning: {output[-2000:]}")
         _wait_stopped(context, second)
 
     with context.case("an entry setup failure stops up with an error"):

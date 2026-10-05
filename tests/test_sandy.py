@@ -57,10 +57,12 @@ LOCKED_STOP = {
     "kill_timeout": sandy.CONTAINER_POWEROFF_TIMEOUT / 2,
 }
 # The stop after the last session runs under the lifecycle lock: it waits
-# for the port mapping lock, and then stops, each for a short time.
+# for the port mapping lock, and then stops, each for a short time. It holds
+# back its output, so machinectl gets no terminal.
 LAST_ATTACH_STOP = {
     "port_lock_timeout": sandy.PORT_MAPPINGS_LOCK_TIMEOUT,
     "stop_timeout": sandy.CONTAINER_POWEROFF_TIMEOUT,
+    "quiet": True,
 }
 
 
@@ -11560,6 +11562,35 @@ class ExecutionTests(unittest.TestCase):
                         not stopped_after_terminate,
                     )
 
+    def test_machine_poweroff_quiet_gives_machinectl_no_terminal(self):
+        # The stop after the last session holds back its output, so its
+        # machinectl commands must not write to the terminal either: with
+        # quiet, they get /dev/null for stdout and stderr. Mocks: the query,
+        # the cleanup, the commands, and the waits; the poweroff does not
+        # stop the container in time, so the terminate runs too.
+        instance = make_sandy()
+        manager = MagicMock()
+        manager.wait.side_effect = [False, True]
+        with patch.object(
+            instance, "_is_container_running", return_value="123"
+        ), patch.object(
+            instance, "_cleanup_port_mappings_for_container", manager.cleanup
+        ), patch.object(
+            sandy, "_run_secure_subprocess", manager.run
+        ), patch.object(
+            instance, "_wait_for_container_stop", manager.wait
+        ):
+            with captured_output():
+                self.assertTrue(instance._machine_poweroff("other", quiet=True))
+        quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        self.assertEqual(
+            manager.run.call_args_list,
+            [
+                call(["machinectl", "poweroff", "other"], timeout=ANY, **quiet),
+                call(["machinectl", "terminate", "other"], timeout=ANY, **quiet),
+            ],
+        )
+
     def test_machine_poweroff_skips_stopped_container(self):
         instance = make_sandy()
         with patch.object(instance, "_is_container_running", return_value=None):
@@ -18277,6 +18308,107 @@ class AttachLifecycleTests(unittest.TestCase):
             stdout.getvalue(), "W: Could not check the sessions of 'ai-dev': 'busy'\n"
         )
         self.assertEqual(sigmask.call_count, 2)
+
+    def test_last_attach_stop_writes_after_the_lock_and_the_unblock(self):
+        # Regression test: the stop after the last session printed its lines
+        # while it held the lifecycle lock, with SIGHUP and SIGTERM blocked.
+        # A write to a stopped terminal (Ctrl-S) blocks, so the lock stayed
+        # held, and each attach failed after 10 s. Now the stop holds its
+        # lines back and writes them in one write, after the release of the
+        # lock and the unblock. Mocks: as in rule_mocks; the terminal records
+        # each write in order with the other calls.
+        stopping = "I: Stopping 'ai-dev': no session is attached\n"
+        down = "   Stop it with: sandy --container ai-dev down\n"
+        not_stopped = "W: Container 'ai-dev' did not stop\n"
+
+        def poweroff_that_does_not_stop(**_kwargs: object) -> bool:
+            print(not_stopped, end="")
+            return False
+
+        cases: tuple[tuple[str, str, Callable[[MagicMock], None]], ...] = (
+            ("stopped", stopping, lambda manager: None),
+            (
+                "did not stop",
+                stopping + not_stopped + down,
+                lambda manager: setattr(
+                    manager.poweroff, "side_effect", poweroff_that_does_not_stop
+                ),
+            ),
+            (
+                "busy port lock",
+                stopping
+                + "W: Did not stop 'ai-dev': the port mapping lock stayed busy\n"
+                + down,
+                lambda manager: setattr(
+                    manager.poweroff, "side_effect", TimeoutError("busy")
+                ),
+            ),
+            (
+                "failed check",
+                "W: Could not check the sessions of 'ai-dev': 'bad cgroup'\n",
+                lambda manager: setattr(
+                    manager.count, "side_effect", ValueError("bad cgroup")
+                ),
+            ),
+            (
+                "lock timeout",
+                "W: Could not check the sessions of 'ai-dev': 'busy'\n",
+                lambda manager: setattr(
+                    manager.lock_enter, "side_effect", TimeoutError("busy")
+                ),
+            ),
+            (
+                "an attach is left",
+                "",
+                lambda manager: setattr(manager.count, "return_value", 1),
+            ),
+        )
+        unblock = call.sigmask(sandy.signal.SIG_UNBLOCK, sandy.ATTACH_HANGUP_SIGNALS)
+        for name, expected, setup in cases:
+            with self.subTest(name=name):
+                with self.rule_mocks() as (instance, manager):
+                    setup(manager)
+
+                    class Terminal(io.StringIO):
+                        def write(self, text: str) -> int:
+                            manager.write(text)
+                            return super().write(text)
+
+                    with redirect_stdout(Terminal()):
+                        instance._stop_if_last_attach()
+                writes = [
+                    index
+                    for index, entry in enumerate(manager.mock_calls)
+                    if entry[0] == "write"
+                ]
+                if not expected:
+                    self.assertEqual(writes, [])
+                    continue
+                # One write, right after the unblock, which comes after the
+                # release of the lock.
+                self.assertEqual(writes, [manager.mock_calls.index(unblock) + 1])
+                self.assertEqual(manager.mock_calls[writes[0]], call.write(expected))
+
+    def test_a_dead_terminal_does_not_skip_the_last_attach_stop(self):
+        # Regression test: the "Stopping" line came before the stop, so a
+        # failed write, for example to a closed terminal (EIO), skipped the
+        # stop: the container kept running with no session. Now the stop
+        # comes first, and the write error comes after it. Mocks: as in
+        # rule_mocks; each terminal write raises EIO.
+        class DeadTerminal(io.StringIO):
+            def write(self, text: str) -> int:
+                raise OSError(errno.EIO, "Input/output error")
+
+        with self.rule_mocks() as (instance, manager):
+            with redirect_stdout(DeadTerminal()):
+                with self.assertRaises(OSError):
+                    instance._stop_if_last_attach()
+        manager.poweroff.assert_called_once_with(**LAST_ATTACH_STOP)
+        manager.lock_exit.assert_called_once_with()
+        self.assertEqual(
+            manager.sigmask.call_args_list[-1],
+            call(sandy.signal.SIG_UNBLOCK, sandy.ATTACH_HANGUP_SIGNALS),
+        )
 
     def test_exec_applies_rule_after_normal_exit_only(self):
         instance = make_sandy()

@@ -438,9 +438,11 @@ seconds (SIGTERM, then SIGKILL), because it can still hold the lifecycle
 lock. While `up` holds the lifecycle lock or the port mapping lock, it
 holds back its output and writes it after the release, so a stopped
 terminal cannot keep a lock held. The stop after
-the last session also waits for the port mapping lock under the lifecycle
-lock for at most 5 seconds, less than the 10 seconds that each attach waits
-for the lifecycle lock. When the port mapping lock stays busy for that
+the last session holds back its output in the same way, and gives
+`machinectl` no terminal. That stop also waits for the port mapping lock
+under the lifecycle lock for at most 5 seconds, less than the 10 seconds
+that each attach waits for the lifecycle lock. When the port mapping lock
+stays busy for that
 time, the container keeps running with its ports (see `up` above). After
 that wait, the stop itself (`machinectl poweroff`, then `machinectl
 terminate`, with their waits and commands) takes at most 5 seconds more;
