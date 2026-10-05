@@ -17922,13 +17922,17 @@ class StartFailureTests(unittest.TestCase):
         manager.supervisor.terminate.assert_called_once_with()
 
     def test_stop_failed_start_skips_exited_supervisor(self):
+        # A supervisor that already exited gets no signal and gives no
+        # warning; its port rules still go.
         instance = make_sandy()
         supervisor = MagicMock()
         supervisor.poll.return_value = 1
         with patch.object(instance, "_cleanup_port_mappings_for_container") as clean:
-            instance._stop_failed_start(supervisor)
+            with captured_output() as (stdout, _):
+                instance._stop_failed_start(supervisor)
         supervisor.terminate.assert_not_called()
         clean.assert_called_once_with("ai-dev")
+        self.assertEqual(stdout.getvalue(), "")
 
 
 class AttachCgroupTests(unittest.TestCase):
