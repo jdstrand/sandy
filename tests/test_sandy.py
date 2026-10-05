@@ -3216,8 +3216,8 @@ class GuestFileTests(unittest.TestCase):
                                 lambda: sandy._create_guest_files(
                                     str(new_image),
                                     "new",
-                                    "10.20.30.0/24",
-                                    "10.20.30.1",
+                                    "192.0.2.0/24",
+                                    "192.0.2.1",
                                 ),
                                 fifos,
                             )
@@ -3232,7 +3232,7 @@ class GuestFileTests(unittest.TestCase):
     def test_address_scan_reserves_the_address_of_a_safe_init_script(self):
         def prepare(machines: Path, _outside: Path) -> list[Path]:
             # The address of another network reserves nothing here.
-            for name, address in (("old", "10.20.30.10"), ("other", "10.99.0.11")):
+            for name, address in (("old", "192.0.2.10"), ("other", "198.51.100.11")):
                 image = machines / f"sandy.{name}"
                 image.mkdir()
                 init_script = image / "init.sh"
@@ -3244,7 +3244,7 @@ class GuestFileTests(unittest.TestCase):
 
         init_script, output, blocked, _ = self.allocate_beside_images(prepare)
         self.assertFalse(blocked)
-        self.assertIn('CONTAINER_IP="10.20.30.11"', init_script)
+        self.assertIn('CONTAINER_IP="192.0.2.11"', init_script)
         self.assertNotIn("W:", output)
 
     def test_address_scan_does_not_follow_an_init_script_link(self):
@@ -3253,7 +3253,7 @@ class GuestFileTests(unittest.TestCase):
         # the address in a file outside the image.
         def prepare(machines: Path, outside: Path) -> list[Path]:
             target = outside / "init.sh"
-            target.write_text('CONTAINER_IP="10.20.30.10"\n', encoding="utf-8")
+            target.write_text('CONTAINER_IP="192.0.2.10"\n', encoding="utf-8")
             target.chmod(0o644)
             image = machines / "sandy.linked"
             image.mkdir()
@@ -3262,7 +3262,7 @@ class GuestFileTests(unittest.TestCase):
 
         init_script, output, blocked, machines = self.allocate_beside_images(prepare)
         self.assertFalse(blocked)
-        self.assertIn('CONTAINER_IP="10.20.30.10"', init_script)
+        self.assertIn('CONTAINER_IP="192.0.2.10"', init_script)
         self.assertIn(
             f"W: Did not reserve the address in '{machines}/sandy.linked/init.sh': "
             "\"Unsafe image file path component 'init.sh'\"\n",
@@ -3277,7 +3277,7 @@ class GuestFileTests(unittest.TestCase):
             image.mkdir()
             init_script = image / "init.sh"
             init_script.write_text(
-                'CONTAINER_IP="10.20.30.10"\n' + "#" * sandy.INIT_SCRIPT_MAX_BYTES,
+                'CONTAINER_IP="192.0.2.10"\n' + "#" * sandy.INIT_SCRIPT_MAX_BYTES,
                 encoding="utf-8",
             )
             init_script.chmod(0o644)
@@ -3285,7 +3285,7 @@ class GuestFileTests(unittest.TestCase):
 
         init_script, output, blocked, machines = self.allocate_beside_images(prepare)
         self.assertFalse(blocked)
-        self.assertIn('CONTAINER_IP="10.20.30.10"', init_script)
+        self.assertIn('CONTAINER_IP="192.0.2.10"', init_script)
         self.assertIn(
             f"W: Did not reserve the address in '{machines}/sandy.large/init.sh': "
             "'Container init script is too large'\n",
@@ -3304,7 +3304,7 @@ class GuestFileTests(unittest.TestCase):
 
         init_script, output, blocked, machines = self.allocate_beside_images(prepare)
         self.assertFalse(blocked, "the scan blocked in the open of a FIFO")
-        self.assertIn('CONTAINER_IP="10.20.30.10"', init_script)
+        self.assertIn('CONTAINER_IP="192.0.2.10"', init_script)
         self.assertIn(
             f"W: Did not reserve the address in '{machines}/sandy.fifo/init.sh': "
             "\"Image file 'init.sh' is not a regular file\"\n",
@@ -3324,7 +3324,7 @@ class GuestFileTests(unittest.TestCase):
             image = Path(temp_dir)
             init_script = image / "init.sh"
             cases = (
-                ('CONTAINER_IP="10.20.30.10"\n', "10.20.30.10", None),
+                ('CONTAINER_IP="192.0.2.10"\n', "192.0.2.10", None),
                 ("no address\n", None, None),
                 ("#" * (sandy.INIT_SCRIPT_MAX_BYTES + 1), None, "too large"),
                 (None, None, None),
@@ -3378,7 +3378,7 @@ class GuestFileTests(unittest.TestCase):
                     with patch.object(sandy, "_write", side_effect=record_write):
                         with captured_output() as (stdout, _):
                             sandy._create_guest_files(
-                                "/machine", "test-box", "10.20.30.0/24", "10.20.30.1"
+                                "/machine", "test-box", "192.0.2.0/24", "192.0.2.1"
                             )
         self.assertEqual(
             events,
@@ -3441,7 +3441,7 @@ class GuestFileTests(unittest.TestCase):
             def build(name: str) -> None:
                 try:
                     sandy._create_guest_files(
-                        str(images[name]), name, "10.20.30.0/24", "10.20.30.1"
+                        str(images[name]), name, "192.0.2.0/24", "192.0.2.1"
                     )
                 except BaseException as exc:  # the test reports each error
                     errors.append(exc)
@@ -3474,8 +3474,8 @@ class GuestFileTests(unittest.TestCase):
             }
         self.assertEqual(errors, [])
         self.assertFalse(b_did_not_wait, "build b did not wait for the address lock")
-        self.assertIn('CONTAINER_IP="10.20.30.10"', addresses["a"])
-        self.assertIn('CONTAINER_IP="10.20.30.11"', addresses["b"])
+        self.assertIn('CONTAINER_IP="192.0.2.10"', addresses["a"])
+        self.assertIn('CONTAINER_IP="192.0.2.11"', addresses["b"])
 
     def test_addresses_lock_holds_an_exclusive_flock_on_its_stable_file(self):
         # Mocks: the stable lock file and flock, which record their calls.
