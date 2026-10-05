@@ -6,26 +6,161 @@ processes, so unit mocks cannot prove them.
 
 from __future__ import annotations
 
+import errno
+import fcntl
+import json
 import os
 import re
+import shlex
 import signal
 import subprocess
+import threading
 import time
+from collections.abc import Callable, Iterator
+from typing import BinaryIO
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from tests.e2e.support import (
+    ADDRESSES_LOCK,
+    BACKGROUND_UP_TIMEOUT,
+    LIFECYCLE_LOCK,
+    PORT_LOCK,
+    PORT_STATE,
     SANDY,
+    SHARED_LIMITS,
+    SLICE,
+    SLICE_CGROUP,
+    SYSTEMD_MACHINES,
+    CommandResult,
     E2EContext,
     E2EFailure,
+    StoppableTerminal,
     assert_contains,
     assert_not_contains,
+    has_open_file,
+    holds_flock,
+    waits_for_flock,
 )
 
-CGROUP_SLICE = Path("/sys/fs/cgroup/system.slice")
+CGROUP_SLICE = SLICE_CGROUP
+ONLINE_CPUS = Path("/sys/devices/system/cpu/online")
+THREADS_MAX = Path("/proc/sys/kernel/threads-max")
+PID_MAX = Path("/proc/sys/kernel/pid_max")
 ATTACH_LEAF = re.compile(r"attach-[0-9a-f]{32}")
-DEFAULT_TASKS_MAX = "16384"
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+DEFAULT_TMP_SIZE = 512 * MIB
 KEEPALIVE_COMM = "sandy-keepalive"
 WAIT_TIMEOUT = 30
+# The markers that up makes in the scope of the container that it starts.
+SCOPE_MARKERS = ("mounts-pending", "up-console")
+# The host port that an up publishes when a check under the lock refuses it.
+REFUSED_UP_PORT = 18089
+# A FIFO that root in a container makes in its image, and links /init.sh to.
+INIT_FIFO = "e2e-init-fifo"
+# A lenient build from the cache takes about 20 seconds. A case that expects
+# one, for example with a scan that blocks on the FIFO, fails after this many
+# seconds, well before BUILD_TIMEOUT.
+INIT_SCAN_TIMEOUT = 300
+# The host port of an up that finds the port mapping lock busy.
+BUSY_LOCK_UP_PORT = 18090
+# up waits for the port mapping lock under the lifecycle lock for 5 seconds
+# (PORT_MAPPINGS_LOCK_TIMEOUT of sandy), and attaches wait for the lifecycle
+# lock for 10 (LIFECYCLE_LOCK_TIMEOUT).
+PORT_LOCK_WAIT = 5
+LIFECYCLE_LOCK_WAIT = 10
+# Under the lifecycle lock, the stop after the last session takes at most 5 s
+# (CONTAINER_POWEROFF_TIMEOUT of sandy) after its port cleanup. With its
+# queries, the lock is free well before this many seconds.
+STOP_UNDER_LOCK_WAIT = 7
+# The host port of an up that gets SIGINT while it waits for the port mapping
+# lock, and how long it may take to exit then.
+INTERRUPTED_UP_PORT = 18091
+INTERRUPTED_UP_EXIT = 3
+# The host port of an up whose supervisor does not start.
+FAILED_START_PORT = 18092
+
+
+def _wait_for_the_publish_wait(
+    up: subprocess.Popen[bytes], lock: BinaryIO, log_path: Path, *, blocking: bool
+) -> None:
+    """Return when up waits for the port mapping lock to publish its ports.
+
+    The caller holds the lock through lock. At its start, up also waits for
+    the lock, to remove the stale port rules and state of its name. Let that
+    removal through, and take the lock back at once: up then needs only some
+    milliseconds to come to the publish. A woken waiter must try again, so
+    the caller can get the lock first; up then waits again, and the loop lets
+    it through again. "I: Limits of this container" is the last line before
+    the publish. Without the lifecycle lock, up then waits in flock(2), and
+    /proc/locks shows it as a waiter. Under the lifecycle lock, up polls with
+    LOCK_NB for PORT_LOCK_WAIT seconds; it starts in much less than one
+    second.
+    """
+    deadline = time.monotonic() + WAIT_TIMEOUT
+    while True:
+        if up.poll() is not None or time.monotonic() >= deadline:
+            raise E2EFailure("up did not wait to publish its ports")
+        # Look at the waits first: up prints nothing while it waits.
+        waiting = waits_for_flock(up.pid, PORT_LOCK)
+        limits = "I: Limits of this container" in log_path.read_text(
+            encoding="utf-8", errors="replace"
+        )
+        if limits and not blocking:
+            time.sleep(1)
+            break
+        if waiting:
+            if limits:
+                break
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            continue
+        time.sleep(0.01)
+    if up.poll() is not None:
+        raise E2EFailure("up did not wait to publish its ports")
+
+
+class _PortStateReader:
+    """Read the port state under the port mapping lock in a loop, as up does.
+
+    Count the reads, and the reads that find one key.
+    """
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self.reads = 0
+        self.found = 0
+        self.errors: list[BaseException] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._read, daemon=True)
+
+    def __enter__(self) -> "_PortStateReader":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=WAIT_TIMEOUT)
+        if self._thread.is_alive():
+            raise E2EFailure("The port state reader did not stop")
+
+    def _read(self) -> None:
+        try:
+            while not self._stop.is_set():
+                with PORT_LOCK.open("rb") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_SH)
+                    try:
+                        if PORT_STATE.exists():
+                            state = json.loads(PORT_STATE.read_text(encoding="utf-8"))
+                            if self.key in state:
+                                self.found += 1
+                        self.reads += 1
+                    finally:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                time.sleep(0.001)
+        except BaseException as exc:  # reported by the case
+            self.errors.append(exc)
 
 
 def _unit(name: str) -> str:
@@ -47,6 +182,23 @@ def _systemd_version(context: E2EContext) -> int:
     return int(first.split()[1])
 
 
+def _read_cgroup_file(path: Path) -> str | None:
+    """Return the text of a cgroup file, or None when its cgroup is gone.
+
+    sandy removes attach leaves while the tests poll them. A removal before
+    the open gives ENOENT; a removal between the open and the read gives
+    ENODEV (seen on systemd 257).
+    """
+    try:
+        return path.read_text(encoding="ascii")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno != errno.ENODEV:
+            raise
+        return None
+
+
 def _leaves(name: str) -> dict[str, bool]:
     """Return each attach leaf of the scope and whether it has processes."""
     unit_dir = _unit_dir(name)
@@ -55,11 +207,9 @@ def _leaves(name: str) -> dict[str, bool]:
     leaves = {}
     for path in unit_dir.iterdir():
         if ATTACH_LEAF.fullmatch(path.name):
-            try:
-                events = (path / "cgroup.events").read_text(encoding="ascii")
-            except FileNotFoundError:
-                continue
-            leaves[path.name] = "populated 1" in events
+            events = _read_cgroup_file(path / "cgroup.events")
+            if events is not None:
+                leaves[path.name] = "populated 1" in events
     return leaves
 
 
@@ -93,6 +243,147 @@ def _payload(leader: int) -> int:
     return min(candidates)[1]
 
 
+def _has_new_only_child(pid: int, old_child: int) -> bool:
+    """Return whether pid has exactly one child, and it is not old_child.
+
+    Read the children once: the list can change between two reads, for
+    example when the keepalive reaps the killed sleep before it starts the
+    next one.
+    """
+    children = _children(pid)
+    return len(children) == 1 and children[0] != old_child
+
+
+def _cpu_set(text: str) -> set[int]:
+    """Parse a CPU list of the kernel (0-3,8) or of systemctl (0-3 8)."""
+    cpus: set[int] = set()
+    for part in text.replace(",", " ").split():
+        first, _, last = part.partition("-")
+        cpus.update(range(int(first), int(last or first) + 1))
+    return cpus
+
+
+def _group_defaults() -> tuple[set[int], int, int]:
+    """Return the default CPUs, memory, and tasks of sandy.slice on this host.
+
+    specs/security-parity.md item 2: the host keeps its 4 lowest-numbered
+    online CPUs of 16 or more, 2 of 8 or more, otherwise 1. It keeps 25% of
+    its memory, at least 4 GiB, never more than half. The containers get the
+    same share of the system task limit (the smaller of threads-max and
+    pid_max).
+    """
+    online = sorted(_cpu_set(ONLINE_CPUS.read_text(encoding="ascii")))
+    reserved = 4 if len(online) >= 16 else 2 if len(online) >= 8 else 1
+    shared = online[len(online) - max(1, len(online) - reserved) :]
+    memory = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    reserve = min(max(memory * 25 // 100, 4 * GIB), memory // 2)
+    shared_memory = (memory - reserve) // MIB * MIB
+    task_limit = min(
+        int(THREADS_MAX.read_text(encoding="ascii")),
+        int(PID_MAX.read_text(encoding="ascii")),
+    )
+    return set(shared), shared_memory, max(1, task_limit * shared_memory // memory)
+
+
+def _container_tasks_default(group_tasks: int) -> int:
+    """25% of the shared process limit, at least 8192, at most half of it."""
+    return max(1, min(max(group_tasks * 25 // 100, 8192), group_tasks // 2))
+
+
+def _default_limits() -> dict[str, str]:
+    """Return the scope properties of the default limits of up.
+
+    A container has no CPU or memory limit of its own, no swap, and a share
+    of the shared process limit.
+    """
+    return {
+        "TasksMax": str(_container_tasks_default(_group_defaults()[2])),
+        "MemoryMax": "infinity",
+        "MemorySwapMax": "0",
+        "CPUQuotaPerSecUSec": "infinity",
+    }
+
+
+def _slice_show(context: E2EContext, prop: str) -> str:
+    return context.run(
+        ["systemctl", "show", SLICE, "-p", prop, "--value"]
+    ).stdout.strip()
+
+
+def _kernel_limit(text: str) -> int | None:
+    """Parse memory.max or pids.max; None for max."""
+    text = text.strip()
+    return None if text == "max" else int(text)
+
+
+def _check_group_limits(
+    context: E2EContext,
+    name: str | None,
+    expected: tuple[set[int], int | None, int | None] | None = None,
+) -> None:
+    """Check the limits of sandy.slice in systemd and in the kernel.
+
+    With a running container name, also check the CPUs that its processes
+    see: the CPU set is the only limit that they can see (measured).
+    """
+    if expected is None:
+        expected = _group_defaults()
+    cpus, memory, tasks = expected
+
+    def value(limit: int | None) -> str:
+        return "infinity" if limit is None else str(limit)
+
+    shown = (
+        _cpu_set(_slice_show(context, "AllowedCPUs")),
+        _slice_show(context, "MemoryMax"),
+        _slice_show(context, "TasksMax"),
+    )
+    if shown != (cpus, value(memory), value(tasks)):
+        raise E2EFailure(f"{SLICE} has {shown!r}, not {expected!r}")
+    if name is None:
+        return
+    kernel = (
+        _cpu_set((CGROUP_SLICE / "cpuset.cpus").read_text(encoding="ascii")),
+        _kernel_limit((CGROUP_SLICE / "memory.max").read_text(encoding="ascii")),
+        _kernel_limit((CGROUP_SLICE / "pids.max").read_text(encoding="ascii")),
+    )
+    if kernel != (cpus, memory, tasks):
+        raise E2EFailure(f"The kernel limits of {SLICE} are {kernel!r}")
+    inside = context.sandy(
+        ["exec", "--", "nproc; grep Cpus_allowed_list /proc/self/status"], name=name
+    ).stdout.split()
+    if inside[0] != str(len(cpus)) or _cpu_set(inside[-1]) != cpus:
+        raise E2EFailure(f"Processes inside see the CPUs {inside!r}")
+
+
+def _oom_score_adj(pid: int) -> int:
+    return int(Path(f"/proc/{pid}/oom_score_adj").read_text(encoding="ascii"))
+
+
+OOM_STATUS = re.compile(
+    r"OOM kills: ([0-9]+) \(memory limit reached: ([0-9]+) times? by all Sandy "
+    r"containers, ([0-9]+) times? inside this container\)"
+)
+
+
+def _oom_status(context: E2EContext, name: str) -> tuple[int, int, int]:
+    """Return the OOM kills, shared-limit OOMs, and own OOMs from status."""
+    status = context.sandy(["status"], name=name)
+    match = OOM_STATUS.search(status.stdout)
+    if match is None:
+        raise E2EFailure(f"No OOM line in status: {status.stdout[-2000:]}")
+    kills, shared, own = (int(value) for value in match.groups())
+    return kills, shared, own
+
+
+def _tmp_size(context: E2EContext, name: str) -> int:
+    """Return the size of /tmp in the container, in bytes."""
+    result = context.sandy(
+        ["exec", "--", "df -B1 --output=size /tmp | tail -n 1"], name=name
+    )
+    return int(result.stdout.strip())
+
+
 def _comm(pid: int) -> str:
     return Path(f"/proc/{pid}/comm").read_text(encoding="ascii").strip()
 
@@ -107,11 +398,8 @@ def _wait_for(description: str, predicate, timeout: float = WAIT_TIMEOUT) -> Non
 
 
 def _pids_with_comm_in_cgroup(name: str, leaf: str) -> list[int]:
-    procs = _unit_dir(name) / leaf / "cgroup.procs"
-    try:
-        return [int(value) for value in procs.read_text().split()]
-    except FileNotFoundError:
-        return []
+    text = _read_cgroup_file(_unit_dir(name) / leaf / "cgroup.procs")
+    return [int(value) for value in (text or "").split()]
 
 
 def _wait_for_leaf_commands(
@@ -138,11 +426,21 @@ def _wait_for_leaf_commands(
 
 
 class _Attach:
-    """A background `sandy exec` whose processes can be found and signaled."""
+    """A background `sandy exec` whose processes can be found and signaled.
 
-    def __init__(self, context: E2EContext, name: str, command: str) -> None:
+    With terminal, its stdout and stderr go to that pty, not to a file.
+    """
+
+    def __init__(
+        self,
+        context: E2EContext,
+        name: str,
+        command: str,
+        terminal: StoppableTerminal | None = None,
+    ) -> None:
         self.context = context
         self.name = name
+        self.terminal = terminal
         arguments = [
             str(SANDY),
             "--workspace",
@@ -160,8 +458,10 @@ class _Attach:
             self.process = subprocess.Popen(
                 arguments,
                 stdin=subprocess.DEVNULL,
-                stdout=stream,
-                stderr=subprocess.STDOUT,
+                # langcheckignore:rule=slave
+                stdout=stream if terminal is None else terminal.slave,
+                # langcheckignore:rule=slave
+                stderr=subprocess.STDOUT if terminal is None else terminal.slave,
                 cwd=context.root,
                 env=context.safe_environment(),
             )
@@ -188,7 +488,8 @@ class _Attach:
         wait for the cgroup, not only for a child.
         """
         pattern = re.compile(
-            rf"0::/system\.slice/{re.escape(_unit(self.name))}/(attach-[0-9a-f]{{32}})"
+            rf"0::/{re.escape(SLICE)}/{re.escape(_unit(self.name))}/"
+            r"(attach-[0-9a-f]{32})"
         )
         found: list[str] = []
 
@@ -208,13 +509,27 @@ class _Attach:
             if self.process.poll() is None:
                 self.process.kill()
                 self.process.wait(timeout=10)
+        if self.terminal is not None:
+            # The reader of the terminal can still get the last bytes.
+            return returncode, self.terminal.output()
         return returncode, self.output.read_text(encoding="utf-8", errors="replace")
 
 
 class _Console:
-    """`sandy up` without -d; its console reads commands from a pipe."""
+    """`sandy up` without -d; its console reads commands from a pipe.
 
-    def __init__(self, context: E2EContext, name: str, *extra: str) -> None:
+    wrap, when given, returns the command and the environment to run in
+    place of sandy and the safe environment, for example
+    with_a_machinectl_that_stops_nothing of the context.
+    """
+
+    def __init__(
+        self,
+        context: E2EContext,
+        name: str,
+        *extra: str,
+        wrap: Callable[[list[str]], tuple[list[str], dict[str, str]]] | None = None,
+    ) -> None:
         arguments = [
             str(SANDY),
             "--workspace",
@@ -229,9 +544,10 @@ class _Console:
             "host",
             *extra,
         ]
-        self.output = context.root / f"console-{time.monotonic_ns()}.log"
         environment = context.safe_environment()
-        environment["SUDO_UID"] = "1000"
+        if wrap is not None:
+            arguments, environment = wrap(arguments)
+        self.output = context.root / f"console-{time.monotonic_ns()}.log"
         with self.output.open("w", encoding="utf-8") as stream:
             self.process = subprocess.Popen(
                 arguments,
@@ -272,6 +588,162 @@ def _wait_stopped(context: E2EContext, name: str) -> None:
     )
 
 
+def _init_address(name: str) -> str:
+    """Return the CONTAINER_IP that sandy wrote in the /init.sh of an image."""
+    init_script = SYSTEMD_MACHINES / f"sandy.{name}" / "init.sh"
+    match = re.search(
+        r'^CONTAINER_IP="([0-9.]+)"$',
+        init_script.read_text(encoding="ascii"),
+        re.MULTILINE,
+    )
+    if match is None:
+        raise E2EFailure(f"{init_script} names no CONTAINER_IP")
+    return match.group(1)
+
+
+@contextmanager
+def _up_while_its_scope_appears(
+    context: E2EContext, name: str, user: str, arguments: list[str]
+) -> Iterator[tuple[int, str]]:
+    """Run up of name so that the scope of name appears while up waits for the lock.
+
+    up checks for a running container and for its scope first, makes other
+    host changes, and then waits for the lifecycle lock. Hold the lock until
+    up waits for it ("Limits of this container" is its last line before the
+    lock), make a scope of the name in sandy.slice, and release the lock.
+    Yield the exit status and the output of up, while the scope still exists;
+    then stop the scope. up waits for the lock for at most 10 seconds
+    (LIFECYCLE_LOCK_TIMEOUT of sandy); this needs about one.
+    """
+    log_path = context.root / f"lock-wait-{name}.log"
+    command = [
+        str(SANDY),
+        "--workspace",
+        context.workspace.name,
+        "--shared",
+        context.shared.name,
+        "--user",
+        user,
+        "--container",
+        name,
+        *arguments,
+    ]
+    up: subprocess.Popen[bytes] | None = None
+    blocker: subprocess.Popen[bytes] | None = None
+    try:
+        with LIFECYCLE_LOCK.open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            print(f"    $ {shlex.join(command)} &", flush=True)
+            with log_path.open("w", encoding="utf-8") as stream:
+                up = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=context.root,
+                    env=context.safe_environment(),
+                )
+            _wait_for(
+                "up waits for the lifecycle lock",
+                lambda: "I: Limits of this container"
+                in log_path.read_text(encoding="utf-8", errors="replace"),
+            )
+            blocker = subprocess.Popen(
+                [
+                    "systemd-run",
+                    "--scope",
+                    "--quiet",
+                    f"--unit={_unit(name)}",
+                    f"--slice={SLICE}",
+                    "--",
+                    "sleep",
+                    "300",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _wait_for(
+                "the blocking scope exists",
+                lambda: _show(context, name, "ActiveState") == "active",
+            )
+        # The close released the lock; up takes it now.
+        returncode = up.wait(timeout=WAIT_TIMEOUT)
+        yield returncode, log_path.read_text(encoding="utf-8", errors="replace")
+    finally:
+        if up is not None and up.poll() is None:
+            up.kill()
+            up.wait(timeout=10)
+        if blocker is not None:
+            context.run(["systemctl", "stop", _unit(name)], expected=None)
+            blocker.wait(timeout=30)
+    _wait_for(
+        "the blocking scope is gone",
+        lambda: _show(context, name, "LoadState") == "not-found",
+    )
+
+
+@contextmanager
+def _up_with_its_terminal_stopped(
+    context: E2EContext, name: str, arguments: list[str]
+) -> Iterator[tuple[subprocess.Popen[bytes], StoppableTerminal]]:
+    """Run up of name on a terminal, and stop its output while up waits for
+    the lifecycle lock.
+
+    Hold the lock until up has opened the lock file: up does so after its
+    last line before the lock, and then tries the lock again every 0.05 s
+    for 10 s. Then type the STOP character, and release the lock: each
+    write of up after that blocks until the case starts the output again.
+    Yield up and the terminal; add the output of up to each E2EFailure, and
+    at the end, kill up if it still runs.
+    """
+    command = [
+        str(SANDY),
+        "--workspace",
+        context.workspace.name,
+        "--shared",
+        context.shared.name,
+        "--container",
+        name,
+        *arguments,
+    ]
+    up: subprocess.Popen[bytes] | None = None
+    with StoppableTerminal() as terminal:
+        try:
+            with LIFECYCLE_LOCK.open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                print(f"    $ {shlex.join(command)} &", flush=True)
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    # langcheckignore:rule=slave
+                    stdout=terminal.slave,
+                    # langcheckignore:rule=slave
+                    stderr=terminal.slave,
+                    cwd=context.root,
+                    env=context.safe_environment(),
+                )
+                up = process
+
+                def waits_for_the_lock() -> bool:
+                    if process.poll() is not None:
+                        raise E2EFailure(f"up exited {process.returncode}")
+                    return has_open_file(process.pid, LIFECYCLE_LOCK)
+
+                _wait_for("up waits for the lifecycle lock", waits_for_the_lock)
+                terminal.stop()
+            # The close released the lock; up takes it now.
+            yield process, terminal
+        except E2EFailure as exc:
+            raise E2EFailure(
+                f"{exc}\nOutput of up: {terminal.output()[-2000:]!r}"
+            ) from None
+        finally:
+            if up is not None and up.poll() is None:
+                up.kill()
+                up.wait(timeout=10)
+
+
 def test_main(context: E2EContext) -> None:
     """Prove the scope, keepalive, attach, and lifecycle design."""
     name = context.main_name
@@ -281,17 +753,14 @@ def test_main(context: E2EContext) -> None:
         raise E2EFailure("The main container is not running")
     leader = int(leader_text)
 
-    with context.case("the container runs in its own scope with today's limits"):
+    with context.case("the container runs in its own scope with the default limits"):
         expected = {
             "LoadState": "loaded",
             "ActiveState": "active",
-            "ControlGroup": f"/system.slice/{_unit(name)}",
+            "ControlGroup": f"/{SLICE}/{_unit(name)}",
             "Description": f"Sandy container {name} (detached)",
             "Delegate": "yes",
-            "TasksMax": DEFAULT_TASKS_MAX,
-            "MemoryMax": "infinity",
-            "MemorySwapMax": "infinity",
-            "CPUQuotaPerSecUSec": "infinity",
+            **_default_limits(),
         }
         # Scope units accept OOMPolicy= only from systemd 253.
         if version >= 253:
@@ -304,6 +773,9 @@ def test_main(context: E2EContext) -> None:
         ).stdout.strip()
         if machine_unit != _unit(name):
             raise E2EFailure(f"Machine unit is {machine_unit!r}")
+        tmp_size = _tmp_size(context, name)
+        if tmp_size != DEFAULT_TMP_SIZE:
+            raise E2EFailure(f"/tmp has {tmp_size} bytes")
         supervisors = [
             int(pid)
             for pid in (_unit_dir(name) / "supervisor" / "cgroup.procs")
@@ -319,8 +791,11 @@ def test_main(context: E2EContext) -> None:
             raise E2EFailure(
                 f"nspawn has a terminal or no own session: {stat_fields[:5]}"
             )
-        if not _cgroup(leader).startswith(f"0::/system.slice/{_unit(name)}/payload"):
+        if not _cgroup(leader).startswith(f"0::/{SLICE}/{_unit(name)}/payload"):
             raise E2EFailure(f"Leader cgroup {_cgroup(leader)!r}")
+
+    with context.case("all containers share the CPUs, memory, and tasks of the slice"):
+        _check_group_limits(context, name)
 
     with context.case("the keepalive is PID 2, container root, and survives users"):
         payload = _payload(leader)
@@ -352,7 +827,7 @@ def test_main(context: E2EContext) -> None:
         os.kill(sleeps[0], signal.SIGKILL)
         _wait_for(
             "the keepalive restarts sleep",
-            lambda: len(_children(payload)) == 1 and _children(payload)[0] != sleeps[0],
+            lambda: _has_new_only_child(payload, sleeps[0]),
         )
         leftovers = sorted(Path("/tmp").glob("sandy-keepalive-*"))
         if leftovers:
@@ -449,17 +924,10 @@ def test_main(context: E2EContext) -> None:
         if stray.returncode == 0:
             raise E2EFailure(f"Attach processes remain: {stray.stdout!r}")
 
-    with context.case("an OOM in an attach kills only that process"):
-        # A test-only limit; sandy sets none by default.
+    with context.case("an OOM in an attach kills only that process and is reported"):
+        # A test-only limit of this scope; sandy sets none.
         context.run(
-            [
-                "systemctl",
-                "set-property",
-                "--runtime",
-                _unit(name),
-                "MemoryMax=256M",
-                "MemorySwapMax=0",
-            ]
+            ["systemctl", "set-property", "--runtime", _unit(name), "MemoryMax=256M"]
         )
         try:
             idle = _Attach(context, name, "sleep 304")
@@ -471,6 +939,13 @@ def test_main(context: E2EContext) -> None:
             )
             if hog.returncode == 0:
                 raise E2EFailure("The memory hog was not killed")
+            assert_contains(
+                hog,
+                f"W: The kernel ended 1 process in '{name}' during this session "
+                "because memory ran out",
+            )
+            assert_contains(hog, "The container reached a memory limit of its own")
+            assert_not_contains(hog, "share")
             if _show(context, name, "ActiveState") != "active":
                 raise E2EFailure("The OOM stopped the scope")
             if _payload(leader) != payload or not context.machine_running(name):
@@ -479,6 +954,11 @@ def test_main(context: E2EContext) -> None:
                 raise E2EFailure("The OOM ended another attach")
             idle.process.send_signal(signal.SIGTERM)
             idle.finish()
+            kills, shared_ooms, own_ooms = _oom_status(context, name)
+            if (kills, shared_ooms) != (1, 0) or own_ooms < 1:
+                raise E2EFailure(f"OOM counts {(kills, shared_ooms, own_ooms)!r}")
+            quiet = context.sandy(["exec", "--", "true"], name=name)
+            assert_not_contains(quiet, "W: The kernel ended")
         finally:
             context.run(
                 [
@@ -487,7 +967,6 @@ def test_main(context: E2EContext) -> None:
                     "--runtime",
                     _unit(name),
                     "MemoryMax=infinity",
-                    "MemorySwapMax=infinity",
                 ]
             )
 
@@ -501,6 +980,64 @@ def test_main(context: E2EContext) -> None:
             ["exec", "--", "cat /proc/self/cgroup"], name=second
         )
         assert_contains(second_inside, "0::/../attach-")
+        if _show(context, second, "ControlGroup") != f"/{SLICE}/{_unit(second)}":
+            raise E2EFailure(f"{_unit(second)} is not in {SLICE}")
+        _check_group_limits(context, second)
+
+    with context.case(
+        "update --shared changes running containers and saves the limits"
+    ):
+        online = sorted(_cpu_set(ONLINE_CPUS.read_text(encoding="ascii")))
+        # The lowest CPU, which the host keeps by default.
+        changed = ({online[0]}, GIB, 4096)
+        update = context.sandy(
+            [
+                "update",
+                "--shared",
+                "--cpuset-cpus",
+                str(online[0]),
+                "-m",
+                "1g",
+                "--pids-limit",
+                "4096",
+            ]
+        )
+        assert_contains(
+            update,
+            f"I: Limits of all Sandy containers: CPUs {online[0]} (saved), memory "
+            "1.0 GiB (saved), 4096 tasks (saved)",
+        )
+        # The change applies at once, also to running processes (measured).
+        _check_group_limits(context, second, changed)
+        cpus = _cpu_set(_status(_payload(leader), "Cpus_allowed_list"))
+        if cpus != changed[0]:
+            raise E2EFailure(f"The running keepalive has the CPUs {cpus!r}")
+        saved = SHARED_LIMITS.stat()
+        if (saved.st_uid, saved.st_gid, saved.st_mode & 0o777) != (0, 0, 0o600):
+            raise E2EFailure(f"Unsafe saved limits {saved!r}")
+        text = SHARED_LIMITS.read_text(encoding="ascii")
+        if text != f'{{"cpus":"{online[0]}","memory":{GIB},"tasks":4096}}\n':
+            raise E2EFailure(f"Saved limits {text!r}")
+        # Errors change nothing.
+        for arguments, message in (
+            ([], "update --shared needs at least one of"),
+            (["--reset", "-m", "2g"], "--reset cannot be used with"),
+            (["--cpuset-cpus", "4095"], "--cpuset-cpus must name online CPUs"),
+        ):
+            refused = context.sandy(["update", "--shared", *arguments], expected=1)
+            assert_contains(refused, message)
+        refused = context.sandy(
+            ["update", "--shared", "-m", "2g"], name=second, expected=1
+        )
+        assert_contains(refused, "update --shared cannot be used with --container")
+        refused = context.sandy(["update", "-m", "2g"], name=second, expected=1)
+        assert_contains(refused, "--memory needs --shared")
+        _check_group_limits(context, None, changed)
+        reset = context.sandy(["update", "--shared", "--reset"])
+        assert_not_contains(reset, "(saved)")
+        _check_group_limits(context, second)
+        if SHARED_LIMITS.read_text(encoding="ascii") != "{}\n":
+            raise E2EFailure("--reset kept saved limits")
 
     with context.case("down stops the container and its scope in one step"):
         down = context.sandy(["down"], name=second)
@@ -546,6 +1083,27 @@ def test_main(context: E2EContext) -> None:
             "the blocking scope is gone",
             lambda: _show(context, second, "LoadState") == "not-found",
         )
+
+    with context.case("an up that waited for the lock leaves a scope of its name"):
+        # Another start can make the scope of the name while up waits for the
+        # lock. up must then refuse: no marker in that scope, and no mount
+        # into it.
+        with _up_while_its_scope_appears(
+            context,
+            second,
+            "developer",
+            ["up", "--detach", "--persistent", "--network", "host"],
+        ) as (returncode, output):
+            for marker in SCOPE_MARKERS:
+                if (_unit_dir(second) / marker).exists():
+                    raise E2EFailure(
+                        f"up made {marker} in a scope that it did not start"
+                    )
+            if returncode != 1:
+                raise E2EFailure(f"up exited {returncode}: {output[-2000:]}")
+            assert_contains_text(output, f"Unit '{_unit(second)}' already exists")
+            if context.machine_running(second):
+                raise E2EFailure("up started the container anyway")
 
     with context.case("the console is an attach, and its exit stops the container"):
         console = _Console(context, second)
@@ -626,6 +1184,232 @@ def test_main(context: E2EContext) -> None:
         assert_contains_text(attach_output, "no session is attached")
         _wait_stopped(context, second)
 
+    with context.case("the last attach out does not wait long for the port lock"):
+        # Regression test: the stop after the last session waited for the port
+        # mapping lock with no limit under the lifecycle lock. While another
+        # process held the port mapping lock (for example, rm --cache), each
+        # attach, to any container, then failed after 10 s. Hold the port
+        # mapping lock while the console of an attached up exits: the stop
+        # must give up after 5 s and keep the container running, and an
+        # attach to another container must work meanwhile.
+        if not context.machine_running(name):
+            raise E2EFailure(f"The other container {name} is not running")
+        console = _Console(context, second)
+        _wait_for_console(context, second)
+        returncode, output = None, ""
+        with PORT_LOCK.open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            console.send("exit\n")
+            # The stop decides under the lifecycle lock, and then waits for
+            # the port mapping lock there.
+            _wait_for(
+                "the stop holds the lifecycle lock",
+                lambda: holds_flock(console.process.pid, LIFECYCLE_LOCK),
+            )
+            attached = context.sandy(["exec", "--", "true"], name=name, expected=None)
+            try:
+                returncode, output = console.finish(timeout=LIFECYCLE_LOCK_WAIT)
+            except subprocess.TimeoutExpired:
+                raise E2EFailure(
+                    "The stop waited for the port mapping lock with no limit"
+                ) from None
+        if attached.returncode != 0:
+            raise E2EFailure(
+                f"An attach to {name} failed during the stop: "
+                f"{attached.output[-2000:]}"
+            )
+        if returncode != 0 or (
+            f"W: Did not stop '{second}': the port mapping lock stayed busy"
+            not in output
+        ):
+            raise E2EFailure(f"Console up exited {returncode}: {output[-2000:]}")
+        if not context.machine_running(second):
+            raise E2EFailure(
+                "The stop with a busy port mapping lock stopped the container"
+            )
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("the stop after the last attach is short under its lock"):
+        # Regression test: under the lifecycle lock, the stop after the last
+        # session ran machinectl poweroff and terminate with no timeout, and
+        # waited up to 5 s after each. So each attach, to any container,
+        # could fail after its 10 s wait. Here the console of up has a
+        # machinectl whose poweroff and terminate do nothing: the stop must
+        # give up after 5 s in all, keep the container running, and name
+        # the down command, and an attach to another container must work.
+        if not context.machine_running(name):
+            raise E2EFailure(f"The other container {name} is not running")
+        console = _Console(
+            context, second, wrap=context.with_a_machinectl_that_stops_nothing
+        )
+        _wait_for_console(context, second)
+        console.send("exit\n")
+        _wait_for(
+            "the stop holds the lifecycle lock",
+            lambda: holds_flock(console.process.pid, LIFECYCLE_LOCK),
+        )
+        held_from = time.monotonic()
+        attaches: list[CommandResult] = []
+        attach = threading.Thread(
+            target=lambda: attaches.append(
+                context.sandy(["exec", "--", "true"], name=name, expected=None)
+            )
+        )
+        attach.start()
+        _wait_for(
+            "the stop frees the lifecycle lock",
+            lambda: not holds_flock(console.process.pid, LIFECYCLE_LOCK),
+            timeout=LIFECYCLE_LOCK_WAIT + STOP_UNDER_LOCK_WAIT,
+        )
+        held_seconds = time.monotonic() - held_from
+        attach.join(timeout=WAIT_TIMEOUT)
+        returncode, output = console.finish(timeout=WAIT_TIMEOUT)
+        if held_seconds >= STOP_UNDER_LOCK_WAIT:
+            raise E2EFailure(
+                f"The stop held the lifecycle lock for {held_seconds:.1f} s"
+            )
+        if not attaches or attaches[0].returncode != 0:
+            raise E2EFailure(
+                f"An attach to {name} failed during the stop: "
+                f"{attaches[0].output[-2000:] if attaches else 'no result'}"
+            )
+        if returncode != 0:
+            raise E2EFailure(f"Console up exited {returncode}: {output[-2000:]}")
+        for line in (
+            f"W: Container '{second}' did not stop",
+            f"   Stop it with: sandy --container {second} down",
+        ):
+            if line not in output:
+                raise E2EFailure(f"No {line!r} in: {output[-2000:]}")
+        if not context.machine_running(second):
+            raise E2EFailure("The container stopped, so the case tested nothing")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("up writes nothing to its terminal under the lifecycle lock"):
+        # Regression test: up wrote the "Starting" line to its terminal while
+        # it held the lifecycle lock. A write to a stopped terminal (Ctrl-S)
+        # blocks, so up kept the lock, and each attach, to any container,
+        # failed after 10 s. Stop the terminal of up -d, which takes the lock
+        # because it mounts directories, while up waits for the lock: up must
+        # start the container and free the lock while its terminal is
+        # stopped, and an attach to another container must work. When the
+        # terminal starts again, up must end as usual.
+        if not context.machine_running(name):
+            raise E2EFailure(f"The other container {name} is not running")
+        with _up_with_its_terminal_stopped(
+            context, second, ["up", "--detach", "--persistent", "--network", "host"]
+        ) as (up, terminal):
+            before = terminal.output()
+            _wait_for(
+                "up starts the container and frees the lifecycle lock",
+                lambda: _show(context, second, "ActiveState") == "active"
+                and not holds_flock(up.pid, LIFECYCLE_LOCK),
+            )
+            attached = context.sandy(["exec", "--", "true"], name=name, expected=None)
+            if attached.returncode != 0:
+                raise E2EFailure(
+                    f"An attach to {name} failed while the terminal of up was "
+                    f"stopped: {attached.output[-2000:]}"
+                )
+            # up still waits to write: the case tested a stopped terminal.
+            if up.poll() is not None or not terminal.stopped():
+                raise E2EFailure(f"up did not wait to write: {terminal.output()}")
+            if terminal.output() != before:
+                raise E2EFailure(f"Output came while stopped: {terminal.output()}")
+            terminal.start()
+            returncode = up.wait(timeout=BACKGROUND_UP_TIMEOUT)
+            output = terminal.output()
+        if returncode != 0:
+            raise E2EFailure(f"up exited {returncode}: {output[-2000:]}")
+        assert_contains_text(output, f"I: Starting '{second}' in detached state")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("the stop after the last attach writes nothing under its lock"):
+        # Regression test: the stop after the last session printed its
+        # "Stopping" line while it held the lifecycle lock. A write to a
+        # stopped terminal (Ctrl-S) blocks, so that session kept the lock,
+        # and each attach, to any container, failed after 10 s. Stop the
+        # terminal of the last attach to a console up, and end the console
+        # first. When the attach ends, its stop must stop the container and
+        # free the lock while its terminal is stopped, and an attach to
+        # another container must work. When the terminal starts again, the
+        # attach must end as usual.
+        if not context.machine_running(name):
+            raise E2EFailure(f"The other container {name} is not running")
+        release = context.workspace / "e2e-release-last-attach"
+        console = _Console(context, second)
+        _wait_for_console(context, second)
+        attach_returncode, output = None, ""
+        with StoppableTerminal() as terminal:
+            # The command writes nothing, and script runs with -q, so only
+            # the stop writes to this terminal. The host ends the command
+            # through the workspace, with no other attach.
+            attach = _Attach(
+                context,
+                second,
+                f'while [ ! -e "$HOME/workspace/{release.name}" ]; do sleep 0.1; done',
+                terminal=terminal,
+            )
+            try:
+                attach.leaf()
+                terminal.stop()
+                before = terminal.output()
+                console.send("exit\n")
+                returncode, console_output = console.finish()
+                if returncode != 0:
+                    raise E2EFailure(
+                        f"Console up exited {returncode}: {console_output[-2000:]}"
+                    )
+                if not context.machine_running(second):
+                    raise E2EFailure("The console exit stopped the container")
+                release.touch()
+                _wait_for(
+                    "the last attach stops the container and frees the lock",
+                    lambda: not context.machine_running(second)
+                    and not holds_flock(attach.process.pid, LIFECYCLE_LOCK),
+                )
+                attached = context.sandy(
+                    ["exec", "--", "true"], name=name, expected=None
+                )
+                if attached.returncode != 0:
+                    raise E2EFailure(
+                        f"An attach to {name} failed while the terminal of the "
+                        f"last attach was stopped: {attached.output[-2000:]}"
+                    )
+                # The attach still waits to write: the case tested a stopped
+                # terminal.
+                if attach.process.poll() is not None or not terminal.stopped():
+                    raise E2EFailure("The attach did not wait to write")
+                if terminal.output() != before:
+                    raise E2EFailure("Output came while the terminal was stopped")
+                terminal.start()
+                attach_returncode, _ = attach.finish()
+                _wait_for(
+                    "the output of the stop arrives",
+                    lambda: "no session is attached" in terminal.output(),
+                )
+                output = terminal.output()
+            except E2EFailure as exc:
+                raise E2EFailure(
+                    f"{exc}\nOutput of the attach: {terminal.output()[-2000:]!r}"
+                ) from None
+            finally:
+                for process in (attach.process, console.process):
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=10)
+                release.unlink(missing_ok=True)
+        if attach_returncode != 0:
+            raise E2EFailure(f"The attach exited {attach_returncode}: {output}")
+        assert_contains_text(output, f"I: Stopping '{second}': no session is attached")
+        for warning in ("did not stop", "Could not"):
+            if warning in output:
+                raise E2EFailure(f"Unexpected warning: {output[-2000:]}")
+        _wait_stopped(context, second)
+
     with context.case("an entry setup failure stops up with an error"):
         # The readiness probe cannot prepare the entry helper. The started
         # container must stop, and up must report the cause.
@@ -639,6 +1423,385 @@ def test_main(context: E2EContext) -> None:
         assert_not_contains(refused, "Traceback")
         _wait_stopped(context, second)
 
+    with context.case("up applies --pids-limit, --tmp-size, and --oom-score-adj"):
+        started = context.sandy(
+            [
+                "up",
+                "--detach",
+                "--persistent",
+                "--network",
+                "host",
+                "--tmp-size",
+                "16m",
+                "--pids-limit",
+                "512",
+                "--oom-score-adj",
+                "-500",
+            ],
+            name=second,
+        )
+        context.wait_for_machine(second, running=True)
+        assert_contains(
+            started,
+            "I: Limits of this container: 512 tasks, /tmp 16.0 MiB, no swap, OOM "
+            "score adjustment -500",
+        )
+        expected = {"TasksMax": "512", "MemorySwapMax": "0", "MemoryMax": "infinity"}
+        actual = {prop: _show(context, second, prop) for prop in expected}
+        if actual != expected:
+            raise E2EFailure(f"Scope properties {actual!r} != {expected!r}")
+        if (_unit_dir(second) / "pids.max").read_text(encoding="ascii") != "512\n":
+            raise E2EFailure("The kernel process limit of the scope is not 512")
+        tmp_size = _tmp_size(context, second)
+        if tmp_size != 16 * MIB:
+            raise E2EFailure(f"/tmp has {tmp_size} bytes")
+        # A full /tmp gives ENOSPC, below the shared memory.
+        full = context.sandy(
+            ["exec", "--", "dd if=/dev/zero of=/tmp/fill bs=1M count=32; rm /tmp/fill"],
+            name=second,
+            expected=None,
+        )
+        assert_contains(full, "No space left on device")
+        # The container and each session have the value; nspawn's own
+        # option fails with --private-users (measured).
+        second_leader = int(context.machine_leader(second) or 0)
+        for pid in (second_leader, _payload(second_leader)):
+            if _oom_score_adj(pid) != -500:
+                raise E2EFailure(
+                    f"PID {pid} has OOM score adjustment {_oom_score_adj(pid)}"
+                )
+        for user in (context.cache_user, "root"):
+            session = context.sandy(
+                ["exec", "--", "cat /proc/self/oom_score_adj"], name=second, user=user
+            )
+            if session.stdout.strip() != "-500":
+                raise E2EFailure(f"A session of {user} has {session.stdout!r}")
+            # Even container root cannot go lower; any user can go higher.
+            lower = context.sandy(
+                ["exec", "--", "echo -600 > /proc/self/oom_score_adj"],
+                name=second,
+                user=user,
+                expected=None,
+            )
+            if lower.returncode == 0:
+                raise E2EFailure(
+                    f"A session of {user} lowered its OOM score adjustment"
+                )
+            context.sandy(
+                ["exec", "--", "echo -400 > /proc/self/oom_score_adj"],
+                name=second,
+                user=user,
+            )
+
+    with context.case("an OOM at the shared memory ends the unprotected process"):
+        # Two containers: this one with the default value, and the second with
+        # -500. A test-only shared memory leaves 256 MiB above the use now.
+        current = int((CGROUP_SLICE / "memory.current").read_text(encoding="ascii"))
+        limit = (current // MIB + 256) * MIB
+        context.sandy(["update", "--shared", "-m", f"{limit // MIB}m"])
+        try:
+            holder = _Attach(
+                context,
+                second,
+                "python3 -c 'b = bytearray(150 << 20); import time; time.sleep(120)'",
+            )
+            holder.leaf()
+
+            def holding() -> bool:
+                used = (_unit_dir(second) / "memory.current").read_text(
+                    encoding="ascii"
+                )
+                return int(used) >= 150 * MIB
+
+            _wait_for("the protected container holds its memory", holding)
+            # More than the whole limit, so that page cache reclaim cannot
+            # make room.
+            hog = context.sandy(
+                ["exec", "--", f"python3 -c 'b = bytearray({limit + 64 * MIB})'"],
+                name=name,
+                expected=None,
+            )
+            if hog.returncode == 0:
+                raise E2EFailure("The memory hog was not killed")
+            assert_contains(hog, f"W: The kernel ended 1 process in '{name}'")
+            assert_contains(
+                hog, "The Sandy containers reached the memory limit that they share"
+            )
+            assert_not_contains(hog, "of its own")
+            if holder.process.poll() is not None:
+                raise E2EFailure("The OOM ended the protected container's process")
+            for container in (name, second):
+                if not context.machine_running(container):
+                    raise E2EFailure(f"The OOM stopped {container}")
+            if _payload(leader) != payload:
+                raise E2EFailure("The OOM stopped the keepalive")
+            holder.process.send_signal(signal.SIGTERM)
+            holder.finish()
+            # The second kill of this container; the first was at its own
+            # test-only limit.
+            kills, shared_ooms, now_own = _oom_status(context, name)
+            if (kills, now_own) != (2, own_ooms) or shared_ooms < 1:
+                raise E2EFailure(f"OOM counts {(kills, shared_ooms, now_own)!r}")
+        finally:
+            context.sandy(["update", "--shared", "--reset"])
+        _check_group_limits(context, name)
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("-1 and 0: no process limit of its own and the tmpfs default"):
+        context.sandy(
+            [
+                "up",
+                "--detach",
+                "--persistent",
+                "--network",
+                "host",
+                "--tmp-size",
+                "0",
+                "--pids-limit",
+                "-1",
+            ],
+            name=second,
+        )
+        context.wait_for_machine(second, running=True)
+        if _show(context, second, "TasksMax") != "infinity":
+            raise E2EFailure("--pids-limit -1 kept a process limit")
+        # The tmpfs default: half of the pages of the host memory.
+        half = os.sysconf("SC_PHYS_PAGES") // 2 * os.sysconf("SC_PAGE_SIZE")
+        tmp_size = _tmp_size(context, second)
+        if tmp_size != half:
+            raise E2EFailure(f"/tmp has {tmp_size} bytes, not {half}")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("invalid limits and a malformed saved file stop up"):
+        for arguments in (
+            ["--pids-limit", "0"],
+            ["--tmp-size", "1k"],
+            ["--oom-score-adj", "-1000"],
+            # A container has no CPU, memory, or swap option of its own.
+            ["--cpus", "2"],
+            ["-m", "1g"],
+        ):
+            refused = context.sandy(
+                ["up", "--detach", "--network", "host", *arguments],
+                name=second,
+                expected=2,
+            )
+            assert_not_contains(refused, "Traceback")
+        before = tuple(
+            _slice_show(context, prop) for prop in ("AllowedCPUs", "MemoryMax")
+        )
+        SHARED_LIMITS.write_text('{"memory":"8g"}\n', encoding="ascii")
+        SHARED_LIMITS.chmod(0o600)
+        refused = context.sandy(
+            ["up", "--detach", "--persistent", "--network", "host"],
+            name=second,
+            expected=1,
+        )
+        assert_contains(
+            refused,
+            "E: The saved shared memory is invalid. Reset them with: sandy update "
+            "--shared --reset",
+        )
+        after = tuple(
+            _slice_show(context, prop) for prop in ("AllowedCPUs", "MemoryMax")
+        )
+        if after != before:
+            raise E2EFailure(f"A malformed saved file changed {SLICE}: {after!r}")
+        if context.machine_running(second):
+            raise E2EFailure("up started the container anyway")
+        if _show(context, second, "LoadState") != "not-found":
+            raise E2EFailure("up created the scope anyway")
+        context.sandy(["update", "--shared", "--reset"])
+        if SHARED_LIMITS.read_text(encoding="ascii") != "{}\n":
+            raise E2EFailure("--reset did not replace the malformed file")
+
+    with context.case("update changes the process limit of a running container"):
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "host"], name=second
+        )
+        context.wait_for_machine(second, running=True)
+        updated = context.sandy(["update", "--pids-limit", "256"], name=second)
+        assert_contains(updated, f"I: Updated '{second}': TasksMax=256")
+        if (_unit_dir(second) / "pids.max").read_text(encoding="ascii") != "256\n":
+            raise E2EFailure("update did not change the kernel process limit")
+        context.sandy(["update", "--pids-limit", "-1"], name=second)
+        if (_unit_dir(second) / "pids.max").read_text(encoding="ascii") != "max\n":
+            raise E2EFailure("update --pids-limit -1 kept a process limit")
+        none = context.sandy(["update"], name=second, expected=1)
+        assert_contains(none, "update needs --pids-limit")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+        # The change ends with the scope: update of a stopped container fails
+        # and leaves no drop-in, and the next up has the defaults.
+        stopped = context.sandy(
+            ["update", "--pids-limit", "5"], name=second, expected=1
+        )
+        assert_contains(stopped, "not found or not running")
+        for directory in ("/run/systemd/system.control", "/run/systemd/transient"):
+            if Path(directory, f"{_unit(second)}.d").exists():
+                raise E2EFailure(f"A drop-in of {_unit(second)} remains in {directory}")
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "host"], name=second
+        )
+        context.wait_for_machine(second, running=True)
+        actual = {prop: _show(context, second, prop) for prop in _default_limits()}
+        if actual != _default_limits():
+            raise E2EFailure(f"Scope properties after update {actual!r}")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("the address scan of a new image follows no /init.sh link"):
+        # Root in a container controls its image. A new image reserves the
+        # addresses in the /init.sh of the other images, and that scan must
+        # not follow a link there with host semantics. Here the link names a
+        # FIFO in the image, and a reader of a FIFO waits for a writer: the
+        # scan blocked up for good. The main image keeps its address.
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "host"], name=second
+        )
+        context.wait_for_machine(second, running=True)
+        context.sandy(
+            ["exec", "--", f"mkfifo /{INIT_FIFO} && ln -s {INIT_FIFO} /init.sh"],
+            name=second,
+            user="root",
+        )
+        planted = SYSTEMD_MACHINES / f"sandy.{second}" / "init.sh"
+        if not planted.is_symlink():
+            raise E2EFailure(f"The container did not make the link {planted}")
+        built = context.build_lenient(
+            context.scan_name, context.main_user, timeout=INIT_SCAN_TIMEOUT
+        )
+        assert_contains(
+            built,
+            f"W: Did not reserve the address in '{planted}': "
+            "\"Unsafe image file path component 'init.sh'\"",
+        )
+        main_init = SYSTEMD_MACHINES / f"sandy.{name}" / "init.sh"
+        assert_not_contains(built, f"W: Did not reserve the address in '{main_init}'")
+        if _init_address(context.scan_name) == _init_address(name):
+            raise E2EFailure("The new image got the address of the main image")
+        context.remove_container(context.scan_name, context.main_user)
+        context.sandy(
+            ["exec", "--", f"rm /init.sh /{INIT_FIFO}"], name=second, user="root"
+        )
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("a machine query that fails does not mean a stopped container"):
+        # machinectl exits 1 for each failure. With no system bus, sandy read
+        # the failure as "not running", and rm removed the image of a running
+        # container. Only these sandy commands lose the bus. update comes
+        # first: it changes nothing, and the old code failed there.
+        if not context.machine_running(name):
+            raise E2EFailure(f"{name} must run for this case")
+        for arguments in (["update", "--pids-limit", "256"], ["rm", "--force"]):
+            refused = context.run(
+                context.with_a_hidden_system_bus(
+                    [
+                        str(SANDY),
+                        "--workspace",
+                        context.workspace.name,
+                        "--shared",
+                        context.shared.name,
+                        "--user",
+                        context.main_user,
+                        "--container",
+                        name,
+                        *arguments,
+                    ]
+                ),
+                expected=1,
+            )
+            assert_contains(refused, f"E: Could not query machine '{name}': ")
+            assert_contains(refused, "Connection refused")
+        if not context.machine_running(name):
+            raise E2EFailure("rm stopped the container")
+        if not (SYSTEMD_MACHINES / f"sandy.{name}" / "init.sh").is_file():
+            raise E2EFailure("rm removed the image of the running container")
+
+    with context.case("rm keeps the image of a container that did not stop"):
+        # After "did not stop", rm removed the image of a container that
+        # still ran on it. In this sandy command, machinectl poweroff and
+        # terminate do nothing; the waits for the stop are real. The case
+        # uses a container of its own.
+        stuck = context.scan_name
+        context.build_minimal(stuck, context.main_user)
+        command, environment = context.with_a_machinectl_that_stops_nothing(
+            [
+                str(SANDY),
+                "--workspace",
+                context.workspace.name,
+                "--shared",
+                context.shared.name,
+                "--user",
+                context.main_user,
+                "--container",
+                stuck,
+                "rm",
+                "--force",
+            ]
+        )
+        refused = context.run(command, expected=1, environment=environment)
+        assert_contains(refused, f"W: Container '{stuck}' did not stop")
+        assert_contains(
+            refused, f"E: Did not remove container '{stuck}': it did not stop"
+        )
+        if not context.machine_running(stuck):
+            raise E2EFailure("The container stopped, so the case tested nothing")
+        if not (SYSTEMD_MACHINES / f"sandy.{stuck}" / "etc").is_dir():
+            raise E2EFailure("rm removed the image of the running container")
+        context.remove_container(stuck, context.main_user)
+
+    with context.case("a new image reserves its address under the address lock"):
+        # No lock covered the scan of the other images and the write of the
+        # new /init.sh, so two builds of different names could get the same
+        # address. Hold that lock: the build must wait for it in flock(2),
+        # then end with an address that the main image does not have. Sandy
+        # makes the lock file; the case makes it when it is missing, so that
+        # the old code fails at the wait, not at the open.
+        lock_fd = os.open(
+            ADDRESSES_LOCK,
+            os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            context.register_container(context.scan_name, context.main_user)
+            build, log_path = context.start_up(
+                context.scan_name,
+                context.main_user,
+                ["up", "--build", "--detach", "--persistent", "--network", "lenient"],
+                "addresses",
+                environment=context.minimal_environment(),
+            )
+            try:
+                _wait_for(
+                    "the build waits for the address lock",
+                    lambda: waits_for_flock(build.pid, ADDRESSES_LOCK),
+                )
+            except E2EFailure:
+                if build.poll() is None:
+                    build.kill()
+                    build.wait(timeout=10)
+                raise
+        finally:
+            os.close(lock_fd)
+        try:
+            returncode = build.wait(timeout=INIT_SCAN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            build.kill()
+            build.wait(timeout=10)
+            raise E2EFailure("The build did not end after the lock release") from None
+        output = log_path.read_text(encoding="utf-8", errors="replace")
+        if returncode != 0:
+            raise E2EFailure(f"up --build exited {returncode}: {output[-2000:]}")
+        context.wait_for_machine(context.scan_name, running=True)
+        if _init_address(context.scan_name) == _init_address(name):
+            raise E2EFailure("The new image got the address of the main image")
+        context.remove_container(context.scan_name, context.main_user)
+
     with context.case("up -d is never stopped by an attach exit"):
         context.sandy(
             ["up", "--detach", "--persistent", "--network", "host"], name=second
@@ -651,6 +1814,243 @@ def test_main(context: E2EContext) -> None:
         context.remove_container(second, context.cache_user)
         if _show(context, second, "LoadState") != "not-found":
             raise E2EFailure("The scope remains after rm")
+
+    with context.case("an up that the check under the lock refuses publishes no port"):
+        # The refused up must also leave no port rule and no port state. It
+        # had published its ports before it waited for the lock, so they
+        # forwarded to the container of the other start until it stopped. The
+        # main container has a lenient network and the address in /init.sh.
+        context.stop_container(name, context.main_user)
+        _wait_stopped(context, name)
+        port = f"tcp:{REFUSED_UP_PORT}:80"
+        with _up_while_its_scope_appears(
+            context,
+            name,
+            context.main_user,
+            ["up", "--detach", "--persistent", "--network", "lenient", "--port", port],
+        ) as (returncode, output):
+            if returncode != 1:
+                raise E2EFailure(f"up exited {returncode}: {output[-2000:]}")
+            assert_contains_text(output, f"Unit '{_unit(name)}' already exists")
+            rules = context.run(["iptables", "-t", "nat", "-S", "sandy-nat-out"])
+            assert_not_contains(rules, f"--dport {REFUSED_UP_PORT}")
+            key = f"tcp:{REFUSED_UP_PORT}"
+            if PORT_STATE.exists() and key in context.port_state():
+                raise E2EFailure("The refused up left its port state")
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=context.main_user,
+        )
+        context.wait_for_machine(name, running=True)
+
+    with context.case("an up waits for a busy port mapping lock for a short time"):
+        # up publishes its ports under the lifecycle lock, which each attach
+        # waits for. Hold the port mapping lock from the time that up waits
+        # for the lifecycle lock: up must then fail before the start, with no
+        # port rule and no port state, and free the lifecycle lock in time.
+        context.stop_container(name, context.main_user)
+        _wait_stopped(context, name)
+        port = f"tcp:{BUSY_LOCK_UP_PORT}:80"
+        with ExitStack() as held:
+            taken: list[float] = []
+
+            def hold_the_port_lock() -> None:
+                lock = held.enter_context(PORT_LOCK.open("rb"))
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                taken.append(time.monotonic())
+
+            refused = context.up_with_a_change_while_it_waits(
+                name,
+                context.main_user,
+                [
+                    "up",
+                    "--detach",
+                    "--persistent",
+                    "--network",
+                    "lenient",
+                    "--port",
+                    port,
+                ],
+                hold_the_port_lock,
+            )
+            # The lifecycle lock is free now: up exited.
+            waited = time.monotonic() - taken[0]
+        if refused.returncode != 1:
+            raise E2EFailure(
+                f"up exited {refused.returncode}: {refused.output[-2000:]}"
+            )
+        assert_contains(
+            refused,
+            f"E: Could not publish the ports of '{name}': Timed out waiting for "
+            "the Sandy port mapping lock",
+        )
+        assert_not_contains(refused, "Starting")
+        if not PORT_LOCK_WAIT <= waited < LIFECYCLE_LOCK_WAIT:
+            raise E2EFailure(f"up held the lifecycle lock for {waited:.1f} seconds")
+        rules = context.run(["iptables", "-t", "nat", "-S", "sandy-nat-out"])
+        assert_not_contains(rules, f"--dport {BUSY_LOCK_UP_PORT}")
+        if PORT_STATE.exists() and f"tcp:{BUSY_LOCK_UP_PORT}" in context.port_state():
+            raise E2EFailure("The up with a busy lock left its port state")
+        if context.machine_running(name):
+            raise E2EFailure("The up with a busy lock started the container")
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=context.main_user,
+        )
+        context.wait_for_machine(name, running=True)
+
+    with context.case("a Ctrl-C while up waits for the port mapping lock stops up"):
+        # Regression test: up removed its ports on each exit after it began
+        # the publish, also on a Ctrl-C in the wait for the port mapping lock.
+        # That removal waited for the busy lock again, so the first Ctrl-C did
+        # not stop up. Hold the port mapping lock, and send SIGINT to an up
+        # that waits for it to publish its ports: up must exit at once, with
+        # no port rule and no port state. Without directories to mount (they
+        # do not exist), up waits in flock(2) with no limit; with them, it
+        # polls under the lifecycle lock.
+        context.stop_container(name, context.main_user)
+        _wait_stopped(context, name)
+        arguments = [
+            "up",
+            "--detach",
+            "--persistent",
+            "--network",
+            "lenient",
+            "--port",
+            f"tcp:{INTERRUPTED_UP_PORT}:80",
+        ]
+        for label, directory in (("no-mounts", "no-such-directory"), ("mounts", None)):
+            with PORT_LOCK.open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                up, log_path = context.start_up(
+                    name,
+                    context.main_user,
+                    arguments,
+                    f"interrupted-{label}",
+                    workspace=directory,
+                    shared=directory,
+                )
+                try:
+                    _wait_for_the_publish_wait(
+                        up, lock, log_path, blocking=directory is not None
+                    )
+                    up.send_signal(signal.SIGINT)
+                    try:
+                        up.wait(timeout=INTERRUPTED_UP_EXIT)
+                    except subprocess.TimeoutExpired:
+                        raise E2EFailure(
+                            f"up ({label}) did not stop at the first Ctrl-C"
+                        ) from None
+                finally:
+                    if up.poll() is None:
+                        up.kill()
+                        up.wait(timeout=10)
+            output = log_path.read_text(encoding="utf-8", errors="replace")
+            if up.returncode == 0 or "Starting" in output:
+                raise E2EFailure(
+                    f"up ({label}) exited {up.returncode}: {output[-2000:]}"
+                )
+            rules = context.run(["iptables", "-t", "nat", "-S", "sandy-nat-out"])
+            assert_not_contains(rules, f"--dport {INTERRUPTED_UP_PORT}")
+            key = f"tcp:{INTERRUPTED_UP_PORT}"
+            if PORT_STATE.exists() and key in context.port_state():
+                raise E2EFailure(f"up ({label}) left its port state")
+            if context.machine_running(name):
+                raise E2EFailure(f"up ({label}) started the container")
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=context.main_user,
+        )
+        context.wait_for_machine(name, running=True)
+
+    with context.case("no other process finds the ports of a start that failed"):
+        # Regression test: up released the port mapping lock after the publish
+        # of its ports, and then its start failed. A process that took the
+        # lock before the removal found the ports of that start, so an up of
+        # another name could refuse its own start ("already allocated"). Read
+        # the port state under the lock in a loop, as each up reads it, while
+        # an up publishes its ports and its supervisor does not start: no read
+        # may find those ports.
+        context.stop_container(name, context.main_user)
+        _wait_stopped(context, name)
+        key = f"tcp:{FAILED_START_PORT}"
+        command = context.with_a_broken_systemd_run(
+            [
+                str(SANDY),
+                "--workspace",
+                context.workspace.name,
+                "--shared",
+                context.shared.name,
+                "--user",
+                context.main_user,
+                "--container",
+                name,
+                "up",
+                "--detach",
+                "--persistent",
+                "--network",
+                "lenient",
+                "--port",
+                f"{key}:80",
+            ]
+        )
+        with _PortStateReader(key) as reader:
+            failed = context.run(command, expected=1)
+        if reader.errors:
+            raise E2EFailure(f"The port state reader failed: {reader.errors[0]!r}")
+        # The ports were published: "Starting" comes after the publish.
+        assert_contains(failed, f"I: Starting '{name}'")
+        assert_contains(failed, f"E: Could not start '{name}': ")
+        if reader.reads == 0 or reader.found:
+            raise E2EFailure(
+                f"{reader.found} of {reader.reads} reads found the ports of the "
+                "start that failed"
+            )
+        rules = context.run(["iptables", "-t", "nat", "-S", "sandy-nat-out"])
+        assert_not_contains(rules, f"--dport {FAILED_START_PORT}")
+        if PORT_STATE.exists() and key in context.port_state():
+            raise E2EFailure("The start that failed left its port state")
+        if context.machine_running(name):
+            raise E2EFailure("The start that failed started the container")
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=context.main_user,
+        )
+        context.wait_for_machine(name, running=True)
+
+    with context.case("update --shared works before the first container"):
+        context.stop_container(name, context.main_user)
+        _wait_stopped(context, name)
+        # Test-only: the harness owns sandy.slice; return it to no state.
+        context.remove_shared_slice()
+        update = context.sandy(
+            ["update", "--shared", "-m", "512m", "--pids-limit", "4096"]
+        )
+        assert_contains(update, "memory 512.0 MiB (saved), 4096 tasks (saved)")
+        changed = (_group_defaults()[0], 512 * MIB, 4096)
+        _check_group_limits(context, None, changed)
+        if _slice_show(context, "ActiveState") != "inactive":
+            raise E2EFailure(f"update --shared started {SLICE}")
+        # The next up starts the slice with the saved limits; a container
+        # gets half of a small shared process limit.
+        started = context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=name,
+            user=context.main_user,
+        )
+        context.wait_for_machine(name, running=True)
+        assert_contains(started, "memory 512.0 MiB (saved), 4096 tasks (saved)")
+        assert_contains(started, "I: Limits of this container: 2048 tasks")
+        _check_group_limits(context, name, changed)
+        context.sandy(["update", "--shared", "--reset"])
+        _check_group_limits(context, name)
+        # A container keeps the process limit that up gave it.
+        if _show(context, name, "TasksMax") != "2048":
+            raise E2EFailure("--reset changed the process limit of a container")
 
 
 def assert_contains_text(text: str, expected: str) -> None:

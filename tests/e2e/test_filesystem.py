@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import shlex
+import subprocess
+import time
 from types import ModuleType
 
 from tests.e2e.support import (
+    CACHE_DIR,
     PORT_LOCK,
     PORT_STATE,
+    PURGE_LOCK,
     SANDY,
     E2EContext,
     E2EFailure,
+    waits_for_flock,
 )
+
+PURGE_TIMEOUT = 120
 
 
 def _load_sandy_module() -> ModuleType:
@@ -161,6 +169,91 @@ def test_main(context: E2EContext) -> None:
             raise E2EFailure("Cache purge removed the stable transaction lock")
         if not sandy._same_inode(first_lock_stat, PORT_LOCK.stat()):
             raise E2EFailure("Cache purge replaced the transaction lock inode")
+
+        context.purge_cache()
+        context.assert_no_sandy_state()
+
+    with context.case("rm --cache removes the payload without the port mapping lock"):
+        # Regression test: rm --cache held the port mapping lock for its whole
+        # purge. Meanwhile, an up under the lifecycle lock failed after 5 s,
+        # and the stop after the last session gave up after 5 s. Hold the port
+        # mapping lock, and run rm --cache: it must remove the payload first,
+        # and wait for the lock only for the temporary files of atomic writes,
+        # which it must leave until then. Then release the lock: rm --cache
+        # must remove those files, end as usual, and keep the lock files. No
+        # cache archive exists yet, so the later builds lose nothing.
+        instance = sandy.Sandy.__new__(sandy.Sandy)
+        instance._ensure_cache_dir()
+        payload = CACHE_DIR / "e2e-purge-payload"
+        payload_file = payload / "file"
+        temporary = CACHE_DIR / f".sandy-{'e' * 32}.tmp"
+        log_path = context.root / "purge.log"
+        command = [
+            str(SANDY),
+            "--workspace",
+            context.workspace.name,
+            "--shared",
+            context.shared.name,
+            "rm",
+            "--cache",
+            "--force",
+        ]
+        payload.mkdir(mode=0o700)
+        try:
+            payload_file.write_text("payload\n", encoding="utf-8")
+            temporary.touch(mode=0o600)
+            # The lock of the product, in this process: it also makes the
+            # lock file, which the purge of the case above removed.
+            with instance._port_mapping_lock(exclusive=True):
+                print(f"    $ {shlex.join(command)} &", flush=True)
+                with log_path.open("w", encoding="utf-8") as stream:
+                    purge = subprocess.Popen(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=stream,
+                        stderr=subprocess.STDOUT,
+                        cwd=context.root,
+                        env=context.safe_environment(),
+                    )
+                try:
+                    deadline = time.monotonic() + PURGE_TIMEOUT
+                    while not waits_for_flock(purge.pid, PORT_LOCK):
+                        if purge.poll() is not None or time.monotonic() >= deadline:
+                            raise E2EFailure(
+                                "rm --cache did not wait for the port mapping lock: "
+                                + log_path.read_text(encoding="utf-8")[-2000:]
+                            )
+                        time.sleep(0.1)
+                    if payload.exists():
+                        raise E2EFailure(
+                            "rm --cache waited for the port mapping lock before "
+                            "it removed the payload"
+                        )
+                    if not temporary.exists():
+                        raise E2EFailure(
+                            "rm --cache removed a temporary file without the "
+                            "port mapping lock"
+                        )
+                except BaseException:
+                    purge.kill()
+                    purge.wait(timeout=10)
+                    raise
+            # The release of the lock lets rm --cache go on.
+            returncode = purge.wait(timeout=PURGE_TIMEOUT)
+            output = log_path.read_text(encoding="utf-8")
+            if returncode != 0 or "I: Purged cache directory" not in output:
+                raise E2EFailure(f"rm --cache exited {returncode}: {output[-2000:]}")
+            if temporary.exists():
+                raise E2EFailure("rm --cache left the temporary file")
+            for path in (PORT_LOCK, PURGE_LOCK):
+                if not path.is_file():
+                    raise E2EFailure(f"rm --cache removed {path.name}")
+        finally:
+            # The case owns these exact paths; remove what a failure left.
+            temporary.unlink(missing_ok=True)
+            payload_file.unlink(missing_ok=True)
+            if payload.is_dir() and not payload.is_symlink():
+                payload.rmdir()
 
         context.purge_cache()
         context.assert_no_sandy_state()

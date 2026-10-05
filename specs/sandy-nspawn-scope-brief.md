@@ -118,7 +118,9 @@ Conclusions:
    value `infinity` (`max` in cgroupfs), as today. A later sandy option can set
    a memory limit on the container unit. With a limit, the kernel kills a
    process inside the unit before the host runs out of memory. The option would
-   address item 2 of `security-parity.md` (see Related work).
+   address item 2 of `security-parity.md` (see Related work). Superseded by
+   that item: all containers now share the memory limit of `sandy.slice` by
+   default (the host keeps a reserve), and no container gets swap.
 5. Each attach (`sandy -c <name> bash` and `exec`) runs inside the container's
    unit, not in the terminal's scope. Its memory counts against the container
    unit, and against the limit when one is set. An OOM in one attach must not
@@ -133,7 +135,10 @@ Conclusions:
    bounding set. This includes `-u root`. Step 1 (see Implementation order)
    delivers this before the console becomes an attach.
 9. Resource defaults stay as today: `TasksMax=16384`, `MemoryMax=infinity`,
-   `MemorySwapMax=infinity`, and no CPU quota.
+   `MemorySwapMax=infinity`, and no CPU quota. Superseded by
+   `security-parity.md` item 2: by default, shared CPU, memory, and process
+   limits on `sandy.slice`, and for each container a process limit, a `/tmp`
+   size, and no swap.
 
 ## Tool facts (systemd 255, verified in the test VM unless noted)
 
@@ -397,7 +402,11 @@ systemd-run --scope --quiet --unit=sandy-<name>.scope --slice=system.slice \
   must set `-p TasksMax=16384` explicitly. The memory and CPU defaults already
   match.
 - A later sandy option can add `-p MemoryMax=`, `-p MemorySwapMax=`, and other
-  limits (Requirement 4). The default passes none.
+  limits (Requirement 4). The default passes none. `security-parity.md` item
+  2 later moved the scopes to `sandy.slice`, which holds the limits that all
+  containers share, and set a process limit and no swap on each scope. The
+  scope cgroups in this brief are then below `/sys/fs/cgroup/sandy.slice`,
+  not `/sys/fs/cgroup/system.slice`.
 
 - Start it through `_run_secure_subprocess_popen` with `pass_fds`,
   `start_new_session=True`, and stdin, stdout, and stderr on `/dev/null`, for
@@ -414,6 +423,15 @@ systemd-run --scope --quiet --unit=sandy-<name>.scope --slice=system.slice \
 - After the start, `up` treats "the scope ended before the container was
   ready" as an error and reports nspawn's exit status. This covers images
   that cannot run the keepalive.
+- Ready means that the readiness probe, an attach as container root, runs.
+  The entry helper refuses an attach until the payload exists
+  (`security-parity.md` item 5), and the probe tries again every 0.5 s, for
+  up to 60 s.
+- The workspace and shared directories are not nspawn binds. When `up` has
+  directories to mount, it mounts them in the running container as soon as the
+  payload exists, before the readiness probe (`security-parity.md` item 6).
+  Until then, the mounts-pending marker makes the entry helper refuse every
+  attach, so the probe cannot work before the mounts are done.
 - Rejected: a transient service (loses the fd; needs `-G`), `machinectl start`
   or `systemd-nspawn@.service` (fixed `--boot` in `ExecStart=`, per-run
   options would need persistent `.nspawn` files and drop-ins, no fd passing),
@@ -486,9 +504,16 @@ systemd-run --scope --quiet --unit=sandy-<name>.scope --slice=system.slice \
   `NOTIFY_SOCKET`, `LANG`, `container_host_version_id`, `container_host_id`).
   So the image cannot set `BASH_ENV` for PID 2, and the non-interactive bash
   reads no startup file.
-- sandy removes the host directory once the container is ready. A running
-  PID 2 does not need it: bash keeps its open fd on the deleted script, and
-  the symlink was resolved at exec (tests 8 and 10).
+- sandy removes the host directory once PID 2 has opened the script. After
+  the container is ready, `up` waits up to 10 s until a descriptor of PID 2
+  links to `/run/sandy/keepalive.sh` (read with `readlink` on the host
+  `/proc/<pid>/fd`). From then on PID 2 does not need the directory: bash
+  keeps its open fd on the deleted script, and the symlink was resolved at
+  exec (tests 8 and 10). A ready container proves only that PID 2 exists.
+  Measured with PID 2 held at its fork, before execve, on systemd 249, 255,
+  and 257 with the Debian trixie and Ubuntu 26.04 images: without the wait,
+  `up` removed the directory and returned, and the container stopped when
+  PID 2 ran.
 - Security: the payload runs as container root. With `--user=root`, the stub
   PID 1 also runs as container root for the container's whole life. Container root is an
   unprivileged host UID, limited by nspawn's bounding set and seccomp. The
@@ -547,6 +572,19 @@ systemd-run --scope --quiet --unit=sandy-<name>.scope --slice=system.slice \
   scope's cgroup. So no attach can exit, and stop the container, before the
   console starts. The console's own exit removes the marker before the count,
   and a console hangup removes it without a count.
+- The mounts-pending marker is a second marker of the same kind, for the
+  workspace and shared directories. When `up` has directories to mount (with
+  or without `-d`), it holds the lifecycle lock while it starts the scope and
+  creates the marker, an empty cgroup `mounts-pending` in the scope's cgroup,
+  and then the up-console marker. The entry helper refuses every attach while
+  the marker exists ("Container is still starting; try again (if sandy up has
+  ended, stop the container with sandy down)", status 125). The check is
+  under the lifecycle lock, after the scope check and before the payload
+  check. `up` waits until the payload exists. Then, under the lifecycle lock,
+  it mounts the directories and removes the marker. A failed mount stops the
+  container. If `up` ends before it removes the marker (for example, with
+  SIGKILL), the marker stays until the container stops, and `sandy down`
+  stops it. The marker is not an attach leaf, so the attach count ignores it.
 - A new attach creates its leaf under the same lock, so a concurrent start
   and stop cannot both succeed.
 - Loss of a terminal (SIGHUP or SIGTERM) runs only the attach cleanup
@@ -644,7 +682,8 @@ Rejected alternatives:
   With this design, a later option puts the limits on the `systemd-run --scope`
   unit. This change keeps the defaults unlimited, so it does not close item 2.
   The item's other points (validated CLI options, `size=` on the `/tmp`
-  tmpfs) still apply.
+  tmpfs) still apply. Item 2 was later fixed with shared limits on
+  `sandy.slice` and limits on each scope.
 - **"PTY and signal behavior".** It records the orphan behavior of test 5 and
   says to fix it separately. The `cgroup.kill` cleanup of each attach cgroup is
   that fix.
@@ -702,15 +741,21 @@ Helper flow as built (steps 1 and 2):
    any other inherited descriptor.
 2. Helper, on the host, before any `setns`: set the parent-death signal and
    check `getppid()`; take the lifecycle lock; open the Leader pidfd; check
-   with `machinectl show -p Leader` that the PID is still the Leader; open the
-   `/proc/<leader>/ns/*` fds; `PTRACE_SEIZE` and `PTRACE_INTERRUPT` the Leader
-   (the stub PID 1) and `waitpid(__WALL)`; read the filters with
-   `PTRACE_SECCOMP_GET_FILTER` for index 0, 1, and so on until `ENOENT` (any
-   other errno fails, and a Leader with no filter fails); `PTRACE_DETACH` on
-   every path, with any signal that the stop took off the queue; read
-   `CapBnd` from the host's `/proc/<leader>/status`; confirm through the pidfd
-   that the Leader is still alive; check that the Leader's cgroup is below the
-   scope's `payload`; join the attach leaf; release the lock.
+   with `machinectl show -p Leader` that the PID is still the Leader; check
+   that the Leader's cgroup is below the scope's `payload` (a Leader still in
+   the scope's own cgroup means that the container is still starting);
+   refuse while the mounts-pending marker exists (`security-parity.md`
+   item 6); require the payload (container PID 2) among the Leader's children, or
+   fail closed because the container is still starting (`security-parity.md`
+   item 5); open the `/proc/<leader>/ns/*` fds; `PTRACE_SEIZE` and
+   `PTRACE_INTERRUPT` the Leader (the stub PID 1) and `waitpid(__WALL)`; read
+   the filters with `PTRACE_SECCOMP_GET_FILTER` for index 0, 1, and so on
+   until `ENOENT` (any other errno fails, and a Leader with no filter fails);
+   `PTRACE_DETACH` on every path, with any signal that the stop took off the
+   queue; read `CapBnd` from the host's `/proc/<leader>/status`; confirm
+   through the pidfd that the Leader is still alive; require the payload's
+   filter count and `CapBnd` to equal the Leader's; join the attach leaf;
+   release the lock.
 3. The helper becomes a child subreaper and forks the middle process. The
    middle process calls `setns` on each pinned fd in the order `cgroup, ipc,
    uts, net, pid, mnt, user` (user last), becomes container root, forks the
@@ -843,8 +888,9 @@ Step 2 decisions that differ from the plan above:
   removes empty ones; this is safe because leaves are created and joined
   under the lifecycle lock.
 - The helper proves the scope from the Leader's host cgroup, which must be
-  below `/system.slice/sandy-<name>.scope/payload`. A container started by
-  an earlier sandy fails this check; `bash` and `exec` refuse it.
+  below `/system.slice/sandy-<name>.scope/payload` (below `/sandy.slice/`
+  since `security-parity.md` item 2). A container started by an earlier
+  sandy fails this check; `bash` and `exec` refuse it.
 - `init.sh` now runs in the main thread after readiness, before the
   console attach (not in a thread during the console).
 - `up` runs `_cleanup_port_mappings_for_container` after CLI validation;
@@ -890,9 +936,9 @@ with at least two images: the default (Debian trixie) and Ubuntu 26.04
 2. The keepalive: PID 2 has `comm=sandy-keepalive`, runs as container root,
    has no `BASH_ENV`, and UID 1000 cannot send it signals. A killed `sleep`
    child is restarted. The host directory (mode 0755, two entries) is removed
-   after the container is ready. `up` works when the host temporary directory
-   is `noexec`. An image without `sleep` in `PATH` makes `up` fail with a
-   clear error, and the keepalive does not spin. The `noexec` and
+   after PID 2 has opened the script. `up` works when the host temporary
+   directory is `noexec`. An image without `sleep` in `PATH` makes `up` fail
+   with a clear error, and the keepalive does not spin. The `noexec` and
    missing-`sleep` cases were checked by hand; the E2E suite does not cover
    them.
 3. `sandy -c <name> bash` and `exec` through the B2 path.
@@ -929,7 +975,8 @@ with at least two images: the default (Debian trixie) and Ubuntu 26.04
 Open questions:
 
 - A later change: CLI options for `MemoryMax=`, `MemorySwapMax=`, `TasksMax=`,
-  and `CPUQuota=`. Defaults stay as today.
+  and `CPUQuota=`. Defaults stay as today. Done in `security-parity.md` item
+  2, with shared limits on `sandy.slice` by default.
 - A later change: `NoNewPrivs=1` on all paths.
 - A later change: `rm --network` without a bridge. `run_rm` constructs
   `SandyNet()` before the running-container check and the confirmation. With

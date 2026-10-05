@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
+import signal
+
 from tests.e2e.support import (
+    CACHE_DIR,
     E2EContext,
     E2EFailure,
     HOST_SECRET_NAME,
@@ -147,6 +152,56 @@ def test_main(context: E2EContext) -> None:
             expected=1,
         )
         assert_contains(duplicate, "is already running")
+
+    with context.case("an up of a name that another up starts fails at once"):
+        # up holds the up lock of the name from its first check until the
+        # container is ready. Hold the lock here, as such an up does.
+        up_lock = CACHE_DIR / f"up-{context.main_name}.lock"
+        if not context._persistent_lock_is_safe(up_lock):
+            raise E2EFailure(f"The up lock is missing or unsafe: {up_lock}")
+        with up_lock.open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            refused = context.sandy(
+                ["up", "--detach", "--persistent", "--network", "lenient"],
+                name=context.main_name,
+                user=context.main_user,
+                expected=1,
+            )
+        assert_contains(
+            refused, f"E: Another up is starting container '{context.main_name}'"
+        )
+        # The refusal comes before the first check of up.
+        assert_not_contains(refused, "is already running")
+        context.wait_for_machine(context.main_name, running=True)
+
+    with context.case("a machine query that does not answer ends the command"):
+        # Stop systemd-machined for a moment: machinectl then waits for its
+        # answer for 25 seconds. Sandy waits for at most 3 seconds
+        # (QUERY_COMMAND_TIMEOUT of sandy), and no answer is not "stopped".
+        machined = context.run(
+            ["systemctl", "show", "systemd-machined", "-p", "MainPID", "--value"]
+        ).stdout.strip()
+        if not machined.isdigit() or int(machined) <= 1:
+            raise E2EFailure(f"systemd-machined does not run: {machined!r}")
+        os.kill(int(machined), signal.SIGSTOP)
+        try:
+            refused = context.sandy(
+                ["up", "--detach", "--persistent", "--network", "lenient"],
+                name=context.main_name,
+                user=context.main_user,
+                expected=1,
+            )
+            attach = context.sandy(
+                ["exec", "--", "true"],
+                name=context.main_name,
+                user=context.main_user,
+                expected=1,
+            )
+        finally:
+            os.kill(int(machined), signal.SIGCONT)
+        assert_contains(refused, f"E: Could not query machine '{context.main_name}'")
+        assert_contains(attach, "E: 'machinectl' did not answer in 3 seconds")
+        context.wait_for_machine(context.main_name, running=True)
 
     with context.case("stopped persistent machine restarts without rebuilding"):
         _exec(context, "touch", "/home/developer/persistent-marker")

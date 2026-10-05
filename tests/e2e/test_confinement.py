@@ -1,26 +1,35 @@
-"""Entry-path confinement parity (specs/security-parity.md item 1).
+"""Entry-path confinement parity (specs/security-parity.md items 1 and 5).
 
 Every attach (`exec`, `bash`, and `-u root`) must run with the container
-payload's seccomp filters and capability bounding set. These properties need
-the real kernel, systemd-nspawn, and sandy, so unit mocks cannot prove them.
+payload's seccomp filters and capability bounding set, also while `up` starts
+the container. These properties need the real kernel, systemd-nspawn, and
+sandy, so unit mocks cannot prove them.
 """
 
 from __future__ import annotations
 
 import base64
+import ctypes
 import importlib.machinery
 import importlib.util
 import json
 import os
 import platform
+import select
 import shlex
+import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import ModuleType
 
 from tests.e2e.support import (
     SANDY,
+    SLICE,
+    SLICE_CGROUP,
+    SYSTEMD_MACHINES,
+    CommandResult,
     E2EContext,
     E2EFailure,
     assert_contains,
@@ -31,8 +40,32 @@ STATUS_FIELDS = ("Seccomp", "Seccomp_filters", "CapBnd", "CapEff", "NoNewPrivs")
 EPERM = 1
 ENTRY_FAILURE = 125
 STABILITY_RUNS = 150
+# Attaches in a loop while up -d starts the container (item 5). The start
+# window is short, so this is a regression check, not a proof.
+START_SAMPLERS = 3
+START_ATTACHES_AFTER_UP = 2
+START_TIMEOUT = 300
+# Starts in which the Leader is stopped as soon as machined reports it. A
+# start in which the payload already exists at the stop is repeated.
+HOLD_ATTEMPTS = 3
+HOLD_STOP_TIMEOUT = 10
+MACHINES_STATE = Path("/run/systemd/machines")
+# <linux/ptrace.h>: requests, options, and events that hold the payload at its
+# fork. sandy defines PTRACE_SEIZE and PTRACE_DETACH.
+PTRACE_CONT = 7
+PTRACE_GETEVENTMSG = 0x4201
+PTRACE_FORK_OPTIONS = 0x02 | 0x04 | 0x08
+PTRACE_FORK_EVENTS = (1, 2, 3)
+# Without the S2 fix, up returned in this time after an attach worked.
+KEEPALIVE_HOLD_SECONDS = 3
+KEEPALIVE_DIR_GLOB = "sandy-keepalive-*"
 # aarch64 has 7 of the 10 denied syscalls, and 5.15 hides bpf.
 MIN_OBSERVABLE_DENIED = 6
+# Orphans that a session leaves to the Leader. Their entries in the Leader's
+# child list take more than one read chunk of the payload search.
+ADOPTED_ORPHANS = 1000
+ORPHAN_COMMAND = b"sleep\x003333\x00"
+ORPHANS_GONE_TIMEOUT = 30
 # Denied by Docker's default profile and by nspawn's filter; the nsenter path
 # reached the kernel with each of them (specs/security-parity.md item 1).
 DENIED_SYSCALLS = (
@@ -238,6 +271,205 @@ class _Session:
                 self.process.wait(timeout=10)
 
 
+class _StartSampler(threading.Thread):
+    """Run one attach after the other until up has returned, and keep results.
+
+    Each result is (started after up returned, exit status, output). The
+    sampler stops after START_ATTACHES_AFTER_UP attaches that started after
+    up returned.
+    """
+
+    def __init__(
+        self,
+        arguments: list[str],
+        environment: dict[str, str],
+        cwd: Path,
+        up_done: threading.Event,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.arguments = arguments
+        self.environment = environment
+        self.cwd = cwd
+        self.up_done = up_done
+        self.results: list[tuple[bool, int, str]] = []
+        self.error: BaseException | None = None
+
+    def run(self) -> None:
+        after_up = 0
+        try:
+            while after_up < START_ATTACHES_AFTER_UP:
+                started_after_up = self.up_done.is_set()
+                if started_after_up:
+                    after_up += 1
+                completed = subprocess.run(
+                    self.arguments,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=120,
+                    shell=False,
+                    cwd=self.cwd,
+                    env=self.environment,
+                )
+                self.results.append(
+                    (
+                        started_after_up,
+                        completed.returncode,
+                        completed.stdout + completed.stderr,
+                    )
+                )
+        except BaseException as exc:  # reported by the main thread
+            self.error = exc
+
+
+def _machined_leader(name: str) -> int:
+    """Return the Leader from machined's state file, or 0 when there is none.
+
+    Reading the file is faster than starting machinectl for each poll.
+    """
+    try:
+        text = (MACHINES_STATE / name).read_text(encoding="ascii", errors="replace")
+    except FileNotFoundError:
+        return 0
+    for line in text.splitlines():
+        key, _, value = line.partition("=")
+        if key == "LEADER" and value.isdigit():
+            return int(value)
+    return 0
+
+
+def _pidfd_alive(pidfd: int) -> bool:
+    """Return whether the process of pidfd has not exited."""
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    return not poller.poll(0)
+
+
+def _open_scope_process(pid: int, unit: str) -> int:
+    """Return a pidfd for pid after a check that pid runs in unit's cgroup.
+
+    The check reads /proc/<pid>/cgroup. The process is alive after the read,
+    so the read and the pidfd refer to the same process.
+    """
+    pidfd = os.pidfd_open(pid)
+    try:
+        cgroup = Path(f"/proc/{pid}/cgroup").read_text(encoding="ascii").strip()
+        scope = f"0::/{SLICE}/{unit}"
+        if cgroup != scope and not cgroup.startswith(scope + "/"):
+            raise E2EFailure(f"PID {pid} is not in {unit}: {cgroup!r}")
+        if not _pidfd_alive(pidfd):
+            raise E2EFailure(f"PID {pid} exited during the check")
+    except BaseException:
+        os.close(pidfd)
+        raise
+    return pidfd
+
+
+def _wait_for_cgroup(pid: int, cgroup: str) -> None:
+    """Wait until /proc/<pid>/cgroup names cgroup, a path below /sys/fs/cgroup."""
+    expected = f"0::{cgroup}"
+    deadline = time.monotonic() + HOLD_STOP_TIMEOUT
+    while True:
+        current = Path(f"/proc/{pid}/cgroup").read_text(encoding="ascii").strip()
+        if current == expected:
+            return
+        if time.monotonic() > deadline:
+            raise E2EFailure(f"PID {pid} runs in {current!r}, not in {expected!r}")
+        time.sleep(0.01)
+
+
+def _process_state(pid: int) -> str:
+    """Return the state letter of pid from /proc/<pid>/stat."""
+    text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    return text.rsplit(")", 1)[1].split()[0]
+
+
+def _is_payload(pid: int, leader: int) -> bool:
+    """Return whether pid is the Leader's child with container PID 2."""
+    try:
+        text = Path(f"/proc/{pid}/status").read_text(encoding="ascii", errors="replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    fields = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        fields[key] = value.split()
+    return fields.get("PPid") == [str(leader)] and fields.get("NSpid") == [
+        str(pid),
+        "2",
+    ]
+
+
+def _has_payload(leader: int) -> bool:
+    """Return whether the Leader has a child with container PID 2."""
+    return any(_is_payload(child, leader) for child in _children(leader))
+
+
+def _hold_payload_at_fork(sandy: ModuleType, leader: int, pidfd: int) -> int:
+    """Hold the payload in its first ptrace stop, before it runs execve.
+
+    Seize the Leader with the fork options and wait for the fork of its
+    child with container PID 2. Release the Leader at once, so that an
+    attach can seize it. Return the payload, which stays stopped until the
+    caller detaches it, or 0 when the payload already existed. pidfd pins
+    the Leader: it is alive after the seize, so the seized process is the
+    Leader.
+    """
+
+    def ptrace(request: int, pid: int, addr: int = 0, data: int = 0) -> int:
+        return sandy._entry_syscall("ptrace", request, pid, addr, data)
+
+    ptrace(sandy.PTRACE_SEIZE, leader, 0, PTRACE_FORK_OPTIONS)
+    stopped = False
+    try:
+        if not _pidfd_alive(pidfd):
+            raise E2EFailure("The Leader exited before the seize")
+        if _has_payload(leader):
+            return 0
+        deadline = time.monotonic() + START_TIMEOUT
+        while time.monotonic() < deadline:
+            pid, status = os.waitpid(leader, sandy.WAIT_ALL | os.WNOHANG)
+            if pid == 0:
+                time.sleep(0.001)
+                continue
+            if not os.WIFSTOPPED(status):
+                raise E2EFailure("The Leader exited before its payload started")
+            stopped = True
+            event = status >> 16
+            signal_number = 0
+            if event in PTRACE_FORK_EVENTS:
+                message = ctypes.c_ulong()
+                ptrace(PTRACE_GETEVENTMSG, leader, 0, ctypes.addressof(message))
+                child = message.value
+                # The new child starts traced, in a ptrace stop.
+                os.waitpid(child, sandy.WAIT_ALL)
+                if _is_payload(child, leader):
+                    return child
+                ptrace(sandy.PTRACE_DETACH, child)
+            elif not event:
+                # Give back the signal that a signal-delivery-stop took.
+                signal_number = os.WSTOPSIG(status)
+            ptrace(PTRACE_CONT, leader, 0, signal_number)
+            stopped = False
+        raise E2EFailure("The Leader did not start its payload")
+    finally:
+        try:
+            signal_number = 0 if stopped else sandy._stop_seized_tracee(leader)
+            sandy._ptrace_detach(leader, signal_number)
+        except OSError:
+            # The Leader exited, which ended the trace.
+            pass
+
+
+def _entry_failure_reason(output: str) -> str:
+    """Return the helper's error message from an attach output."""
+    for line in output.replace("\r", "").splitlines():
+        if "Container entry failed" in line:
+            return line.strip()
+    return "(no helper message)"
+
+
 def _exec(context: E2EContext, command: str, *, user: str | None = None, **kwargs):
     return context.sandy(
         ["exec", "--", command],
@@ -245,6 +477,31 @@ def _exec(context: E2EContext, command: str, *, user: str | None = None, **kwarg
         user=user or context.main_user,
         **kwargs,
     )
+
+
+# up mounts the workspace and shared directories as soon as the payload exists,
+# and polls every 0.5 s. Until then an attach fails closed (status 125, "Container
+# is still starting"), also while the payload is held.
+MOUNTS_WAIT_TIMEOUT = 30
+
+
+def _exec_when_mounted(context: E2EContext, command: str) -> CommandResult:
+    """Run a command in the main container as soon as up has mounted its directories.
+
+    Retry only the refusal for a container that is still starting.
+    """
+    deadline = time.monotonic() + MOUNTS_WAIT_TIMEOUT
+    while True:
+        result = _exec(context, command, expected=None)
+        if result.returncode == 0:
+            return result
+        if result.returncode != ENTRY_FAILURE or "still starting" not in result.output:
+            raise E2EFailure(
+                f"Unexpected result {result.returncode}: {result.output[-2000:]}"
+            )
+        if time.monotonic() >= deadline:
+            raise E2EFailure("up did not mount the directories in time")
+        time.sleep(0.1)
 
 
 def _status_via(context: E2EContext, arguments: list[str], user: str) -> dict:
@@ -482,3 +739,429 @@ def test_main(context: E2EContext) -> None:
         root_identity = _exec(context, "id -u; id -G", user="root")
         if root_identity.stdout.split() != ["0", "0"]:
             raise E2EFailure(f"-u root identity: {root_identity.stdout!r}")
+
+    # Item 5: before the payload exists, the Leader's confinement may not be
+    # final, so the helper refuses an attach. The main container restarts in
+    # these cases, and the scope tests use it next.
+    common = [
+        str(SANDY),
+        "--workspace",
+        context.workspace.name,
+        "--shared",
+        context.shared.name,
+        "--user",
+        context.main_user,
+        "--container",
+        context.main_name,
+    ]
+    up_arguments = common + ["up", "--detach", "--persistent", "--network", "lenient"]
+    start_environment = context.safe_environment()
+
+    with context.case("attaches while up -d starts the container are refused or final"):
+        # Every attach that runs must have the final confinement.
+        context.stop_container(context.main_name, context.main_user)
+        attach = common + ["exec", "--", grep_status]
+        environment = start_environment
+        up_done = threading.Event()
+        samplers = [
+            _StartSampler(attach, environment, context.root, up_done)
+            for _ in range(START_SAMPLERS)
+        ]
+        print(f"    $ {shlex.join(attach)}  # {START_SAMPLERS} loops", flush=True)
+        for sampler in samplers:
+            sampler.start()
+        up_log = context.root / "start-window-up.log"
+        print(f"    $ {shlex.join(up_arguments)}", flush=True)
+        up_returncode: int | None = None
+        try:
+            with up_log.open("w", encoding="utf-8") as stream:
+                up = subprocess.Popen(
+                    up_arguments,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=context.root,
+                    env=environment,
+                )
+                try:
+                    up_returncode = up.wait(timeout=START_TIMEOUT)
+                finally:
+                    if up.poll() is None:
+                        up.kill()
+                        up.wait(timeout=10)
+        finally:
+            up_done.set()
+            for sampler in samplers:
+                sampler.join(timeout=START_TIMEOUT)
+        if any(sampler.is_alive() for sampler in samplers):
+            raise E2EFailure("An attach sampler did not finish")
+        if up_returncode != 0:
+            output = up_log.read_text(encoding="utf-8", errors="replace")
+            raise E2EFailure(f"up -d exited {up_returncode}: {output[-2000:]}")
+        context.wait_for_machine(context.main_name, running=True)
+        new_leader = context.machine_leader(context.main_name)
+        if new_leader is None:
+            raise E2EFailure("The restarted container has no Leader")
+        final = dict(
+            _host_status(_payload_pid(int(new_leader))), CapEff="0000000000000000"
+        )
+        counts = {"confined": 0, "not running": 0, "refused": 0}
+        refusals: dict[str, int] = {}
+        for sampler in samplers:
+            if sampler.error is not None:
+                raise E2EFailure(f"An attach sampler failed: {sampler.error!r}")
+            for after_up, returncode, output in sampler.results:
+                if returncode == 0:
+                    status = _parse_status(output)
+                    if status != final:
+                        raise E2EFailure(
+                            f"An attach ran with {status!r}, not the final "
+                            f"confinement {final!r}"
+                        )
+                    counts["confined"] += 1
+                elif after_up:
+                    raise E2EFailure(
+                        f"An attach after up returned failed with {returncode}: "
+                        f"{output[-2000:]}"
+                    )
+                elif returncode == 1 and "not found or not running" in output:
+                    counts["not running"] += 1
+                elif returncode == ENTRY_FAILURE:
+                    counts["refused"] += 1
+                    reason = _entry_failure_reason(output)
+                    refusals[reason] = refusals.get(reason, 0) + 1
+                else:
+                    raise E2EFailure(
+                        f"Unexpected attach result {returncode}: {output[-2000:]}"
+                    )
+        print(f"    attaches: {counts}; refusals: {refusals}", flush=True)
+        if counts["confined"] < START_SAMPLERS * START_ATTACHES_AFTER_UP:
+            raise E2EFailure(f"Too few attaches ran: {counts}")
+
+    with context.case("an attach before the payload exists is refused"):
+        # Stop the Leader as soon as machined reports it. While it is
+        # stopped, it cannot start its payload, so an attach must fail
+        # closed and must not run its command.
+        marker = context.workspace / "start-refused-marker"
+        unit = f"sandy-{context.main_name}.scope"
+        held_in = 0
+        for attempt in range(1, HOLD_ATTEMPTS + 1):
+            context.stop_container(context.main_name, context.main_user)
+            print(f"    $ {shlex.join(up_arguments)}", flush=True)
+            hold_log = context.root / f"start-hold-up-{attempt}.log"
+            with hold_log.open("w", encoding="utf-8") as stream:
+                up = subprocess.Popen(
+                    up_arguments,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=context.root,
+                    env=start_environment,
+                )
+            try:
+                leader = 0
+                deadline = time.monotonic() + START_TIMEOUT
+                while not leader and up.poll() is None:
+                    if time.monotonic() > deadline:
+                        raise E2EFailure("The container did not register")
+                    leader = _machined_leader(context.main_name)
+                if not leader:
+                    raise E2EFailure(f"up exited {up.returncode} before registration")
+                pidfd = _open_scope_process(leader, unit)
+                try:
+                    signal.pidfd_send_signal(pidfd, signal.SIGSTOP)
+                    try:
+                        deadline = time.monotonic() + HOLD_STOP_TIMEOUT
+                        while _process_state(leader) != "T":
+                            if time.monotonic() > deadline:
+                                raise E2EFailure("The Leader did not stop")
+                            time.sleep(0.01)
+                        if not _has_payload(leader):
+                            held_in = attempt
+                            refused = _exec(
+                                context,
+                                f"touch /home/developer/workspace/{marker.name}",
+                                expected=ENTRY_FAILURE,
+                            )
+                            assert_contains(refused, "Container is still starting")
+                            if marker.exists():
+                                raise E2EFailure("The command ran before the payload")
+                    finally:
+                        try:
+                            signal.pidfd_send_signal(pidfd, signal.SIGCONT)
+                        except ProcessLookupError:
+                            pass
+                finally:
+                    os.close(pidfd)
+                returncode = up.wait(timeout=START_TIMEOUT)
+            finally:
+                if up.poll() is None:
+                    up.kill()
+                    up.wait(timeout=10)
+            if returncode != 0:
+                output = hold_log.read_text(encoding="utf-8", errors="replace")
+                raise E2EFailure(
+                    f"up -d exited {returncode} after the hold: {output[-2000:]}"
+                )
+            if held_in:
+                break
+        if not held_in:
+            raise E2EFailure(
+                f"The payload existed at the stop in all {HOLD_ATTEMPTS} starts"
+            )
+        print(f"    held before the payload in start {held_in}", flush=True)
+        context.wait_for_machine(context.main_name, running=True)
+        _exec(context, "true")
+
+    with context.case("an attach before the payload exists is refused without mounts"):
+        # In the case above, up has directories to mount, so the scope check
+        # or the mounts-pending marker refuses the attach before the payload
+        # check runs. Without directories, up makes no marker. nspawn moves
+        # the stopped Leader into the payload cgroup, and then only the
+        # payload check stops an attach. Start up with names of directories
+        # that do not exist, and hold the Leader there.
+        missing = ("missing-workspace", "missing-shared")
+        for name in missing:
+            if os.path.lexists(context.root / name):
+                raise E2EFailure(f"{name} exists in the run root")
+        bare_arguments = [
+            str(SANDY),
+            "--workspace",
+            missing[0],
+            "--shared",
+            missing[1],
+            "--user",
+            context.main_user,
+            "--container",
+            context.main_name,
+            "up",
+            "--detach",
+            "--persistent",
+            "--network",
+            "lenient",
+        ]
+        unit = f"sandy-{context.main_name}.scope"
+        pending = SLICE_CGROUP / unit / "mounts-pending"
+        marker_name = "bare-start-refused-marker"
+        marker = (
+            SYSTEMD_MACHINES
+            / f"sandy.{context.main_name}"
+            / "home"
+            / context.main_user
+            / marker_name
+        )
+        held_in = 0
+        for attempt in range(1, HOLD_ATTEMPTS + 1):
+            context.stop_container(context.main_name, context.main_user)
+            print(f"    $ {shlex.join(bare_arguments)}", flush=True)
+            bare_log = context.root / f"bare-hold-up-{attempt}.log"
+            with bare_log.open("w", encoding="utf-8") as stream:
+                up = subprocess.Popen(
+                    bare_arguments,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=context.root,
+                    env=start_environment,
+                )
+            try:
+                leader = 0
+                deadline = time.monotonic() + START_TIMEOUT
+                while not leader and up.poll() is None:
+                    if time.monotonic() > deadline:
+                        raise E2EFailure("The container did not register")
+                    leader = _machined_leader(context.main_name)
+                if not leader:
+                    raise E2EFailure(f"up exited {up.returncode} before registration")
+                pidfd = _open_scope_process(leader, unit)
+                try:
+                    signal.pidfd_send_signal(pidfd, signal.SIGSTOP)
+                    try:
+                        deadline = time.monotonic() + HOLD_STOP_TIMEOUT
+                        while _process_state(leader) != "T":
+                            if time.monotonic() > deadline:
+                                raise E2EFailure("The Leader did not stop")
+                            time.sleep(0.01)
+                        if not _has_payload(leader):
+                            held_in = attempt
+                            _wait_for_cgroup(leader, f"/{SLICE}/{unit}/payload")
+                            if pending.exists():
+                                raise E2EFailure(
+                                    "up made a mounts-pending marker with no "
+                                    "directory to mount"
+                                )
+                            refused = _exec(
+                                context,
+                                f"touch /home/{context.main_user}/{marker_name}",
+                                expected=ENTRY_FAILURE,
+                            )
+                            assert_contains(refused, "Container is still starting")
+                            if marker.exists():
+                                raise E2EFailure("The command ran before the payload")
+                            if _has_payload(leader):
+                                raise E2EFailure("The held Leader started its payload")
+                    finally:
+                        try:
+                            signal.pidfd_send_signal(pidfd, signal.SIGCONT)
+                        except ProcessLookupError:
+                            pass
+                finally:
+                    os.close(pidfd)
+                returncode = up.wait(timeout=START_TIMEOUT)
+            finally:
+                if up.poll() is None:
+                    up.kill()
+                    up.wait(timeout=10)
+            output = bare_log.read_text(encoding="utf-8", errors="replace")
+            if returncode != 0:
+                raise E2EFailure(
+                    f"up -d exited {returncode} after the hold: {output[-2000:]}"
+                )
+            for name in missing:
+                if f"Could not find '{name}'" not in output:
+                    raise E2EFailure(f"up did not skip {name}: {output[-2000:]}")
+            if held_in:
+                break
+        if not held_in:
+            raise E2EFailure(
+                f"The payload existed at the stop in all {HOLD_ATTEMPTS} starts"
+            )
+        print(f"    held in the payload cgroup in start {held_in}", flush=True)
+        context.wait_for_machine(context.main_name, running=True)
+        # The next cases need the main container with its directories.
+        context.stop_container(context.main_name, context.main_user)
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "lenient"],
+            name=context.main_name,
+            user=context.main_user,
+            timeout=START_TIMEOUT,
+        )
+        _exec_when_mounted(context, "true")
+
+    with context.case("an attach finds the payload among many adopted orphans"):
+        # The Leader adopts the orphans of its container while the session
+        # that made them runs. With 1000 orphans the Leader's child list takes
+        # more than one read chunk; the payload stays its first entry, because
+        # the kernel adds an adopted orphan at the end, and an attach works.
+        # A test VM cannot hold enough processes for a list above the old
+        # 1 MiB limit; the unit tests of the payload search cover that size.
+        leader_now = int(context.machine_leader(context.main_name) or 0)
+        if not leader_now:
+            raise E2EFailure("The main container is not running")
+        session = _Session(
+            context,
+            f"for i in $(seq {ADOPTED_ORPHANS}); do "
+            "(sleep 3333 </dev/null >/dev/null 2>&1 &); done; sleep 300",
+        )
+        try:
+            deadline = time.monotonic() + START_TIMEOUT
+            while True:
+                children = _children(leader_now)
+                orphans = [
+                    child for child in children if _cmdline(child) == ORPHAN_COMMAND
+                ]
+                if len(orphans) >= ADOPTED_ORPHANS:
+                    break
+                if session.process.poll() is not None:
+                    raise E2EFailure("The session ended before its orphans existed")
+                if time.monotonic() > deadline:
+                    raise E2EFailure(f"Only {len(orphans)} orphans reached the Leader")
+                time.sleep(0.1)
+            listing = Path(f"/proc/{leader_now}/task/{leader_now}/children")
+            size = len(listing.read_bytes())
+            if size <= sandy.PROC_READ_CHUNK_BYTES:
+                raise E2EFailure(f"The Leader's child list has only {size} bytes")
+            if not _is_payload(children[0], leader_now):
+                raise E2EFailure("The payload is not the Leader's first child")
+            print(f"    {len(children)} children, {size} bytes", flush=True)
+            _exec(context, "true")
+        finally:
+            session.process.terminate()
+            session.finish()
+        # The end of the session kills its leaf, and the orphans in it.
+        deadline = time.monotonic() + ORPHANS_GONE_TIMEOUT
+        while any(_cmdline(child) == ORPHAN_COMMAND for child in _children(leader_now)):
+            if time.monotonic() > deadline:
+                raise E2EFailure("The orphans outlived their session")
+            time.sleep(0.1)
+
+    with context.case("the keepalive files stay until the payload opened its script"):
+        # Review finding S2: up removed the keepalive files as soon as an
+        # attach worked, before the payload had started the keepalive. Hold
+        # the payload at its fork, before execve: an attach works, and up
+        # must wait and keep the files. Then release it.
+        unit = f"sandy-{context.main_name}.scope"
+        # sandy gets no TMPDIR from the E2E environment.
+        tmp = Path("/tmp")
+        held_in = 0
+        for attempt in range(1, HOLD_ATTEMPTS + 1):
+            context.stop_container(context.main_name, context.main_user)
+            print(f"    $ {shlex.join(up_arguments)}", flush=True)
+            keepalive_log = context.root / f"keepalive-up-{attempt}.log"
+            with keepalive_log.open("w", encoding="utf-8") as stream:
+                up = subprocess.Popen(
+                    up_arguments,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    cwd=context.root,
+                    env=start_environment,
+                )
+            try:
+                leader = 0
+                deadline = time.monotonic() + START_TIMEOUT
+                while not leader and up.poll() is None:
+                    if time.monotonic() > deadline:
+                        raise E2EFailure("The container did not register")
+                    leader = _machined_leader(context.main_name)
+                if not leader:
+                    raise E2EFailure(f"up exited {up.returncode} before registration")
+                pidfd = _open_scope_process(leader, unit)
+                try:
+                    payload = _hold_payload_at_fork(sandy, leader, pidfd)
+                finally:
+                    os.close(pidfd)
+                if payload:
+                    held_in = attempt
+                    try:
+                        # The readiness probe of up is an attach too. It needs the
+                        # mounts, which up makes while the payload is held.
+                        _exec_when_mounted(context, "true")
+                        time.sleep(KEEPALIVE_HOLD_SECONDS)
+                        if up.poll() is not None:
+                            raise E2EFailure(
+                                "up returned before the payload opened its script"
+                            )
+                        held_dirs = sorted(tmp.glob(KEEPALIVE_DIR_GLOB))
+                        if len(held_dirs) != 1:
+                            raise E2EFailure(
+                                f"Keepalive directories while held: {held_dirs!r}"
+                            )
+                    finally:
+                        sandy._ptrace_detach(payload)
+                returncode = up.wait(timeout=START_TIMEOUT)
+            finally:
+                if up.poll() is None:
+                    up.kill()
+                    up.wait(timeout=10)
+            if returncode != 0:
+                output = keepalive_log.read_text(encoding="utf-8", errors="replace")
+                raise E2EFailure(f"up -d exited {returncode}: {output[-2000:]}")
+            if held_in:
+                break
+        if not held_in:
+            raise E2EFailure(
+                f"The payload existed at the seize in all {HOLD_ATTEMPTS} starts"
+            )
+        print(f"    held the payload at its fork in start {held_in}", flush=True)
+        context.wait_for_machine(context.main_name, running=True)
+        new_leader = context.machine_leader(context.main_name)
+        if new_leader is None:
+            raise E2EFailure("The container stopped after the payload was released")
+        comm = Path(f"/proc/{_payload_pid(int(new_leader))}/comm").read_text()
+        if comm.strip() != "sandy-keepalive":
+            raise E2EFailure(f"Payload comm is {comm.strip()!r}")
+        leftovers = sorted(tmp.glob(KEEPALIVE_DIR_GLOB))
+        if leftovers:
+            raise E2EFailure(f"Keepalive directories remain: {leftovers!r}")
+        _exec(context, "true")
