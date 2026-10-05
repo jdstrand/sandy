@@ -17822,6 +17822,41 @@ class StartFailureTests(unittest.TestCase):
             "W: The supervisor of 'ai-dev' did not stop (PID 4242)\n",
         )
 
+    def test_stop_failed_start_warns_then_removes_the_ports(self):
+        # With the default limits, the stop also gives up after SIGKILL: it
+        # gives the warning, and then it removes the port rules. Mocks: the
+        # supervisor, which does not end, and the port cleanup, which
+        # records the output that came before it.
+        instance = make_sandy()
+        manager = MagicMock()
+        manager.supervisor.pid = 4242
+        manager.supervisor.poll.return_value = None
+        manager.supervisor.wait.side_effect = subprocess.TimeoutExpired(
+            ["systemd-run"], sandy.CONTAINER_STOP_TIMEOUT
+        )
+        output_before_cleanup: list[str] = []
+        with captured_output() as (stdout, _):
+            manager.cleanup.side_effect = lambda _container: (
+                output_before_cleanup.append(stdout.getvalue())
+            )
+            with patch.object(
+                instance, "_cleanup_port_mappings_for_container", manager.cleanup
+            ):
+                instance._stop_failed_start(manager.supervisor)
+        self.assertEqual(
+            manager.mock_calls[1:],
+            [
+                call.supervisor.terminate(),
+                call.supervisor.wait(timeout=sandy.CONTAINER_STOP_TIMEOUT),
+                call.supervisor.kill(),
+                call.supervisor.wait(timeout=sandy.CONTAINER_POWEROFF_TIMEOUT),
+                call.cleanup("ai-dev"),
+            ],
+        )
+        warning = "W: The supervisor of 'ai-dev' did not stop (PID 4242)\n"
+        self.assertEqual(output_before_cleanup, [warning])
+        self.assertEqual(stdout.getvalue(), warning)
+
     def test_stop_failed_start_can_leave_the_ports(self):
         # A caller that removed the ports in the hold of the publish stops the
         # supervisor after the release. Mocks: the supervisor and the cleanup.
