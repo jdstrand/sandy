@@ -15406,6 +15406,124 @@ class RunUpTests(unittest.TestCase):
                     output,
                 )
 
+    def send_sigint(self, *_args: object, **_kwargs: object) -> None:
+        """Send a real SIGINT to this process, as a Ctrl-C does.
+
+        Each test catches each exception and checks its type: a stray
+        KeyboardInterrupt would end the whole test run, not one test.
+        """
+        os.kill(os.getpid(), sandy.signal.SIGINT)
+
+    def test_a_ctrl_c_right_after_the_start_stops_the_supervisor(self):
+        # Regression test: a Ctrl-C after the start of the supervisor and
+        # before the try that stops it (here in the restore of the OOM score
+        # adjustment) left the supervisor running. Now up holds it back until
+        # the try after the start, which stops the supervisor. Mocks: as in
+        # up_mocks; the restore sends a real SIGINT to this process.
+        instance = make_sandy()
+        instance.workspace = None
+        handler = sandy.signal.getsignal(sandy.signal.SIGINT)
+
+        @contextmanager
+        def oom_score_adj(_value: object) -> Iterator[None]:
+            try:
+                yield
+            finally:
+                self.send_sigint()
+
+        self.oom_score_adj.side_effect = oom_score_adj
+        with tempfile.TemporaryDirectory() as machine:
+            with self.up_mocks(instance, machine) as mocks:
+                with captured_output():
+                    with self.assertRaises(BaseException) as raised:
+                        instance.run_up(self.arguments(detach=False))
+        self.assertIsInstance(raised.exception, KeyboardInterrupt)
+        mocks.stop.assert_called_once_with(mocks.popen.return_value)
+        self.create_marker.assert_called_once()
+        self.exec.assert_not_called()
+        self.assertIs(sandy.signal.getsignal(sandy.signal.SIGINT), handler)
+
+    def test_a_ctrl_c_during_the_stop_of_a_failed_pin_does_not_cut_it(self):
+        # Regression test: a Ctrl-C while up handled a failed pin (here in
+        # the stop) cut the handling short, and up ended with a traceback in
+        # place of its error. Now the steps run to their end, and up exits 1
+        # with the error. Mocks: as in up_mocks; the pin fails, and the stop
+        # sends a real SIGINT to this process.
+        instance = make_sandy()
+        instance.workspace = None
+        handler = sandy.signal.getsignal(sandy.signal.SIGINT)
+        self.pin_supervisor.side_effect = OSError(errno.ESRCH, "No such process")
+        with tempfile.TemporaryDirectory() as machine:
+            with self.up_mocks(instance, machine) as mocks:
+                mocks.stop.side_effect = self.send_sigint
+                with captured_output() as (stdout, _):
+                    with self.assertRaises(BaseException) as raised:
+                        instance.run_up(self.arguments(detach=True))
+        self.assertIsInstance(raised.exception, SystemExit)
+        assert isinstance(raised.exception, SystemExit)
+        self.assertEqual(raised.exception.code, 1)
+        mocks.stop.assert_called_once_with(mocks.popen.return_value, **LOCKED_STOP)
+        self.assertIn(
+            "E: Container 'ai-dev' did not start: '[Errno 3] No such process'\n",
+            stdout.getvalue(),
+        )
+        self.assertIs(sandy.signal.getsignal(sandy.signal.SIGINT), handler)
+
+    def test_a_ctrl_c_before_the_console_ends_the_console(self):
+        # Regression test: a Ctrl-C after the container was ready and before
+        # its console (here in the close of the up lock) ended up with the
+        # container running and its up-console marker, so it never stopped.
+        # Now up holds the SIGINT back until the console has started, where
+        # it ends the console. Mocks: as in up_mocks; the close of the up lock
+        # sends a real SIGINT to this process, and the console releases the
+        # held SIGINT, as _exec does at its start.
+        instance = make_sandy()
+        instance.workspace = None
+        handler = sandy.signal.getsignal(sandy.signal.SIGINT)
+        self.up_lock.close.side_effect = self.send_sigint
+
+        def console(*_args: object, sigint: object = None, **_kwargs: object) -> int:
+            assert isinstance(sigint, sandy._DeferredSigint)
+            sandy._DeferredSigint.release(sigint)
+            return 0
+
+        self.exec.side_effect = console
+        with tempfile.TemporaryDirectory() as machine:
+            with self.up_mocks(instance, machine) as mocks:
+                with captured_output():
+                    with self.assertRaises(BaseException) as raised:
+                        instance.run_up(self.arguments(detach=False))
+        self.assertIsInstance(raised.exception, KeyboardInterrupt)
+        self.exec.assert_called_once()
+        mocks.stop.assert_not_called()
+        self.assertIs(sandy.signal.getsignal(sandy.signal.SIGINT), handler)
+
+    def test_a_failed_cleanup_after_the_start_gives_back_sigint(self):
+        # A cleanup step after a good start can fail while up holds SIGINT
+        # back. Then up ends with that error, and SIGINT has its handler
+        # again. Mocks: as in up_mocks; the close of the pinned pidfd closes
+        # it, and then fails.
+        instance = make_sandy()
+        instance.workspace = None
+        handler = sandy.signal.getsignal(sandy.signal.SIGINT)
+        real_close = os.close
+
+        def close(fd: int) -> None:
+            real_close(fd)
+            if self.pinned and fd == self.pinned[-1].pidfd:
+                raise OSError(errno.EBADF, "Bad file descriptor")
+
+        with tempfile.TemporaryDirectory() as machine:
+            with self.up_mocks(instance, machine), patch.object(
+                sandy.os, "close", side_effect=close
+            ):
+                with captured_output():
+                    with self.assertRaises(OSError) as raised:
+                        instance.run_up(self.arguments(detach=False))
+        self.assertEqual(raised.exception.errno, errno.EBADF)
+        self.exec.assert_not_called()
+        self.assertIs(sandy.signal.getsignal(sandy.signal.SIGINT), handler)
+
     def test_up_stops_when_the_port_mapping_lock_stays_busy(self):
         # Regression test: up waited for the port mapping lock without a limit
         # while it held the lifecycle lock, so each attach failed after
@@ -15636,7 +15754,12 @@ class RunUpTests(unittest.TestCase):
                         with self.assertRaises(SystemExit) as exited:
                             instance.run_up(self.arguments(detach=False))
                         self.assertEqual(exited.exception.code, expected)
-                self.exec.assert_called_once_with(None, login_shell=True, console=True)
+                self.exec.assert_called_once_with(
+                    None, login_shell=True, console=True, sigint=ANY
+                )
+                self.assertIsInstance(
+                    self.exec.call_args.kwargs["sigint"], sandy._DeferredSigint
+                )
 
     def test_rejects_ports_with_host_network(self):
         instance = make_sandy()
@@ -15868,7 +15991,12 @@ class RunUpTests(unittest.TestCase):
         init.assert_called_once_with(network_mode="lenient")
         # The console is an attach. _exec applies the last-attach rule, and
         # the stop removes the port forwarding rules.
-        self.exec.assert_called_once_with(None, login_shell=True, console=True)
+        self.exec.assert_called_once_with(
+            None, login_shell=True, console=True, sigint=ANY
+        )
+        self.assertIsInstance(
+            self.exec.call_args.kwargs["sigint"], sandy._DeferredSigint
+        )
         # The pending marker and the console marker exist before the lock is
         # released, in that order. The port mapping lock is held from the
         # publish until the supervisor is pinned with its markers.
@@ -18194,6 +18322,31 @@ class AttachLifecycleTests(unittest.TestCase):
                     else:
                         rule.assert_not_called()
 
+    def test_the_console_ends_at_once_on_a_held_ctrl_c(self):
+        # up holds a Ctrl-C back from the end of its start until the console
+        # has started. It ends the console there, before the query, and that
+        # is a console exit. Mocks: the query and the last-attach rule; the
+        # SIGINT is real.
+        instance = make_sandy()
+        handler = sandy.signal.getsignal(sandy.signal.SIGINT)
+        self.addCleanup(sandy.signal.signal, sandy.signal.SIGINT, handler)
+        held = sandy._DeferredSigint()
+        held.hold()
+        try:
+            os.kill(os.getpid(), sandy.signal.SIGINT)
+            sandy.time.sleep(0)
+        except KeyboardInterrupt:
+            self.fail("The SIGINT was not held back")
+        with patch.object(instance, "_is_container_running") as running, patch.object(
+            instance, "_stop_if_last_attach"
+        ) as rule:
+            with self.assertRaises(BaseException) as raised:
+                instance._exec(None, login_shell=True, console=True, sigint=held)
+        self.assertIsInstance(raised.exception, KeyboardInterrupt)
+        running.assert_not_called()
+        rule.assert_called_once_with(console=True)
+        self.assertIs(sandy.signal.getsignal(sandy.signal.SIGINT), handler)
+
     def test_up_console_exit_and_hangup_end_the_console_once(self):
         # Mocks: as above. A normal exit is one console exit. A hangup only
         # removes the marker, so no stop follows it.
@@ -18229,6 +18382,81 @@ class AttachLifecycleTests(unittest.TestCase):
                         pass
                 self.assertEqual(rule.call_args_list, rule_calls)
                 self.assertEqual(end.call_count, end_calls)
+
+
+class DeferredSigintTests(unittest.TestCase):
+    """A SIGINT held back in a short section of up.
+
+    Each test sends a real SIGINT to this process; the held section records
+    it. The handler of SIGINT is the same after each test.
+    """
+
+    def setUp(self):
+        self.handler = signal_handler = sandy.signal.getsignal(sandy.signal.SIGINT)
+        self.addCleanup(sandy.signal.signal, sandy.signal.SIGINT, signal_handler)
+
+    def send_sigint(self) -> None:
+        """Send a SIGINT that the section must hold back.
+
+        A KeyboardInterrupt here would end the whole test run, so it fails
+        this test.
+        """
+        try:
+            os.kill(os.getpid(), sandy.signal.SIGINT)
+            # Let the handler of the signal run here.
+            sandy.time.sleep(0)
+        except KeyboardInterrupt:
+            self.fail("The SIGINT was not held back")
+
+    def test_a_held_sigint_acts_at_the_release(self):
+        held = sandy._DeferredSigint()
+        held.hold()
+        self.send_sigint()
+        # Nothing happens until the release.
+        with self.assertRaises(KeyboardInterrupt):
+            held.release()
+        self.assertIs(sandy.signal.getsignal(sandy.signal.SIGINT), self.handler)
+        # A second release does nothing.
+        held.release()
+
+    def test_a_release_with_no_sigint_or_with_discard_raises_nothing(self):
+        for discard in (False, True):
+            with self.subTest(discard=discard):
+                held = sandy._DeferredSigint()
+                held.hold()
+                held.hold()
+                if discard:
+                    self.send_sigint()
+                held.release(discard=discard)
+                self.assertIs(sandy.signal.getsignal(sandy.signal.SIGINT), self.handler)
+
+    def test_an_ignored_sigint_stays_ignored(self):
+        sandy.signal.signal(sandy.signal.SIGINT, sandy.signal.SIG_IGN)
+        held = sandy._DeferredSigint()
+        held.hold()
+        self.send_sigint()
+        held.release()
+        self.assertEqual(
+            sandy.signal.getsignal(sandy.signal.SIGINT), sandy.signal.SIG_IGN
+        )
+
+    def test_another_thread_holds_nothing(self):
+        # Only the main thread can change a handler.
+        held = sandy._DeferredSigint()
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                held.hold()
+                held.release()
+            except BaseException as exc:  # the test reports each error
+                errors.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(10)
+        self.assertEqual(errors, [])
+        self.assertIs(sandy.signal.getsignal(sandy.signal.SIGINT), self.handler)
 
 
 class OomReportTests(unittest.TestCase):

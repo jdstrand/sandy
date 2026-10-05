@@ -572,6 +572,46 @@ class _MachineQueryError(subprocess.SubprocessError):
         self.machine_name = machine_name
 
 
+class _DeferredSigint:
+    """Hold back SIGINT in a section whose steps must stay together.
+
+    While held, a SIGINT only records itself. release() puts the previous
+    handler back and, when a SIGINT came meanwhile, runs that handler: the
+    KeyboardInterrupt then comes at release(), inside a try that handles it.
+    A child that execve starts gets the default action, as without the hold
+    (a blocked signal mask would stay blocked in the child). Only the main
+    thread can change a handler, so in another thread nothing is held.
+    """
+
+    def __init__(self) -> None:
+        self._previous: Any = None
+        self._held = False
+        self._pending = False
+
+    def hold(self) -> None:
+        """Start to hold back SIGINT, when it is not held yet."""
+        if self._held or threading.current_thread() is not threading.main_thread():
+            return
+        self._pending = False
+        previous = signal.signal(signal.SIGINT, self._record)
+        self._previous = signal.SIG_DFL if previous is None else previous
+        self._held = True
+
+    def _record(self, signum: int, frame: Any) -> None:
+        _ = signum, frame
+        self._pending = True
+
+    def release(self, discard: bool = False) -> None:
+        """Stop to hold back SIGINT; act on a held one unless discard."""
+        if not self._held:
+            return
+        signal.signal(signal.SIGINT, self._previous)
+        self._held = False
+        pending, self._pending = self._pending, False
+        if pending and not discard and callable(self._previous):
+            self._previous(signal.SIGINT, None)
+
+
 @contextmanager  # installs and restores the hangup handlers around an attach
 def _attach_hangup_handlers() -> Iterator[None]:
     """Turn SIGHUP and SIGTERM into _AttachHangup in the main thread.
@@ -8204,13 +8244,15 @@ class Sandy:
         *,
         login_shell: bool = False,
         console: bool = False,
+        sigint: Optional[_DeferredSigint] = None,
     ) -> int:
         """Run a command or a login shell in the container as self.user.
 
         The entry helper applies the container payload's seccomp filters and
         capability bounding set. When login_shell is True, spawn a single
         interactive login shell so that startup files execute only once
-        (mirrors `ssh -tt` behaviour).
+        (mirrors `ssh -tt` behaviour). up passes the SIGINT that it holds
+        back; a Ctrl-C held meanwhile ends the console here.
         """
         # With console=True, this is the console of up without -d. Each way
         # out ends the console: a hangup only removes the up-console marker,
@@ -8219,6 +8261,8 @@ class Sandy:
         # after its last attach.
         console_ended = not console
         try:
+            if sigint is not None:
+                sigint.release()
             container_environment = _container_environment(self.user, self.user_home)
 
             leader = self._is_container_running()
@@ -9375,6 +9419,12 @@ class Sandy:
 
         # The supervisor that this run starts, pinned until up returns.
         pinned: Optional[PinnedSupervisor] = None
+        # A Ctrl-C between the start of the supervisor and a try that stops it
+        # left the container running. So up holds back SIGINT from the start
+        # until the try after the start, and from the end of that try until
+        # the console has started (see _exec). The waits in between stay
+        # open to a Ctrl-C.
+        sigint = _DeferredSigint()
         try:
             # The mount targets and the image user's ids, before any change of
             # the network.
@@ -9618,6 +9668,12 @@ class Sandy:
                                 end="",
                                 flush=True,
                             )
+                            # From the start until the try after the pin, a
+                            # Ctrl-C must not cut the steps apart: one that
+                            # comes meanwhile acts at the start of that try,
+                            # whose handler stops the supervisor. A failure
+                            # in between runs its stop to the end.
+                            sigint.hold()
                             try:
                                 # The container inherits the OOM score
                                 # adjustment.
@@ -9715,6 +9771,9 @@ class Sandy:
                     _write_held_output(held_output)
                     raise
             try:
+                # A Ctrl-C since the start acts here, so the handlers below
+                # stop the container.
+                sigint.release()
                 # The output of the start, which up held back while it held
                 # the port mapping lock. A write error stops the container
                 # below, as it does for each later write.
@@ -9752,6 +9811,12 @@ class Sandy:
                     sys.exit(1)
                 _finish_spinner_line(spinner_line_event, suffix=" done")
                 self._run_init_script(network_mode=args.network)
+                # The container is ready. Hold back a Ctrl-C again until the
+                # console has started, or up -d returns: a Ctrl-C in the
+                # cleanup below then ends the console, which stops the
+                # container. Without it, the up-console marker kept the
+                # container running.
+                sigint.hold()
             except _EntrySetupError as exc:
                 _finish_spinner_line(spinner_line_event)
                 print(
@@ -9768,27 +9833,40 @@ class Sandy:
             except BaseException:
                 self._stop_failed_start(supervisor)
                 raise
+        except BaseException:
+            # up fails, so a held Ctrl-C has nothing more to stop.
+            sigint.release(discard=True)
+            raise
         finally:
             try:
-                cleanup_init_bind()
-            finally:
                 try:
-                    cleanup_keepalive()
+                    cleanup_init_bind()
                 finally:
                     try:
-                        close_runtime_fds()
+                        cleanup_keepalive()
                     finally:
-                        if pinned is not None:
-                            os.close(pinned.pidfd)
+                        try:
+                            close_runtime_fds()
+                        finally:
+                            if pinned is not None:
+                                os.close(pinned.pidfd)
+            except BaseException:
+                sigint.release(discard=True)
+                raise
 
-        # The container is ready, so another up of the name now finds it. On
-        # an error, the lock stays until up exits, after its cleanup.
-        up_lock.close()
-        if args.detach:
-            return
-        # The console is one more attach. When it exits, the container stops
-        # unless another attach is still running.
-        status = self._exec(None, login_shell=True, console=True)
+        try:
+            # The container is ready, so another up of the name now finds it.
+            # On an error, the lock stays until up exits, after its cleanup.
+            up_lock.close()
+            if args.detach:
+                # A Ctrl-C after the start acts now; the container stays.
+                sigint.release()
+                return
+            # The console is one more attach. When it exits, the container
+            # stops unless another attach is still running.
+            status = self._exec(None, login_shell=True, console=True, sigint=sigint)
+        finally:
+            sigint.release(discard=True)
         _raise_for_container_status(status)
 
     def _existing_container_error(self) -> Optional[str]:
