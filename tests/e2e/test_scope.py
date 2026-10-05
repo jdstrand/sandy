@@ -23,6 +23,7 @@ from pathlib import Path
 
 from tests.e2e.support import (
     ADDRESSES_LOCK,
+    BACKGROUND_UP_TIMEOUT,
     LIFECYCLE_LOCK,
     PORT_LOCK,
     PORT_STATE,
@@ -34,8 +35,10 @@ from tests.e2e.support import (
     CommandResult,
     E2EContext,
     E2EFailure,
+    StoppableTerminal,
     assert_contains,
     assert_not_contains,
+    has_open_file,
     holds_flock,
     waits_for_flock,
 )
@@ -665,6 +668,65 @@ def _up_while_its_scope_appears(
     )
 
 
+@contextmanager
+def _up_with_its_terminal_stopped(
+    context: E2EContext, name: str, arguments: list[str]
+) -> Iterator[tuple[subprocess.Popen[bytes], StoppableTerminal]]:
+    """Run up of name on a terminal, and stop its output while up waits for
+    the lifecycle lock.
+
+    Hold the lock until up has opened the lock file: up does so after its
+    last line before the lock, and then tries the lock again every 0.05 s
+    for 10 s. Then type the STOP character, and release the lock: each
+    write of up after that blocks until the case starts the output again.
+    Yield up and the terminal; add the output of up to each E2EFailure, and
+    at the end, kill up if it still runs.
+    """
+    command = [
+        str(SANDY),
+        "--workspace",
+        context.workspace.name,
+        "--shared",
+        context.shared.name,
+        "--container",
+        name,
+        *arguments,
+    ]
+    up: subprocess.Popen[bytes] | None = None
+    with StoppableTerminal() as terminal:
+        try:
+            with LIFECYCLE_LOCK.open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                print(f"    $ {shlex.join(command)} &", flush=True)
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=terminal.slave,
+                    stderr=terminal.slave,
+                    cwd=context.root,
+                    env=context.safe_environment(),
+                )
+                up = process
+
+                def waits_for_the_lock() -> bool:
+                    if process.poll() is not None:
+                        raise E2EFailure(f"up exited {process.returncode}")
+                    return has_open_file(process.pid, LIFECYCLE_LOCK)
+
+                _wait_for("up waits for the lifecycle lock", waits_for_the_lock)
+                terminal.stop()
+            # The close released the lock; up takes it now.
+            yield process, terminal
+        except E2EFailure as exc:
+            raise E2EFailure(
+                f"{exc}\nOutput of up: {terminal.output()[-2000:]!r}"
+            ) from None
+        finally:
+            if up is not None and up.poll() is None:
+                up.kill()
+                up.wait(timeout=10)
+
+
 def test_main(context: E2EContext) -> None:
     """Prove the scope, keepalive, attach, and lifecycle design."""
     name = context.main_name
@@ -1202,6 +1264,46 @@ def test_main(context: E2EContext) -> None:
                 raise E2EFailure(f"No {line!r} in: {output[-2000:]}")
         if not context.machine_running(second):
             raise E2EFailure("The container stopped, so the case tested nothing")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("up writes nothing to its terminal under the lifecycle lock"):
+        # Regression test: up wrote the "Starting" line to its terminal while
+        # it held the lifecycle lock. A write to a stopped terminal (Ctrl-S)
+        # blocks, so up kept the lock, and each attach, to any container,
+        # failed after 10 s. Stop the terminal of up -d, which takes the lock
+        # because it mounts directories, while up waits for the lock: up must
+        # start the container and free the lock while its terminal is
+        # stopped, and an attach to another container must work. When the
+        # terminal starts again, up must end as usual.
+        if not context.machine_running(name):
+            raise E2EFailure(f"The other container {name} is not running")
+        with _up_with_its_terminal_stopped(
+            context, second, ["up", "--detach", "--persistent", "--network", "host"]
+        ) as (up, terminal):
+            before = terminal.output()
+            _wait_for(
+                "up starts the container and frees the lifecycle lock",
+                lambda: _show(context, second, "ActiveState") == "active"
+                and not holds_flock(up.pid, LIFECYCLE_LOCK),
+            )
+            attached = context.sandy(["exec", "--", "true"], name=name, expected=None)
+            if attached.returncode != 0:
+                raise E2EFailure(
+                    f"An attach to {name} failed while the terminal of up was "
+                    f"stopped: {attached.output[-2000:]}"
+                )
+            # up still waits to write: the case tested a stopped terminal.
+            if up.poll() is not None or not terminal.stopped():
+                raise E2EFailure(f"up did not wait to write: {terminal.output()}")
+            if terminal.output() != before:
+                raise E2EFailure(f"Output came while stopped: {terminal.output()}")
+            terminal.start()
+            returncode = up.wait(timeout=BACKGROUND_UP_TIMEOUT)
+            output = terminal.output()
+        if returncode != 0:
+            raise E2EFailure(f"up exited {returncode}: {output[-2000:]}")
+        assert_contains_text(output, f"I: Starting '{second}' in detached state")
         context.sandy(["down"], name=second)
         _wait_stopped(context, second)
 

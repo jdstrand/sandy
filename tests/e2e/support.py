@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -17,6 +18,8 @@ import socket
 import stat
 import subprocess
 import tempfile
+import termios
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -51,6 +54,11 @@ PERSISTENT_FILES = (*PERSISTENT_LOCKS, SHARED_LIMITS)
 # of sandy); it gets to the lock in a few.
 LIFECYCLE_WAIT_TIMEOUT = 60
 BACKGROUND_UP_TIMEOUT = 120
+# The default STOP and START characters of a terminal (Ctrl-S, Ctrl-Q), and
+# the time that the kernel gets to act on them.
+STOP_CHARACTER = b"\x13"
+START_CHARACTER = b"\x11"
+TERMINAL_FLOW_TIMEOUT = 10
 # The up lock of a container name (_acquire_up_lock of sandy). Sandy never
 # removes one either.
 UP_LOCK_PATTERN = re.compile(r"up-[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\.lock")
@@ -245,6 +253,120 @@ def holds_flock(pid: int, path: Path) -> bool:
         ):
             return True
     return False
+
+
+def has_open_file(pid: int, path: Path) -> bool:
+    """Return True when process pid has a descriptor of the file at path.
+
+    sandy waits for the lifecycle lock with LOCK_NB retries, so /proc/locks
+    shows no waiter; it opens the lock file just before the first try.
+    """
+    target = path.stat()
+    try:
+        names = os.listdir(f"/proc/{pid}/fd")
+    except FileNotFoundError:
+        return False
+    for name in names:
+        try:
+            info = os.stat(f"/proc/{pid}/fd/{name}")
+        except OSError:
+            # The descriptor closed meanwhile.
+            continue
+        if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
+            return True
+    return False
+
+
+class StoppableTerminal:
+    """A pty for the output of a process, which a case can stop.
+
+    The process writes to slave. A thread reads master, so the output does
+    not fill the pty, and output() returns what came so far. stop() types
+    the STOP character: with IXON set, each write to slave then blocks in the
+    kernel until start() types the START character. A stopped pty has no
+    write room, so a poll of slave shows the state without a write.
+    """
+
+    def __init__(self) -> None:
+        self.master, self.slave = os.openpty()
+        try:
+            attributes = termios.tcgetattr(self.slave)
+            attributes[0] = (attributes[0] | termios.IXON) & ~termios.IXANY
+            attributes[6][termios.VSTOP] = STOP_CHARACTER
+            attributes[6][termios.VSTART] = START_CHARACTER
+            termios.tcsetattr(self.slave, termios.TCSANOW, attributes)
+        except BaseException:
+            os.close(self.slave)
+            os.close(self.master)
+            raise
+        self._chunks: list[bytes] = []
+        self._chunks_lock = threading.Lock()
+        self._closing = threading.Event()
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
+
+    def __enter__(self) -> StoppableTerminal:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _read(self) -> None:
+        poller = select.poll()
+        poller.register(self.master, select.POLLIN)
+        # Poll with a timeout, so that close() ends this thread before it
+        # closes master.
+        while not self._closing.is_set():
+            if not poller.poll(100):
+                continue
+            try:
+                chunk = os.read(self.master, 4096)
+            except OSError:
+                # EIO: no descriptor of slave is open.
+                return
+            if not chunk:
+                return
+            with self._chunks_lock:
+                self._chunks.append(chunk)
+
+    def output(self) -> str:
+        with self._chunks_lock:
+            return b"".join(self._chunks).decode("utf-8", errors="replace")
+
+    def stopped(self) -> bool:
+        """Return True when a write to slave blocks: the output is stopped."""
+        poller = select.poll()
+        poller.register(self.slave, select.POLLOUT)
+        return not poller.poll(0)
+
+    def stop(self) -> None:
+        """Type the STOP character, and wait until the output stops."""
+        self._type(STOP_CHARACTER, stopped=True)
+
+    def start(self) -> None:
+        """Type the START character, and wait until the output starts."""
+        self._type(START_CHARACTER, stopped=False)
+
+    def _type(self, character: bytes, *, stopped: bool) -> None:
+        os.write(self.master, character)
+        # A kernel worker handles the typed character a little later.
+        deadline = time.monotonic() + TERMINAL_FLOW_TIMEOUT
+        while self.stopped() != stopped:
+            if time.monotonic() >= deadline:
+                state = "stop" if stopped else "start"
+                raise E2EFailure(f"The output of the terminal did not {state}")
+            time.sleep(0.05)
+
+    def close(self) -> None:
+        """Close slave, end the reader, and close master."""
+        self._closing.set()
+        if self.slave >= 0:
+            os.close(self.slave)
+            self.slave = -1
+        self._reader.join(timeout=TERMINAL_FLOW_TIMEOUT)
+        if self.master >= 0:
+            os.close(self.master)
+            self.master = -1
 
 
 def up_temporary_directories() -> list[Path]:

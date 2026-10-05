@@ -12,7 +12,9 @@ import socket
 import stat
 import subprocess
 import tempfile
+import termios
 import threading
+import time
 import unittest
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, closing, contextmanager
@@ -2539,6 +2541,110 @@ class MountCaseHelperTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(E2EFailure, "did not go"):
                 test_mounts._wait_scope_gone(fake_context(), "e2e-x")
+
+
+class HasOpenFileTests(unittest.TestCase):
+    """Mocks: nothing, except /proc where a test says so; this process and
+    its own files."""
+
+    def test_an_open_descriptor_of_the_file_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lock"
+            path.touch()
+            self.assertFalse(support.has_open_file(os.getpid(), path))
+            with path.open("rb"):
+                self.assertTrue(support.has_open_file(os.getpid(), path))
+            # A new file at the same path is another inode.
+            with path.open("rb"):
+                path.unlink()
+                path.touch()
+                self.assertFalse(support.has_open_file(os.getpid(), path))
+
+    def test_a_process_that_is_gone_has_no_file(self):
+        # Mocks: the listing of /proc/<pid>/fd fails as for an ended process.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lock"
+            path.touch()
+            with path.open("rb"), patch.object(
+                support.os, "listdir", side_effect=FileNotFoundError
+            ):
+                self.assertFalse(support.has_open_file(os.getpid(), path))
+
+    def test_a_descriptor_that_closes_meanwhile_is_skipped(self):
+        # Mocks: each stat of /proc/<pid>/fd/<n> fails, as for a descriptor
+        # that closed after the listing.
+        real_stat = os.stat
+
+        def stat(
+            name: str | os.PathLike[str], *, follow_symlinks: bool = True
+        ) -> os.stat_result:
+            if os.fspath(name).startswith("/proc/"):
+                raise FileNotFoundError(name)
+            return real_stat(name, follow_symlinks=follow_symlinks)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lock"
+            path.touch()
+            with path.open("rb"), patch.object(support.os, "stat", side_effect=stat):
+                self.assertFalse(support.has_open_file(os.getpid(), path))
+
+
+class StoppableTerminalTests(unittest.TestCase):
+    """Mocks: nothing; each test uses a real pty of this process."""
+
+    def wait_for_output(self, terminal: support.StoppableTerminal, text: str) -> None:
+        deadline = time.monotonic() + 10
+        while text not in terminal.output():
+            if time.monotonic() >= deadline:
+                self.fail(f"No {text!r} in {terminal.output()!r}")
+            time.sleep(0.01)
+
+    def test_a_write_waits_while_the_output_is_stopped(self):
+        with support.StoppableTerminal() as terminal:
+            os.write(terminal.slave, b"before\n")
+            self.wait_for_output(terminal, "before")
+            self.assertFalse(terminal.stopped())
+            terminal.stop()
+            self.assertTrue(terminal.stopped())
+            # A blocking write would wait here. A descriptor of its own with
+            # O_NONBLOCK gets EAGAIN instead, and leaves slave as it is.
+            fd = os.open(
+                os.ttyname(terminal.slave), os.O_WRONLY | os.O_NONBLOCK | os.O_NOCTTY
+            )
+            try:
+                with self.assertRaises(BlockingIOError):
+                    os.write(fd, b"during\n")
+            finally:
+                os.close(fd)
+            terminal.start()
+            self.assertFalse(terminal.stopped())
+            os.write(terminal.slave, b"after\n")
+            self.wait_for_output(terminal, "after")
+        # The typed characters do not come back as output.
+        self.assertEqual(terminal.output(), "before\r\nafter\r\n")
+        self.assertEqual((terminal.master, terminal.slave), (-1, -1))
+
+    def test_a_stop_that_does_not_act_fails(self):
+        # Without IXON, the STOP character is input like any other.
+        with support.StoppableTerminal() as terminal, patch.object(
+            support, "TERMINAL_FLOW_TIMEOUT", 0.2
+        ):
+            attributes = termios.tcgetattr(terminal.slave)
+            attributes[0] &= ~termios.IXON
+            termios.tcsetattr(terminal.slave, termios.TCSANOW, attributes)
+            with self.assertRaisesRegex(
+                support.E2EFailure, "^The output of the terminal did not stop$"
+            ):
+                terminal.stop()
+
+    def test_close_ends_the_reader(self):
+        terminal = support.StoppableTerminal()
+        reader = getattr(terminal, "_reader")
+        self.assertTrue(reader.is_alive())
+        terminal.close()
+        self.assertFalse(reader.is_alive())
+        # A second close does nothing.
+        terminal.close()
 
 
 if __name__ == "__main__":

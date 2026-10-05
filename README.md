@@ -435,8 +435,9 @@ container. When the start fails before that, `up` removes the ports before
 it releases the lock, so no other `up` finds them, and the removal does not
 wait for the lock. It then stops the container process in at most 5
 seconds (SIGTERM, then SIGKILL), because it can still hold the lifecycle
-lock. During that hold, `up` holds back its output and writes it after the
-release, so a stopped terminal cannot keep the lock held. The stop after
+lock. While `up` holds the lifecycle lock or the port mapping lock, it
+holds back its output and writes it after the release, so a stopped
+terminal cannot keep a lock held. The stop after
 the last session also waits for the port mapping lock under the lifecycle
 lock for at most 5 seconds, less than the 10 seconds that each attach waits
 for the lifecycle lock. When the port mapping lock stays busy for that

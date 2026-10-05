@@ -15322,12 +15322,14 @@ class RunUpTests(unittest.TestCase):
         )
 
     def test_a_failed_pin_stops_the_supervisor_when_a_terminal_write_fails(self):
-        # Regression test: without ports, up writes the end of the "Starting"
-        # line and the error of a failed pin to the terminal. When it did so
-        # before the stop, a failed write, for example to a closed pipe,
-        # skipped the stop: the container kept running after up exited.
-        # Mocks: as in failed_pin_run; the terminal raises BrokenPipeError on
-        # each write after the "Starting" line.
+        # Regression test: with no ports and no lock (up -d with no mounts),
+        # up writes the end of the "Starting" line and the error of a failed
+        # pin to the terminal. When it did so before the stop, a failed
+        # write, for example to a closed pipe, skipped the stop: the container
+        # kept running after up exited. Under the lifecycle lock (no -d), up
+        # holds these lines back and writes them after the release, in one
+        # write. Mocks: as in failed_pin_run; the terminal raises
+        # BrokenPipeError on each write after a write of the "Starting" line.
         class BrokenTerminal(io.StringIO):
             def write(self, text: str) -> int:
                 if text and "I: Starting" in self.getvalue():
@@ -15346,18 +15348,22 @@ class RunUpTests(unittest.TestCase):
                     self.record_cleanup(events),
                     terminal=BrokenTerminal(),
                 )
-                self.assertIsInstance(raised, BrokenPipeError)
+                self.assertIsInstance(raised, BrokenPipeError if detach else SystemExit)
                 started = ["stop"] if detach else ["enter", "stop", "exit"]
                 self.assertEqual(events, ["cleanup ai-dev", *started])
                 mocks.stop.assert_called_once_with(
                     mocks.popen.return_value, **LOCKED_STOP
                 )
-                # No write after the "Starting" line reached the terminal.
-                mode = " in detached state" if detach else ""
-                self.assertEqual(
-                    output[output.index("I: Starting") :],
-                    f"I: Starting 'ai-dev'{mode} ",
-                )
+                if detach:
+                    # No write after the "Starting" line reached the terminal.
+                    expected = "I: Starting 'ai-dev' in detached state "
+                else:
+                    expected = (
+                        "I: Starting 'ai-dev' \r\n"
+                        "E: Container 'ai-dev' did not start: "
+                        "'[Errno 3] No such process'\n"
+                    )
+                self.assertEqual(output[output.index("I: Starting") :], expected)
 
     def test_a_failed_removal_after_a_failed_pin_still_stops_the_supervisor(self):
         # The port removal in the hold can fail, for example when the disk is
@@ -15404,6 +15410,98 @@ class RunUpTests(unittest.TestCase):
                     "E: Container 'ai-dev' did not start: "
                     "'[Errno 3] No such process'\n",
                     output,
+                )
+
+    @contextmanager
+    def lock_recording_the_terminal(self, terminal: list[str]) -> Iterator[None]:
+        """Mock the lifecycle lock. Record the text on the terminal, which is
+        the stdout of the test (a StringIO), when up takes the lock and when
+        it releases it."""
+
+        @contextmanager
+        def lock(timeout: float = sandy.LIFECYCLE_LOCK_TIMEOUT) -> Iterator[None]:
+            _ = timeout
+            terminal.append(getattr(sys.stdout, "getvalue")())
+            try:
+                yield
+            finally:
+                terminal.append(getattr(sys.stdout, "getvalue")())
+
+        with patch.object(sandy, "_lifecycle_lock", side_effect=lock):
+            yield
+
+    def test_up_writes_nothing_to_the_terminal_under_the_lifecycle_lock(self):
+        # Regression test: up wrote to the terminal while it held the
+        # lifecycle lock: the "Starting" line when it published no ports, and
+        # the refusal of the check under the lock. A write that blocked, for
+        # example after the STOP character, then kept the lock held, and
+        # each attach failed after 10 s. Now up holds its output back while
+        # it holds the lock, and writes it after the release. Mocks: as in
+        # up_mocks; the lifecycle lock records the terminal when up takes it
+        # and when up releases it.
+        refused = "E: Container 'ai-dev' is already running"
+        for refusal in (None, refused):
+            with self.subTest(refused=refusal is not None):
+                terminal: list[str] = []
+                instance = make_sandy()
+                instance.workspace = None
+                # The check before the lock passes. The check under the lock
+                # finds the container of another program, or nothing.
+                checks = patch.object(
+                    instance, "_existing_container_error", side_effect=[None, refusal]
+                )
+                with tempfile.TemporaryDirectory() as machine, self.up_mocks(
+                    instance, machine
+                ), checks, self.lock_recording_the_terminal(
+                    terminal
+                ), captured_output() as (
+                    stdout,
+                    _,
+                ):
+                    if refusal:
+                        with self.assertRaises(SystemExit) as exited:
+                            instance.run_up(self.arguments(detach=False))
+                        self.assertEqual(exited.exception.code, 1)
+                    else:
+                        instance.run_up(self.arguments(detach=False))
+                self.assertEqual(len(terminal), 2)
+                # Nothing reached the terminal under the lock.
+                self.assertEqual(terminal[1], terminal[0])
+                after = stdout.getvalue()[len(terminal[1]) :]
+                self.assertIn(refusal or "I: Starting 'ai-dev' ", after)
+
+    def test_a_failed_pin_writes_its_error_after_the_lifecycle_lock(self):
+        # Regression test: when the pin failed, up wrote the error to the
+        # terminal before it released the lifecycle lock: at once without
+        # ports, and with the held output with ports. Mocks: as in
+        # failed_pin_run; the lifecycle lock records the terminal when up
+        # takes it and when up releases it.
+        for published in (False, True):
+            with self.subTest(published=published):
+                terminal: list[str] = []
+                self.lock_events.clear()
+                with self.lock_recording_the_terminal(terminal):
+                    raised, output, mocks = self.failed_pin_run(
+                        self.lock_events,
+                        False,
+                        published,
+                        OSError(errno.ESRCH, "No such process"),
+                        self.record_cleanup(self.lock_events),
+                    )
+                self.assertIsInstance(raised, SystemExit)
+                assert isinstance(raised, SystemExit)
+                self.assertEqual(raised.code, 1)
+                mocks.stop.assert_called_once_with(
+                    mocks.popen.return_value, **LOCKED_STOP
+                )
+                self.assertEqual(len(terminal), 2)
+                # Nothing reached the terminal under the lock.
+                self.assertEqual(terminal[1], terminal[0])
+                self.assertIn(
+                    "I: Starting 'ai-dev' \r\n"
+                    "E: Container 'ai-dev' did not start: "
+                    "'[Errno 3] No such process'\n",
+                    output[len(terminal[1]) :],
                 )
 
     def send_sigint(self, *_args: object, **_kwargs: object) -> None:
