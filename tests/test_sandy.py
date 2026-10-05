@@ -1259,6 +1259,50 @@ class MainDispatchTests(unittest.TestCase):
             "'Failed to connect to bus: Connection refused'\n",
         )
 
+    def test_list_ends_when_a_machine_query_fails(self):
+        # A failed query must not show an image as stopped: list ends with
+        # the error and exit status 1, and it prints no list line. Mocks:
+        # the image directory listing, and the subprocess wrapper, whose
+        # machinectl exits 1 with a bus error.
+        instance = make_sandy()
+        argv = ["machinectl", "show", "ai-dev", "-p", "Leader", "--value"]
+        failure = subprocess.CalledProcessError(
+            1, argv, stderr="Failed to connect to bus: Connection refused\n"
+        )
+
+        def exists(path: str) -> bool:
+            return path == sandy.SYSTEMD_MACHINES
+
+        with patch.object(sandy.os.path, "exists", side_effect=exists):
+            with patch.object(
+                sandy.glob, "glob", return_value=["/var/lib/machines/sandy.ai-dev"]
+            ):
+                with patch.object(
+                    instance,
+                    "_get_cache_dir",
+                    return_value="/var/lib/machines/sandy.__cache",
+                ):
+                    with patch.object(
+                        sandy, "_run_secure_subprocess", side_effect=failure
+                    ) as run:
+                        with captured_output() as (stdout, _):
+                            with self.assertRaises(SystemExit) as exited:
+                                self.run_main(self.make_args("list"), instance)
+        self.assertEqual(exited.exception.code, 1)
+        self.assertEqual(
+            stdout.getvalue(),
+            "E: Could not query machine 'ai-dev': "
+            "'Failed to connect to bus: Connection refused'\n",
+        )
+        run.assert_called_once_with(
+            argv,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=sandy.QUERY_COMMAND_TIMEOUT,
+            env=sandy._c_locale_environment(),
+        )
+
     def test_root_and_safe_directory_checks_precede_construction(self):
         args = self.make_args("status")
         instance = MagicMock(container="ai-dev", user="developer")
