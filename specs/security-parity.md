@@ -1135,7 +1135,7 @@ the clone set to each value), and with the implementation before the fix:
 | Propagation of the clone | Root in the container mounts a tmpfs below the mount | The host mounts a tmpfs below the directory after the attach |
 | --- | --- | --- |
 | Unchanged (a peer of the host mount) | The mount appears on the host, and the host reads its files (Linux 5.15, 6.1, 6.8, and 6.12 with the prototype; and the implementation on systemd 249 and 257) | It appears in the container (same) |
-| `MS_SLAVE` | Does not appear on the host | It appears in the container |
+| `MS_SLAVE` | Does not appear on the host | It appears in the container <!-- langcheckignore:rule=slave --> |
 | `MS_PRIVATE` | Does not appear on the host | It does not appear in the container |
 
 With the implementation before the fix, on systemd 257, the mount of root in the

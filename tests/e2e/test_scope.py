@@ -458,7 +458,9 @@ class _Attach:
             self.process = subprocess.Popen(
                 arguments,
                 stdin=subprocess.DEVNULL,
+                # langcheckignore:rule=slave
                 stdout=stream if terminal is None else terminal.slave,
+                # langcheckignore:rule=slave
                 stderr=subprocess.STDOUT if terminal is None else terminal.slave,
                 cwd=context.root,
                 env=context.safe_environment(),
@@ -714,7 +716,9 @@ def _up_with_its_terminal_stopped(
                 process = subprocess.Popen(
                     command,
                     stdin=subprocess.DEVNULL,
+                    # langcheckignore:rule=slave
                     stdout=terminal.slave,
+                    # langcheckignore:rule=slave
                     stderr=terminal.slave,
                     cwd=context.root,
                     env=context.safe_environment(),

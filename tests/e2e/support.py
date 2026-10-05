@@ -302,22 +302,29 @@ def has_open_file(pid: int, path: Path) -> bool:
 class StoppableTerminal:
     """A pty for the output of a process, which a case can stop.
 
+    langcheckignore:rule=slave
     The process writes to slave. A thread reads master, so the output does
     not fill the pty, and output() returns what came so far. stop() types
+    langcheckignore:rule=slave
     the STOP character: with IXON set, each write to slave then blocks in the
     kernel until start() types the START character. A stopped pty has no
+    langcheckignore:rule=slave
     write room, so a poll of slave shows the state without a write.
     """
 
     def __init__(self) -> None:
+        # langcheckignore:rule=slave
         self.master, self.slave = os.openpty()
         try:
+            # langcheckignore:rule=slave
             attributes = termios.tcgetattr(self.slave)
             attributes[0] = (attributes[0] | termios.IXON) & ~termios.IXANY
             attributes[6][termios.VSTOP] = STOP_CHARACTER
             attributes[6][termios.VSTART] = START_CHARACTER
+            # langcheckignore:rule=slave
             termios.tcsetattr(self.slave, termios.TCSANOW, attributes)
         except BaseException:
+            # langcheckignore:rule=slave
             os.close(self.slave)
             os.close(self.master)
             raise
@@ -344,6 +351,7 @@ class StoppableTerminal:
             try:
                 chunk = os.read(self.master, 4096)
             except OSError:
+                # langcheckignore:rule=slave
                 # EIO: no descriptor of slave is open.
                 return
             if not chunk:
@@ -356,8 +364,10 @@ class StoppableTerminal:
             return b"".join(self._chunks).decode("utf-8", errors="replace")
 
     def stopped(self) -> bool:
+        # langcheckignore:rule=slave
         """Return True when a write to slave blocks: the output is stopped."""
         poller = select.poll()
+        # langcheckignore:rule=slave
         poller.register(self.slave, select.POLLOUT)
         return not poller.poll(0)
 
@@ -380,10 +390,14 @@ class StoppableTerminal:
             time.sleep(0.05)
 
     def close(self) -> None:
+        # langcheckignore:rule=slave
         """Close slave, end the reader, and close master."""
         self._closing.set()
+        # langcheckignore:rule=slave
         if self.slave >= 0:
+            # langcheckignore:rule=slave
             os.close(self.slave)
+            # langcheckignore:rule=slave
             self.slave = -1
         self._reader.join(timeout=TERMINAL_FLOW_TIMEOUT)
         if self.master >= 0:

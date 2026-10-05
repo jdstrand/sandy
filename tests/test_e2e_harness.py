@@ -2679,15 +2679,19 @@ class StoppableTerminalTests(unittest.TestCase):
 
     def test_a_write_waits_while_the_output_is_stopped(self):
         with support.StoppableTerminal() as terminal:
+            # langcheckignore:rule=slave
             os.write(terminal.slave, b"before\n")
             self.wait_for_output(terminal, "before")
             self.assertFalse(terminal.stopped())
             terminal.stop()
             self.assertTrue(terminal.stopped())
             # A blocking write would wait here. A descriptor of its own with
+            # langcheckignore:rule=slave
             # O_NONBLOCK gets EAGAIN instead, and leaves slave as it is.
             fd = os.open(
-                os.ttyname(terminal.slave), os.O_WRONLY | os.O_NONBLOCK | os.O_NOCTTY
+                # langcheckignore:rule=slave
+                os.ttyname(terminal.slave),
+                os.O_WRONLY | os.O_NONBLOCK | os.O_NOCTTY,
             )
             try:
                 with self.assertRaises(BlockingIOError):
@@ -2696,10 +2700,12 @@ class StoppableTerminalTests(unittest.TestCase):
                 os.close(fd)
             terminal.start()
             self.assertFalse(terminal.stopped())
+            # langcheckignore:rule=slave
             os.write(terminal.slave, b"after\n")
             self.wait_for_output(terminal, "after")
         # The typed characters do not come back as output.
         self.assertEqual(terminal.output(), "before\r\nafter\r\n")
+        # langcheckignore:rule=slave
         self.assertEqual((terminal.master, terminal.slave), (-1, -1))
 
     def test_a_stop_that_does_not_act_fails(self):
@@ -2707,8 +2713,10 @@ class StoppableTerminalTests(unittest.TestCase):
         with support.StoppableTerminal() as terminal, patch.object(
             support, "TERMINAL_FLOW_TIMEOUT", 0.2
         ):
+            # langcheckignore:rule=slave
             attributes = termios.tcgetattr(terminal.slave)
             attributes[0] &= ~termios.IXON
+            # langcheckignore:rule=slave
             termios.tcsetattr(terminal.slave, termios.TCSANOW, attributes)
             with self.assertRaisesRegex(
                 support.E2EFailure, "^The output of the terminal did not stop$"
