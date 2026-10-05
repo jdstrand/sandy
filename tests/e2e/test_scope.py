@@ -224,6 +224,22 @@ def _status(pid: int, key: str) -> str:
     raise E2EFailure(f"No {key} in /proc/{pid}/status")
 
 
+def _scope_pids(name: str) -> set[int]:
+    """Return the processes of the scope of name and of its cgroups."""
+    pids = set()
+    for procs in _unit_dir(name).rglob("cgroup.procs"):
+        try:
+            text = procs.read_text(encoding="ascii")
+        except FileNotFoundError:
+            continue
+        pids.update(int(value) for value in text.split())
+    return pids
+
+
+def _process_exists(pid: int) -> bool:
+    return Path(f"/proc/{pid}").exists()
+
+
 def _children(pid: int) -> list[int]:
     try:
         text = Path(f"/proc/{pid}/task/{pid}/children").read_text(encoding="ascii")
@@ -1651,6 +1667,113 @@ def test_main(context: E2EContext) -> None:
             raise E2EFailure(f"Scope properties after update {actual!r}")
         context.sandy(["down"], name=second)
         _wait_stopped(context, second)
+
+    with context.case("update changes the OOM score adjustment of a container"):
+        context.sandy(
+            [
+                "up",
+                "--detach",
+                "--persistent",
+                "--network",
+                "host",
+                "--oom-score-adj",
+                "-500",
+            ],
+            name=second,
+        )
+        context.wait_for_machine(second, running=True)
+        # A running session with a value that it set itself.
+        holder = _Attach(
+            context,
+            second,
+            "echo 500 > /proc/self/oom_score_adj && exec sleep 120",
+        )
+        try:
+            holder.leaf()
+
+            def raised() -> bool:
+                return any(
+                    _oom_score_adj(pid) == 500
+                    for pid in _scope_pids(second)
+                    if _process_exists(pid)
+                )
+
+            _wait_for("the session sets its own value", raised)
+            updated = context.sandy(["update", "--oom-score-adj", "100"], name=second)
+            assert_contains(
+                updated, f"I: Updated '{second}': OOM score adjustment 100 ("
+            )
+            # Each process of the scope has the value: nspawn, the Leader,
+            # the payload, the entry helper, and the session.
+            pids = _scope_pids(second)
+            leader_pid = int(context.machine_leader(second) or 0)
+            for pid in (leader_pid, _payload(leader_pid), holder.helper()):
+                if pid not in pids:
+                    raise E2EFailure(f"PID {pid} is not in the scope {pids!r}")
+            for pid in pids:
+                if _process_exists(pid) and _oom_score_adj(pid) != 100:
+                    raise E2EFailure(
+                        f"PID {pid} has OOM score adjustment {_oom_score_adj(pid)}"
+                    )
+            # The scope is not frozen after the update.
+            unit_dir = _unit_dir(second)
+            if (unit_dir / "cgroup.freeze").read_text(encoding="ascii") != "0\n":
+                raise E2EFailure("update left the scope frozen")
+            if "frozen 0" not in (unit_dir / "cgroup.events").read_text(
+                encoding="ascii"
+            ):
+                raise E2EFailure("update left the scope frozen")
+            if holder.process.poll() is not None:
+                raise E2EFailure("update ended the running session")
+        finally:
+            if holder.process.poll() is None:
+                holder.process.send_signal(signal.SIGTERM)
+            holder.finish()
+        # A new session gets the value. The lowest value is now 100, also for
+        # container root, which could go to -500 before.
+        for user in (context.cache_user, "root"):
+            session = context.sandy(
+                ["exec", "--", "cat /proc/self/oom_score_adj"], name=second, user=user
+            )
+            if session.stdout.strip() != "100":
+                raise E2EFailure(f"A session of {user} has {session.stdout!r}")
+            lower = context.sandy(
+                ["exec", "--", "echo 99 > /proc/self/oom_score_adj"],
+                name=second,
+                user=user,
+                expected=None,
+            )
+            if lower.returncode == 0:
+                raise E2EFailure(f"A session of {user} went below the updated value")
+            context.sandy(
+                ["exec", "--", "echo 200 > /proc/self/oom_score_adj"],
+                name=second,
+                user=user,
+            )
+        # A lower value protects the container again.
+        context.sandy(["update", "--oom-score-adj", "-600"], name=second)
+        session = context.sandy(
+            ["exec", "--", "cat /proc/self/oom_score_adj"], name=second, user="root"
+        )
+        if session.stdout.strip() != "-600":
+            raise E2EFailure(f"A session after -600 has {session.stdout!r}")
+        for arguments, expected, message in (
+            (["update", "--oom-score-adj", "-1000"], 2, "invalid OOM score"),
+            (
+                ["update", "--shared", "--oom-score-adj", "1"],
+                1,
+                "update --shared cannot be used with --oom-score-adj",
+            ),
+        ):
+            refused = context.sandy(arguments, expected=expected)
+            assert_contains(refused, message)
+            assert_not_contains(refused, "Traceback")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+        stopped = context.sandy(
+            ["update", "--oom-score-adj", "1"], name=second, expected=1
+        )
+        assert_contains(stopped, "not found or not running")
 
     with context.case("the address scan of a new image follows no /init.sh link"):
         # Root in a container controls its image. A new image reserves the

@@ -151,8 +151,8 @@ SHARED_LIMITS_LOCK_FILENAME: Final = "shared_limits.lock"
 SHARED_LIMITS_MAX_BYTES: Final = 8192
 SHARED_LIMITS_RESET_HINT: Final = "Reset them with: sandy update --shared --reset"
 UPDATE_NEEDS_OPTION: Final = (
-    "update needs --pids-limit, or --shared to change the limits that all "
-    "containers share"
+    "update needs --pids-limit or --oom-score-adj, or --shared to change the "
+    "limits that all containers share"
 )
 UPDATE_SHARED_NEEDS_OPTION: Final = (
     "update --shared needs at least one of --cpuset-cpus, --memory, "
@@ -1887,7 +1887,12 @@ def _write_own_oom_score_adj(value: int) -> None:
     As root, this also sets the lowest value that this process and its
     children can set later (measured: a container cannot go lower).
     """
-    fd = os.open(OWN_OOM_SCORE_ADJ_PATH, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    _write_oom_score_adj(OWN_OOM_SCORE_ADJ_PATH, value)
+
+
+def _write_oom_score_adj(path: str, value: int, dir_fd: Optional[int] = None) -> None:
+    """Write an OOM score adjustment to an oom_score_adj file."""
+    fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
     try:
         data = f"{value}\n".encode("ascii")
         if os.write(fd, data) != len(data):
@@ -3277,6 +3282,8 @@ ATTACH_LEAF_PATTERN: Final = re.compile(r"attach-[0-9a-f]{32}")
 ATTACH_LEAF_KILL_TIMEOUT: Final = 5
 ATTACH_LEAF_POLL_INTERVAL: Final = 0.02
 CGROUP_EVENTS_MAX_BYTES: Final = 4096
+CGROUP_FREEZE_TIMEOUT: Final = 5
+CGROUP_FREEZE_POLL_INTERVAL: Final = 0.01
 # The up-console marker: an empty cgroup in the scope of a container that up
 # started without -d. It exists from the start of up until the console of that
 # up ends, in any way (see _exec). While it exists, no attach exit stops the
@@ -3321,8 +3328,6 @@ class LeaderConfinement(NamedTuple):
     capability_bounding_set: int
     # cgroup.kill of the attach leaf that this process joined.
     attach_kill_fd: int
-    # The Leader's value, which up set for the container (--oom-score-adj).
-    oom_score_adj: int
 
 
 class ProcessConfinement(NamedTuple):
@@ -3653,6 +3658,16 @@ def _container_memory_events(machine_name: str) -> Optional[MemoryEvents]:
 
 def _cgroup_populated(dir_fd: int) -> bool:
     """Return whether an open cgroup or any of its descendants has processes."""
+    return _cgroup_event(dir_fd, "populated")
+
+
+def _cgroup_frozen(dir_fd: int) -> bool:
+    """Return whether an open cgroup and all of its descendants are frozen."""
+    return _cgroup_event(dir_fd, "frozen")
+
+
+def _cgroup_event(dir_fd: int, key: str) -> bool:
+    """Return the 0 or 1 value of key in cgroup.events of an open cgroup."""
     fd = os.open("cgroup.events", READ_FILE_OPEN_FLAGS, dir_fd=dir_fd)
     try:
         data = os.read(fd, CGROUP_EVENTS_MAX_BYTES + 1)
@@ -3667,10 +3682,95 @@ def _cgroup_populated(dir_fd: int) -> bool:
     ]
     if any(len(fields) != 2 for fields in values):
         raise ValueError("Malformed cgroup.events")
-    populated = [fields[1] for fields in values if fields[0] == "populated"]
-    if len(populated) != 1 or populated[0] not in ("0", "1"):
+    found = [fields[1] for fields in values if fields[0] == key]
+    if len(found) != 1 or found[0] not in ("0", "1"):
         raise ValueError("Malformed cgroup.events")
-    return populated[0] == "1"
+    return found[0] == "1"
+
+
+@contextmanager  # ensures the cgroup is thawed at the call site
+def _frozen_cgroup(dir_fd: int) -> Iterator[None]:
+    """Freeze an open cgroup and its descendants, and always thaw it again.
+
+    While the cgroup is frozen, no process in it runs, so none can start a
+    process or change a value. A process that does not freeze in time, such
+    as one in an uninterruptible sleep, makes the freeze fail.
+    """
+    try:
+        _write_cgroup_file(dir_fd, "cgroup.freeze", b"1")
+        deadline = time.monotonic() + CGROUP_FREEZE_TIMEOUT
+        while not _cgroup_frozen(dir_fd):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("The processes of the container did not freeze")
+            time.sleep(CGROUP_FREEZE_POLL_INTERVAL)
+        yield
+    finally:
+        try:
+            _write_cgroup_file(dir_fd, "cgroup.freeze", b"0")
+        except OSError as exc:
+            raise OSError(
+                f"Could not thaw the container, which stays frozen: {exc}"
+            ) from exc
+
+
+def _process_in_scope(proc_fd: int, unit: str) -> bool:
+    """Return whether the process of an open host /proc/<pid> directory is in
+    the scope unit or in a cgroup below it.
+
+    Only the start of the line matters. Container root names the cgroups
+    below payload, so the rest of the path can be long or malformed.
+    """
+    cgroup_fd = os.open("cgroup", READ_FILE_OPEN_FLAGS, dir_fd=proc_fd)
+    try:
+        data = os.read(cgroup_fd, PROC_CGROUP_MAX_BYTES + 1)
+    finally:
+        os.close(cgroup_fd)
+    scope = f"0::/{SUPERVISOR_SLICE}/{unit}".encode("ascii")
+    return data.startswith(scope + b"\n") or data.startswith(scope + b"/")
+
+
+def _set_scope_oom_score_adj(machine_name: str, value: int) -> int:
+    """Give every process in the container's scope an OOM score adjustment.
+
+    Return the number of processes. The caller holds the lifecycle lock, so
+    no attach reads the Leader's value meanwhile (see
+    _extract_leader_confinement). The scope stays frozen during the scan of
+    the host /proc, so no process of the container can start a process with
+    the earlier value after the scan has passed it. Each write is anchored
+    at the pinned /proc/<pid> directory of the process that was checked. As
+    host root, each write also sets the lowest value that the process can
+    set. The processes include nspawn and the entry helpers of the scope.
+    """
+    unit = _supervisor_unit_name(machine_name)
+    leader_pid = _query_machine_leader(machine_name)
+    updated = set()
+    unit_fd = _open_supervisor_cgroup(machine_name)
+    try:
+        with _frozen_cgroup(unit_fd):
+            for name in os.listdir("/proc"):
+                if not LEADER_PID_PATTERN.fullmatch(name):
+                    continue
+                pid = int(name)
+                try:
+                    proc_fd = _open_process_dir(pid)
+                except FileNotFoundError:
+                    continue
+                try:
+                    if _process_in_scope(proc_fd, unit):
+                        _write_oom_score_adj("oom_score_adj", value, dir_fd=proc_fd)
+                        updated.add(pid)
+                except (FileNotFoundError, ProcessLookupError):
+                    # The process exited after the listing.
+                    continue
+                finally:
+                    os.close(proc_fd)
+    finally:
+        os.close(unit_fd)
+    # Fail closed when the scan did not find the container, for example on a
+    # host without cgroup v2.
+    if leader_pid not in updated:
+        raise ProcessLookupError("The container Leader is not in its scope")
+    return len(updated)
 
 
 def _join_attach_leaf(machine_name: str, attach_leaf: str) -> int:
@@ -4025,8 +4125,9 @@ def _extract_leader_confinement(
     (PID 2) inherits its filters and bounding set, and the kernel only lets
     both become stricter, so they are the confinement to copy. See
     specs/security-parity.md, item 1. The Leader also has the OOM score
-    adjustment of the container (item 2). Container root cannot set it below
-    the lowest value that the container inherited from up.
+    adjustment of the container (item 2), which this process writes to
+    itself. Container root cannot set it below the lowest value that the
+    container got from up or update.
 
     machined reports the Leader before nspawn has completed its setup, and
     nspawn starts the payload only after that setup. So find the payload
@@ -4088,6 +4189,11 @@ def _extract_leader_confinement(
                 raise PermissionError(
                     "Container payload confinement differs from the Leader"
                 )
+            # The session gets the container's OOM score adjustment. As host
+            # root, the write also sets the lowest value that the session can
+            # set. Write it under the lock, so that update --oom-score-adj
+            # cannot change the Leader between this read and this write.
+            _write_own_oom_score_adj(oom_score_adj)
             attach_kill_fd = _join_attach_leaf(machine_name, attach_leaf)
         except BaseException:
             _close_fds(tuple(opened))
@@ -4098,7 +4204,6 @@ def _extract_leader_confinement(
         seccomp_filters=seccomp_filters,
         capability_bounding_set=capability_bounding_set,
         attach_kill_fd=attach_kill_fd,
-        oom_score_adj=oom_score_adj,
     )
 
 
@@ -5009,14 +5114,6 @@ def _entry_helper_main(argv: list) -> int:
     if confinement.capability_bounding_set >> (cap_last + 1):
         _close_leader_confinement(confinement)
         _entry_error(PermissionError("CapBnd has unknown capabilities"))
-        return ENTRY_HELPER_FAILURE
-    # The session gets the container's OOM score adjustment. As host root,
-    # the write also sets the lowest value that the session can set.
-    try:
-        _write_own_oom_score_adj(confinement.oom_score_adj)
-    except OSError as exc:
-        _close_leader_confinement(confinement)
-        _entry_error(exc)
         return ENTRY_HELPER_FAILURE
     return _run_confined_entry(request, environment, confinement, cap_last)
 
@@ -10200,8 +10297,9 @@ class Sandy:
             )
 
     def run_update(self, args: argparse.Namespace) -> None:
-        """Change the process limit of a running container, as docker update
-        does, or with --shared the limits that all containers share."""
+        """Change the process limit or the OOM score adjustment of a running
+        container, as docker update does, or with --shared the limits that
+        all containers share."""
         if args.shared_limits:
             self._run_update_shared(args)
             return
@@ -10221,7 +10319,7 @@ class Sandy:
                 "no CPU or memory limit of its own"
             )
             sys.exit(1)
-        if args.pids_limit is None:
+        if args.pids_limit is None and args.oom_score_adj is None:
             print(f"E: {UPDATE_NEEDS_OPTION}")
             sys.exit(1)
         unit = _supervisor_unit_name(self.container)
@@ -10235,6 +10333,13 @@ class Sandy:
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             print(f"E: Could not query unit '{unit}': {_terminal_safe_repr(str(exc))}")
             sys.exit(1)
+        if args.pids_limit is not None:
+            self._update_pids_limit(unit, args.pids_limit)
+        if args.oom_score_adj is not None:
+            self._update_oom_score_adj(args.oom_score_adj)
+
+    def _update_pids_limit(self, unit: str, pids_limit: int) -> None:
+        """Set the process limit of the running scope unit until it stops."""
         try:
             group = _read_live_group_limits()
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -10243,7 +10348,7 @@ class Sandy:
                 f"{_terminal_safe_repr(str(exc))}"
             )
             sys.exit(1)
-        tasks_max = None if args.pids_limit == -1 else args.pids_limit
+        tasks_max = None if pids_limit == -1 else pids_limit
         pids_warning = _pids_limit_warning(tasks_max, group.tasks_max)
         if pids_warning is not None:
             print(pids_warning)
@@ -10260,6 +10365,26 @@ class Sandy:
             sys.exit(1)
         print(f"I: Updated '{self.container}': {assignment}")
 
+    def _update_oom_score_adj(self, value: int) -> None:
+        """Give each process of the running container the OOM score adjustment.
+
+        Later sessions get it from the Leader. The value ends with the
+        container; the next up uses its own flags.
+        """
+        try:
+            with _lifecycle_lock():
+                count = _set_scope_oom_score_adj(self.container, value)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(
+                "E: Could not update the OOM score adjustment of "
+                f"'{self.container}': {_terminal_safe_repr(str(exc))}"
+            )
+            sys.exit(1)
+        print(
+            f"I: Updated '{self.container}': OOM score adjustment {value} "
+            f"({count} processes)"
+        )
+
     def _run_update_shared(self, args: argparse.Namespace) -> None:
         """Change, save, and set the limits that all containers share.
 
@@ -10268,6 +10393,12 @@ class Sandy:
         """
         if args.container is not None:
             print("E: update --shared cannot be used with --container")
+            sys.exit(1)
+        if args.oom_score_adj is not None:
+            print(
+                "E: update --shared cannot be used with --oom-score-adj: the "
+                "containers have no shared OOM score adjustment"
+            )
             sys.exit(1)
         values = {
             "cpus": args.cpuset_cpus,
@@ -10409,6 +10540,14 @@ def _add_update_arguments(parser: argparse.ArgumentParser) -> None:
         type=_parse_pids_limit_argument,
         help="Process limit of the running container, or with --shared, of all "
         "containers together (-1: no limit)",
+    )
+    parser.add_argument(
+        "--oom-score-adj",
+        action=_StoreOnceAction,
+        type=_parse_oom_score_adj_argument,
+        help="OOM score adjustment of the running container and its sessions, "
+        "from -999 to 1000. Each process of the container gets the value, also "
+        "a process that set its own value",
     )
     parser.add_argument(
         "--reset",

@@ -1022,9 +1022,21 @@ class ParserTests(unittest.TestCase):
     def test_update_options_follow_docker_update(self):
         args = self.parse("-c", "box", "update", "--pids-limit", "512")
         self.assertEqual(
-            (args.command, args.container, args.shared_limits, args.pids_limit),
-            ("update", "box", False, 512),
+            (
+                args.command,
+                args.container,
+                args.shared_limits,
+                args.pids_limit,
+                args.oom_score_adj,
+            ),
+            ("update", "box", False, 512, None),
         )
+        for value, expected in (("-999", -999), ("0", 0), ("1000", 1000)):
+            with self.subTest(value=value):
+                args = self.parse("-c", "box", "update", "--oom-score-adj", value)
+                self.assertEqual(
+                    (args.pids_limit, args.oom_score_adj), (None, expected)
+                )
         # update --shared does not change the global -s/--shared directory.
         args = self.parse(
             "-s",
@@ -1067,7 +1079,11 @@ class ParserTests(unittest.TestCase):
         self.assertFalse(hasattr(args, "tmp_size"))
         for arguments in (
             ("--tmp-size", "1g"),
-            ("--oom-score-adj", "1"),
+            ("--oom-score-adj", "-1000"),
+            ("--oom-score-adj", "1001"),
+            ("--oom-score-adj", "01"),
+            ("--oom-score-adj", "1", "--oom-score-adj", "2"),
+            ("--oom", "1"),
             # No abbreviations: --cpus is a prefix of --cpuset-cpus.
             ("--cpus", "1"),
             ("--cpu", "1"),
@@ -5128,7 +5144,6 @@ class LeaderExtractionTests(unittest.TestCase):
             seccomp_filters=(),
             capability_bounding_set=0,
             attach_kill_fd=6,
-            oom_score_adj=0,
         )
         with patch.object(
             sandy.os, "close", side_effect=[None, OSError(errno.EBADF, "x"), None, None]
@@ -5177,6 +5192,7 @@ class LeaderExtractionTests(unittest.TestCase):
             "filters",
             "capbnd",
             "oom",
+            "write_oom",
             "pidfd_open",
             "join",
             "payload",
@@ -5204,6 +5220,9 @@ class LeaderExtractionTests(unittest.TestCase):
             )
             stack.enter_context(patch.object(sandy, "_read_oom_score_adj", manager.oom))
             stack.enter_context(
+                patch.object(sandy, "_write_own_oom_score_adj", manager.write_oom)
+            )
+            stack.enter_context(
                 patch.object(sandy, "_read_process_cgroup", manager.cgroup)
             )
             stack.enter_context(
@@ -5227,7 +5246,6 @@ class LeaderExtractionTests(unittest.TestCase):
                 seccomp_filters=(b"old", b"new"),
                 capability_bounding_set=0xFDECBFFF,
                 attach_kill_fd=30,
-                oom_score_adj=-500,
             ),
         )
         ns_flags = os.O_RDONLY | os.O_CLOEXEC
@@ -5257,6 +5275,9 @@ class LeaderExtractionTests(unittest.TestCase):
                 call.oom(20),
                 call.close(20),
                 call.alive(10),
+                # Under the lock, so that update --oom-score-adj cannot
+                # change the Leader between the read and the write.
+                call.write_oom(-500),
                 call.join("ai-dev", ATTACH_LEAF),
                 call.lock_exit(),
             ],
@@ -5337,6 +5358,22 @@ class LeaderExtractionTests(unittest.TestCase):
             [call(fd) for fd in (10, 21, 22, 23, 24, 25, 26, 27)],
         )
 
+    def test_extract_leader_confinement_fails_closed_without_the_oom_value(self):
+        # Mocks: as extraction_mocks; the write of this process's value fails.
+        error = OSError(errno.EACCES, "denied")
+        with self.extraction_mocks(write_oom=error) as manager:
+            with self.assertRaises(OSError) as raised:
+                sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
+        self.assertIs(raised.exception, error)
+        manager.write_oom.assert_called_once_with(-500)
+        # No attach leaf without the container's value.
+        manager.join.assert_not_called()
+        self.assertEqual(
+            manager.close.call_args_list[1:],
+            [call(fd) for fd in (10, 21, 22, 23, 24, 25, 26, 27)],
+        )
+        manager.lock_exit.assert_called_once_with()
+
     def test_extract_leader_confinement_validates_leaf_and_name_before_lock(self):
         for machine, leaf in (
             ("ai-dev", "attach-x"),
@@ -5401,6 +5438,7 @@ class LeaderExtractionTests(unittest.TestCase):
                     with self.assertRaises(type(error)):
                         sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
                 manager.alive.assert_not_called()
+                manager.write_oom.assert_not_called()
                 manager.join.assert_not_called()
                 manager.lock_exit.assert_called_once_with()
                 if name != "pidfd_open":
@@ -5502,7 +5540,6 @@ def entry_confinement(mask=0b101010):
         seccomp_filters=(b"oldest00", b"newest00"),
         capability_bounding_set=mask,
         attach_kill_fd=30,
-        oom_score_adj=-500,
     )
 
 
@@ -6392,7 +6429,7 @@ class EntryHelperTests(unittest.TestCase):
         )
         manager.run.return_value = 0
         manager.getppid.return_value = overrides.get("ppid", 4100)
-        for name in ("verify", "extract", "cap_last", "pdeathsig", "oom"):
+        for name in ("verify", "extract", "cap_last", "pdeathsig"):
             if name in overrides:
                 getattr(manager, name).side_effect = overrides[name]
         with patch.object(sandy.os, "geteuid", manager.geteuid), patch.object(
@@ -6435,10 +6472,9 @@ class EntryHelperTests(unittest.TestCase):
         names = [entry[0] for entry in manager.mock_calls]
         self.assertLess(names.index("pdeathsig"), names.index("getppid"))
         self.assertLess(names.index("getppid"), names.index("extract"))
-        # The session gets the Leader's OOM score adjustment before it starts.
-        manager.oom.assert_called_once_with(-500)
-        self.assertLess(names.index("extract"), names.index("oom"))
-        self.assertLess(names.index("oom"), names.index("run"))
+        # The extraction writes the Leader's OOM score adjustment under the
+        # lifecycle lock (LeaderExtractionTests); the helper writes none after.
+        manager.oom.assert_not_called()
         manager.run.assert_called_once_with(
             entry_request(),
             sandy._container_environment("developer", "/home/developer")
@@ -6493,15 +6529,6 @@ class EntryHelperTests(unittest.TestCase):
             self.assertEqual(sandy._entry_helper_main(self.helper_argv()), 125)
         manager.close.assert_called_once_with(confinement)
         manager.oom.assert_not_called()
-        manager.run.assert_not_called()
-
-    def test_entry_helper_main_fails_closed_without_the_oom_value(self):
-        # Mocks: as helper_mocks; the write of oom_score_adj fails.
-        error = OSError(errno.EACCES, "x")
-        with self.helper_mocks(oom=error) as manager:
-            self.assertEqual(sandy._entry_helper_main(self.helper_argv()), 125)
-        manager.close.assert_called_once_with(entry_confinement(0xFDECBFFF))
-        manager.error.assert_called_once_with(error)
         manager.run.assert_not_called()
 
     def test_main_dispatches_entry_helper_before_argument_parsing(self):
@@ -17935,6 +17962,301 @@ class StartFailureTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
 
 
+class ScopeOomScoreAdjTests(unittest.TestCase):
+    """update --oom-score-adj: the freeze, the scan, and the writes.
+
+    Tests use plain directories and regular files in place of cgroupfs and
+    the host /proc. Mocks: the /proc listing, the opening of /proc/<pid>, the
+    Leader query, the supervisor cgroup, and the freeze poll timing. E2E
+    tests must prove the real freeze, the kernel values, and the lowest
+    value that a process can set.
+    """
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.unit = self.root / "unit"
+        self.unit.mkdir()
+        (self.unit / "cgroup.freeze").write_text("")
+        (self.unit / "cgroup.events").write_text("populated 1\nfrozen 1\n")
+        self.proc = self.root / "proc"
+        self.proc.mkdir()
+
+    def open_dir(self, path):
+        fd = os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+        self.addCleanup(self.close_quietly, fd)
+        return fd
+
+    @staticmethod
+    def close_quietly(fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def fake_process(self, pid, cgroup):
+        directory = self.proc / str(pid)
+        directory.mkdir()
+        (directory / "cgroup").write_text(cgroup)
+        (directory / "oom_score_adj").write_text("0\n")
+        return directory
+
+    def test_cgroup_frozen(self):
+        unit_fd = self.open_dir(self.unit)
+        for text, expected in (
+            ("populated 1\nfrozen 0\n", False),
+            ("populated 1\nfrozen 1\n", True),
+        ):
+            with self.subTest(text=text):
+                (self.unit / "cgroup.events").write_text(text)
+                self.assertIs(sandy._cgroup_frozen(unit_fd), expected)
+        for text in ("populated 1\n", "frozen 2\n", "frozen 0\nfrozen 1\n"):
+            with self.subTest(text=text):
+                (self.unit / "cgroup.events").write_text(text)
+                with self.assertRaisesRegex(ValueError, "cgroup.events"):
+                    sandy._cgroup_frozen(unit_fd)
+
+    def test_frozen_cgroup_freezes_waits_and_thaws(self):
+        unit_fd = self.open_dir(self.unit)
+        events = self.unit / "cgroup.events"
+        events.write_text("populated 1\nfrozen 0\n")
+        polls = []
+
+        def sleep(_interval):
+            # The kernel reports the freeze after the first poll.
+            polls.append((self.unit / "cgroup.freeze").read_text())
+            events.write_text("populated 1\nfrozen 1\n")
+
+        with patch.object(sandy.time, "sleep", side_effect=sleep):
+            with sandy._frozen_cgroup(unit_fd):
+                self.assertEqual((self.unit / "cgroup.freeze").read_text(), "1")
+        self.assertEqual(polls, ["1"])
+        self.assertEqual((self.unit / "cgroup.freeze").read_text(), "0")
+        # An error in the body thaws the cgroup too.
+        with self.assertRaisesRegex(RuntimeError, "body"):
+            with sandy._frozen_cgroup(unit_fd):
+                raise RuntimeError("body")
+        self.assertEqual((self.unit / "cgroup.freeze").read_text(), "0")
+
+    def test_frozen_cgroup_times_out_and_thaws(self):
+        unit_fd = self.open_dir(self.unit)
+        (self.unit / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+        times = iter((0.0, 1.0, sandy.CGROUP_FREEZE_TIMEOUT))
+        body = MagicMock()
+        with patch.object(
+            sandy.time, "monotonic", side_effect=lambda: next(times)
+        ), patch.object(sandy.time, "sleep") as sleep:
+            with self.assertRaisesRegex(TimeoutError, "did not freeze"):
+                with sandy._frozen_cgroup(unit_fd):
+                    body()
+        body.assert_not_called()
+        sleep.assert_called_once_with(sandy.CGROUP_FREEZE_POLL_INTERVAL)
+        self.assertEqual((self.unit / "cgroup.freeze").read_text(), "0")
+
+    def test_frozen_cgroup_reports_a_failed_thaw(self):
+        unit_fd = self.open_dir(self.unit)
+        writes = []
+
+        def write(dir_fd, name, value):
+            writes.append(value)
+            if value == b"0":
+                raise OSError(errno.EBUSY, "busy")
+
+        with patch.object(sandy, "_write_cgroup_file", side_effect=write):
+            with self.assertRaisesRegex(OSError, "stays frozen"):
+                with sandy._frozen_cgroup(unit_fd):
+                    pass
+            # A failed freeze still tries to thaw.
+            writes.clear()
+            with patch.object(
+                sandy, "_cgroup_frozen", side_effect=ValueError("bad")
+            ), self.assertRaisesRegex(OSError, "stays frozen"):
+                with sandy._frozen_cgroup(unit_fd):
+                    pass
+        self.assertEqual(writes, [b"1", b"0"])
+
+    def test_process_in_scope(self):
+        unit = "sandy-ai-dev.scope"
+        directory = self.fake_process(42, "")
+        proc_fd = self.open_dir(directory)
+        for text, expected in (
+            ("0::/sandy.slice/sandy-ai-dev.scope\n", True),
+            ("0::/sandy.slice/sandy-ai-dev.scope/payload\n", True),
+            ("0::/sandy.slice/sandy-ai-dev.scope/attach-x\n", True),
+            # Container root names the cgroups below payload.
+            ("0::/sandy.slice/sandy-ai-dev.scope/payload/a\nb\n", True),
+            (
+                "0::/sandy.slice/sandy-ai-dev.scope/payload/"
+                + "a" * sandy.PROC_CGROUP_MAX_BYTES
+                + "\n",
+                True,
+            ),
+            ("0::/sandy.slice/sandy-ai-dev.scopex\n", False),
+            ("0::/sandy.slice/sandy-ai-dev.scope", False),
+            ("0::/sandy.slice/sandy-other.scope/payload\n", False),
+            ("0::/sandy.slice\n", False),
+            ("0::/\n", False),
+            ("1:name=systemd:/x\n0::/sandy.slice/sandy-ai-dev.scope\n", False),
+            ("", False),
+        ):
+            with self.subTest(text=text[:60]):
+                (directory / "cgroup").write_text(text)
+                self.assertIs(sandy._process_in_scope(proc_fd, unit), expected)
+
+    def scope_mocks(self, leader=42, opened=None):
+        """Mock the host boundaries of _set_scope_oom_score_adj."""
+        manager = MagicMock()
+        manager.leader.return_value = leader
+        # sandy.os is the os module, so keep the real listdir for the fake.
+        real_listdir = os.listdir
+        manager.listdir.side_effect = lambda path: sorted(
+            real_listdir(self.proc) + ["self", "thread-self", "sys"]
+        )
+
+        def open_process(pid):
+            manager.open_process(pid)
+            path = self.proc / str(pid)
+            if not path.exists():
+                raise FileNotFoundError(path)
+            fd = os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
+            if opened is not None:
+                opened.append(fd)
+            return fd
+
+        @contextmanager
+        def frozen(dir_fd):
+            manager.freeze(dir_fd)
+            yield
+            manager.thaw(dir_fd)
+
+        unit_fd = os.open(self.unit, sandy.DIRECTORY_OPEN_FLAGS)
+        manager.open_unit.return_value = unit_fd
+        stack = ExitStack()
+        stack.enter_context(
+            patch.object(sandy, "_query_machine_leader", manager.leader)
+        )
+        stack.enter_context(patch.object(sandy.os, "listdir", manager.listdir))
+        stack.enter_context(
+            patch.object(sandy, "_open_process_dir", side_effect=open_process)
+        )
+        stack.enter_context(
+            patch.object(sandy, "_open_supervisor_cgroup", manager.open_unit)
+        )
+        stack.enter_context(patch.object(sandy, "_frozen_cgroup", frozen))
+        return manager, unit_fd, stack
+
+    def test_set_scope_oom_score_adj_writes_each_process_of_the_scope(self):
+        scope = "0::/sandy.slice/sandy-ai-dev.scope"
+        processes = {
+            1: "0::/init.scope\n",
+            40: scope + "/supervisor\n",
+            42: scope + "/payload\n",
+            43: scope + "/payload/user.slice/a\n",
+            50: scope + f"/{ATTACH_LEAF}\n",
+            60: "0::/sandy.slice/sandy-other.scope/payload\n",
+            61: "0::/sandy.slice/sandy-ai-dev.scopex/payload\n",
+        }
+        for pid, cgroup in processes.items():
+            self.fake_process(pid, cgroup)
+        opened = []
+        manager, unit_fd, stack = self.scope_mocks(opened=opened)
+        with stack, patch.object(sandy.os, "close", wraps=os.close) as close:
+            self.assertEqual(sandy._set_scope_oom_score_adj("ai-dev", -500), 4)
+        for pid in processes:
+            expected = "-500\n" if pid in (40, 42, 43, 50) else "0\n"
+            with self.subTest(pid=pid):
+                self.assertEqual(
+                    (self.proc / str(pid) / "oom_score_adj").read_text(), expected
+                )
+        # The Leader is queried before the freeze; every write happens while
+        # the scope is frozen; non-PID entries are skipped.
+        names = [entry[0] for entry in manager.mock_calls]
+        self.assertEqual(names[:4], ["leader", "open_unit", "freeze", "listdir"])
+        self.assertEqual(names[-1], "thaw")
+        manager.leader.assert_called_once_with("ai-dev")
+        manager.open_unit.assert_called_once_with("ai-dev")
+        manager.freeze.assert_called_once_with(unit_fd)
+        self.assertEqual(
+            [entry.args[0] for entry in manager.open_process.call_args_list],
+            sorted(processes),
+        )
+        # Each /proc/<pid> descriptor and the unit descriptor are closed.
+        closed = [entry.args[0] for entry in close.call_args_list]
+        for fd in opened + [unit_fd]:
+            self.assertIn(fd, closed)
+
+    def test_set_scope_oom_score_adj_skips_processes_that_exit(self):
+        scope = "0::/sandy.slice/sandy-ai-dev.scope"
+        self.fake_process(42, scope + "/payload\n")
+        gone_cgroup = self.fake_process(43, scope + "/payload\n")
+        self.fake_process(44, scope + "/payload\n")
+        # The kernel gives ENOENT for a file of an exited process, and
+        # ESRCH for a write to it.
+        (gone_cgroup / "cgroup").unlink()
+        manager, _, stack = self.scope_mocks()
+        # A PID in the listing whose directory is gone at open.
+        listing = manager.listdir.side_effect
+        manager.listdir.side_effect = lambda path: listing(path) + ["99"]
+        real_write = sandy._write_oom_score_adj
+
+        def write(path, value, dir_fd=None):
+            if os.readlink(f"/proc/self/fd/{dir_fd}").endswith("/44"):
+                raise ProcessLookupError("gone")
+            return real_write(path, value, dir_fd=dir_fd)
+
+        with stack, patch.object(sandy, "_write_oom_score_adj", side_effect=write):
+            self.assertEqual(sandy._set_scope_oom_score_adj("ai-dev", 100), 1)
+        self.assertEqual((self.proc / "42" / "oom_score_adj").read_text(), "100\n")
+        manager.thaw.assert_called_once()
+
+    def test_set_scope_oom_score_adj_fails_closed_without_the_leader(self):
+        # On a host without a pure cgroup v2 line, or when the container
+        # restarted, the scan does not find the Leader.
+        self.fake_process(42, "0::/sandy.slice/sandy-ai-dev.scope/payload\n")
+        manager, _, stack = self.scope_mocks(leader=77)
+        with stack:
+            with self.assertRaisesRegex(ProcessLookupError, "not in its scope"):
+                sandy._set_scope_oom_score_adj("ai-dev", 100)
+        manager.thaw.assert_called_once()
+
+    def test_set_scope_oom_score_adj_stops_on_other_errors(self):
+        self.fake_process(42, "0::/sandy.slice/sandy-ai-dev.scope/payload\n")
+        manager, unit_fd, stack = self.scope_mocks()
+        error = OSError(errno.EACCES, "denied")
+        with stack, patch.object(
+            sandy, "_write_oom_score_adj", side_effect=error
+        ), patch.object(sandy.os, "close", wraps=os.close) as close:
+            with self.assertRaises(OSError) as raised:
+                sandy._set_scope_oom_score_adj("ai-dev", 100)
+        self.assertIs(raised.exception, error)
+        self.assertIn(call(unit_fd), close.call_args_list)
+        # The fake _frozen_cgroup does not thaw on an error; the real one
+        # does (test_frozen_cgroup_freezes_waits_and_thaws).
+        manager.freeze.assert_called_once_with(unit_fd)
+
+    def test_set_scope_oom_score_adj_validates_the_name_first(self):
+        manager, unit_fd, stack = self.scope_mocks()
+        os.close(unit_fd)
+        with stack:
+            with self.assertRaises(ValueError):
+                sandy._set_scope_oom_score_adj("Bad", 100)
+        manager.leader.assert_not_called()
+        manager.freeze.assert_not_called()
+
+    def test_write_oom_score_adj_at_a_process_directory(self):
+        directory = self.fake_process(42, "")
+        proc_fd = self.open_dir(directory)
+        sandy._write_oom_score_adj("oom_score_adj", -999, dir_fd=proc_fd)
+        self.assertEqual((directory / "oom_score_adj").read_text(), "-999\n")
+        # The file name is not followed as a symlink.
+        (directory / "oom_score_adj").unlink()
+        (directory / "oom_score_adj").symlink_to(self.root / "target")
+        with self.assertRaises(OSError):
+            sandy._write_oom_score_adj("oom_score_adj", 1, dir_fd=proc_fd)
+        self.assertFalse((self.root / "target").exists())
+
+
 class AttachCgroupTests(unittest.TestCase):
     """Attach leaf cgroups in the container's scope.
 
@@ -19168,8 +19490,10 @@ class UpdateCommandTests(unittest.TestCase):
     """sandy update: validation, the systemctl call, and errors.
 
     Mocks: host facts, the running check, systemctl queries, the subprocess
-    wrapper, and _set_shared_limits (SharedLimitTests cover it). E2E tests
-    prove the change of a running scope and of sandy.slice.
+    wrapper, the lifecycle lock, _set_scope_oom_score_adj
+    (ScopeOomScoreAdjTests cover it), and _set_shared_limits
+    (SharedLimitTests cover it). E2E tests prove the change of a running
+    scope and of sandy.slice.
     """
 
     def start_patch(self, target: object, name: str, value: object) -> MagicMock:
@@ -19184,6 +19508,11 @@ class UpdateCommandTests(unittest.TestCase):
         )
         self.live = self.start_patch(sandy, "_read_live_group_limits", DEFAULT_GROUP)
         self.systemctl = self.start_patch(sandy, "_run_secure_subprocess", None)
+        self.set_oom = self.start_patch(sandy, "_set_scope_oom_score_adj", 7)
+        self.lock = MagicMock()
+        lock = patch.object(sandy, "_lifecycle_lock", return_value=self.lock)
+        lock.start()
+        self.addCleanup(lock.stop)
         self.set_shared_limits = self.start_patch(
             sandy.Sandy,
             "_set_shared_limits",
@@ -19201,6 +19530,7 @@ class UpdateCommandTests(unittest.TestCase):
             "cpuset_cpus": None,
             "memory": None,
             "pids_limit": None,
+            "oom_score_adj": None,
             "reset": False,
         }
         values.update(overrides)
@@ -19229,6 +19559,85 @@ class UpdateCommandTests(unittest.TestCase):
                 )
                 self.assertEqual(output, f"I: Updated 'ai-dev': TasksMax={value}\n")
         self.set_shared_limits.assert_not_called()
+        self.set_oom.assert_not_called()
+
+    def test_update_sets_the_oom_score_adj_under_the_lifecycle_lock(self):
+        manager = MagicMock()
+        self.lock.__enter__.side_effect = manager.lock_enter
+        self.lock.__exit__.side_effect = lambda *args: manager.lock_exit()
+        self.set_oom.side_effect = manager.set_oom
+        manager.set_oom.return_value = 7
+        status, output = self.update(oom_score_adj=-500)
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            manager.mock_calls,
+            [call.lock_enter(), call.set_oom("ai-dev", -500), call.lock_exit()],
+        )
+        self.assertEqual(
+            output, "I: Updated 'ai-dev': OOM score adjustment -500 (7 processes)\n"
+        )
+        # Neither the slice nor the scope's TasksMax is read or changed.
+        self.live.assert_not_called()
+        self.systemctl.assert_not_called()
+
+    def test_update_sets_both_values_in_order(self):
+        manager = MagicMock()
+        self.systemctl.side_effect = manager.systemctl
+        self.set_oom.side_effect = manager.set_oom
+        manager.set_oom.return_value = 3
+        status, output = self.update(pids_limit=512, oom_score_adj=100)
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            [entry[0] for entry in manager.mock_calls], ["systemctl", "set_oom"]
+        )
+        self.assertEqual(
+            output,
+            "I: Updated 'ai-dev': TasksMax=512\n"
+            "I: Updated 'ai-dev': OOM score adjustment 100 (3 processes)\n",
+        )
+        # A failed process limit stops before the OOM score adjustment.
+        self.set_oom.reset_mock()
+        self.systemctl.side_effect = subprocess.CalledProcessError(1, ["systemctl"])
+        status, _ = self.update(pids_limit=512, oom_score_adj=100)
+        self.assertEqual(status, 1)
+        self.set_oom.assert_not_called()
+
+    def test_update_reports_a_failed_oom_score_adj(self):
+        for error in (
+            TimeoutError("The processes of the container did not freeze"),
+            ProcessLookupError("The container Leader is not in its scope"),
+            OSError(errno.EACCES, "denied"),
+            ValueError("Invalid container Leader PID"),
+            subprocess.CalledProcessError(1, ["machinectl"]),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.set_oom.side_effect = error
+                status, output = self.update(oom_score_adj=-500)
+                self.assertEqual(status, 1)
+                self.assertTrue(
+                    output.startswith(
+                        "E: Could not update the OOM score adjustment of 'ai-dev': "
+                    ),
+                    output,
+                )
+        # Control characters from the error are not printed.
+        self.set_oom.side_effect = OSError("bad\x1b[2Jname")
+        _, output = self.update(oom_score_adj=-500)
+        self.assertNotIn("\x1b", output)
+
+    def test_update_oom_score_adj_needs_a_running_container_and_its_scope(self):
+        self.running.return_value = None
+        status, output = self.update(oom_score_adj=-500)
+        self.assertEqual(
+            (status, output), (1, "E: Container 'ai-dev' not found or not running\n")
+        )
+        self.running.return_value = "9"
+        self.supervisor_unit_loaded.return_value = False
+        status, output = self.update(oom_score_adj=-500)
+        self.assertEqual(
+            (status, output), (1, "E: Unit 'sandy-ai-dev.scope' does not exist\n")
+        )
+        self.set_oom.assert_not_called()
 
     def test_update_warns_above_the_shared_process_limit(self):
         status, output = self.update(pids_limit=98305)
@@ -19246,7 +19655,15 @@ class UpdateCommandTests(unittest.TestCase):
 
     def test_update_rejects_before_any_change(self):
         for overrides, message in (
-            ({}, "E: update needs --pids-limit, or --shared to change the limits"),
+            (
+                {},
+                "E: update needs --pids-limit or --oom-score-adj, or --shared to "
+                "change the limits",
+            ),
+            (
+                {"memory": GIB, "oom_score_adj": 5},
+                "E: --memory needs --shared",
+            ),
             (
                 {"memory": GIB, "pids_limit": 5},
                 "E: --memory needs --shared: a container has no CPU or memory limit "
@@ -19263,6 +19680,7 @@ class UpdateCommandTests(unittest.TestCase):
                 self.assertIn(message, output)
         self.running.assert_not_called()
         self.systemctl.assert_not_called()
+        self.set_oom.assert_not_called()
 
     def test_update_needs_a_running_container_and_its_scope(self):
         self.running.return_value = None
@@ -19337,6 +19755,14 @@ class UpdateCommandTests(unittest.TestCase):
             ),
             ({}, "E: update --shared needs at least one of --cpuset-cpus"),
             (
+                {"oom_score_adj": -500},
+                "E: update --shared cannot be used with --oom-score-adj",
+            ),
+            (
+                {"memory": GIB, "oom_score_adj": -500},
+                "E: update --shared cannot be used with --oom-score-adj",
+            ),
+            (
                 {"reset": True, "pids_limit": 5},
                 "E: --reset cannot be used with --cpuset-cpus, --memory, or "
                 "--pids-limit",
@@ -19352,6 +19778,7 @@ class UpdateCommandTests(unittest.TestCase):
                 self.assertIn(message, output)
         self.set_shared_limits.assert_not_called()
         self.systemctl.assert_not_called()
+        self.set_oom.assert_not_called()
 
 
 class SharedLimitTests(unittest.TestCase):

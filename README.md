@@ -172,9 +172,10 @@ same seccomp filters and capability bounding set as the container itself, also
 with `-u root` (see "Attached sessions" below).
 - `status` - Show `machinectl status` for the container and its OOM kills.
 - `update` - Change resource limits, as `docker update` does.
-  `update --pids-limit N` changes the process limit of a running container
-  until it stops. `update --shared` changes the limits that all containers
-  share. See "Resource limits" below.
+  `update --pids-limit N` and `update --oom-score-adj N` change the process
+  limit and the OOM score adjustment of a running container until it stops.
+  `update --shared` changes the limits that all containers share. See
+  "Resource limits" below.
 - `list` - Enumerate managed containers and their paths under
   `/var/lib/machines`.
 
@@ -722,7 +723,7 @@ such as `8g`.
 | Processes (per container) | 25% of the shared process limit, at least 8192, never more than half of it | `up --pids-limit N`, `update --pids-limit N` (`-1`: no limit of its own) |
 | `/tmp` (per container) | 512 MiB | `up --tmp-size SIZE` (`0`: the tmpfs default, half of the host memory) |
 | Swap | none | - |
-| OOM score adjustment (per container) | the value of the `sandy` process | `up --oom-score-adj N` |
+| OOM score adjustment (per container) | the value of the `sandy` process | `up --oom-score-adj N`, `update --oom-score-adj N` |
 
 Examples of the defaults: a host with 4 GiB of memory shares 2 GiB with the
 containers, 8 GiB shares 4 GiB, 16 GiB shares 12 GiB, and 64 GiB shares 48
@@ -750,8 +751,14 @@ containers use now makes the kernel end processes at once. A malformed
 `shared_limits.json` stops `up` until `update --shared --reset`.
 
 `sudo sandy -c NAME update --pids-limit N` changes the process limit of a
-running container. The change ends with the container; the next `up` uses
-its own flags. A container has no CPU or memory limit of its own.
+running container. `sudo sandy -c NAME update --oom-score-adj N` gives each
+process of a running container, and each later `bash` and `exec` session,
+the OOM score adjustment. It also replaces a value that a process set
+itself, and the lowest value that a process can set. Sandy freezes the
+container during the change, and fails when the container does not freeze
+within 5 seconds. The changes end with the
+container; the next `up` uses its own flags. A container has no CPU or
+memory limit of its own.
 
 When the shared memory runs out, the kernel ends the process with the
 highest score in `sandy.slice`. The score is the memory use of the process

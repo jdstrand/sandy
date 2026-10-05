@@ -474,7 +474,8 @@ reserve outside of it, and settings of each container inside it.
   `/tmp` tmpfs gets a `size=` (`--tmp-size`). A container has no CPU or
   memory limit of its own.
 - `up --oom-score-adj N` gives the container and each session an OOM score
-  adjustment.
+  adjustment. `update --oom-score-adj N` changes it for a running
+  container.
 
 | Limit | Where | Default |
 | --- | --- | --- |
@@ -497,6 +498,18 @@ The options have the names and units of `docker run` and `podman run`:
   The change ends with the scope (measured: `systemctl set-property` on a
   running transient scope writes `/run/systemd/transient/<unit>.d/`, which
   systemd removes when the scope stops).
+- `update --oom-score-adj N` changes the OOM score adjustment of a running
+  container. Under the lifecycle lock, Sandy freezes the scope's cgroup
+  (`cgroup.freeze`), waits for `frozen 1` in `cgroup.events` (at most 5
+  seconds), and writes the value to the `oom_score_adj` of each host process
+  whose `/proc/<pid>/cgroup` is the scope or below it: nspawn, the Leader,
+  the container's processes, and the attach leaves. Each write goes through
+  the pinned `/proc/<pid>` directory of the checked process. Then Sandy
+  thaws the scope, also after an error. While the scope is frozen, no
+  process of the container can start a process with the earlier value. The
+  scan must find the Leader, otherwise the update fails. As host root, each
+  write also sets the lowest value that the process can set. The value ends
+  with the container. Not measured yet.
 - `update --shared [--cpuset-cpus LIST] [-m SIZE] [--pids-limit N]` and
   `update --shared --reset` change the shared limits, with or without
   running containers. `-m 0` and `--pids-limit -1` mean no shared limit;
@@ -527,9 +540,11 @@ nspawn's `--oom-score-adjust=` fails with `--private-users` (measured), so
 `up` sets its own `/proc/self/oom_score_adj` while it starts the scope, and
 restores it. The container inherits the value. The entry helper reads the
 Leader's value through its pinned `/proc/<pid>` directory, and writes it to
-its own process after the bounding set check, before the session starts. As
-host root, each write also sets the lowest value that the container and the
-session can set; container root cannot go lower (measured).
+its own process under the lifecycle lock, before it joins its attach leaf.
+So `update --oom-score-adj` cannot change the Leader between the read and
+the write. As host root, each write also sets the lowest value that the
+container and the session can set; container root cannot go lower
+(measured).
 
 When the kernel ends processes of a container because memory ran out, the
 `up` console, `bash`, and `exec` report it when the session ends. Sandy
