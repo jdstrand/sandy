@@ -546,11 +546,61 @@ class SharedLimitStateTests(unittest.TestCase):
                         self.SHOW,
                     ],
                 )
-                # State that remains after the stop is an error.
+                # State that remains after the stop is an error, and only
+                # the cgroup of an inactive slice gets a start.
                 context.on_stop = None
+                context.commands.clear()
                 context.shows = [self.show("active"), self.show("active")]
                 with self.assertRaisesRegex(E2EFailure, "sandy.slice state remains"):
                     E2EContext.remove_shared_slice(context)
+                self.assertNotIn(
+                    ["systemctl", "start", "sandy.slice"], context.commands
+                )
+
+    def test_remove_shared_slice_starts_and_stops_an_inactive_slice_cgroup(self):
+        # Regression test: a run that failed before any container started
+        # left the cgroup that systemctl set-property made for the inactive
+        # slice. A stop of an inactive unit leaves it, so the cleanup failed,
+        # and the next run refused to start. Now a start and a stop remove
+        # it. Mocks: systemctl, which removes the cgroup at the second stop
+        # only, and the slice cgroup, a temporary directory.
+        start_and_stop = [
+            self.SHOW,
+            ["systemctl", "revert", "sandy.slice"],
+            ["systemctl", "stop", "sandy.slice"],
+            self.SHOW,
+            ["systemctl", "start", "sandy.slice"],
+            ["systemctl", "stop", "sandy.slice"],
+            self.SHOW,
+        ]
+        for removed in (True, False):
+            with self.subTest(removed=removed):
+                with tempfile.TemporaryDirectory() as parent:
+                    cgroup = Path(parent) / "sandy.slice"
+                    events = cgroup / "cgroup.events"
+                    cgroup.mkdir()
+                    events.write_text("populated 0\nfrozen 0\n", encoding="ascii")
+                    with patch.object(support, "SLICE_CGROUP", cgroup):
+                        context = SliceProbeContext(Path(parent))
+                        context.shows = [self.show(), self.show(), self.show()]
+                        stops: list[int] = []
+
+                        def stop() -> None:
+                            stops.append(1)
+                            if removed and len(stops) == 2:
+                                events.unlink()
+                                cgroup.rmdir()
+
+                        context.on_stop = stop
+                        if removed:
+                            E2EContext.remove_shared_slice(context)
+                        else:
+                            with self.assertRaisesRegex(
+                                E2EFailure,
+                                f"^sandy.slice state remains: cgroup {cgroup}$",
+                            ):
+                                E2EContext.remove_shared_slice(context)
+                    self.assertEqual(context.commands, start_and_stop)
 
     def test_preflight_refuses_a_pre_existing_slice(self):
         with tempfile.TemporaryDirectory() as parent:

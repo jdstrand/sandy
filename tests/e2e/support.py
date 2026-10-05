@@ -998,7 +998,10 @@ class E2EContext:
 
         Preflight proved that the slice had no state, so its state belongs to
         this run. A stop would also stop the units in the slice, so the slice
-        must be empty.
+        must be empty. A stop of the inactive slice leaves the cgroup that
+        systemctl set-property made for it (see slice_artifacts), for example
+        after a run that failed before any container started (measured on
+        systemd 249 and 257). A start and a stop make systemd remove it.
         """
         if not self.slice_artifacts():
             return
@@ -1011,6 +1014,12 @@ class E2EContext:
         self.run(["systemctl", "revert", SLICE])
         self.run(["systemctl", "stop", SLICE])
         remaining = self.slice_artifacts()
+        if remaining == [f"cgroup {SLICE_CGROUP}"]:
+            # Only the cgroup of the inactive slice is left. It has no
+            # process (see above), so the start runs nothing in it.
+            self.run(["systemctl", "start", SLICE])
+            self.run(["systemctl", "stop", SLICE])
+            remaining = self.slice_artifacts()
         if remaining:
             raise E2EFailure(f"{SLICE} state remains: " + ", ".join(remaining))
 
