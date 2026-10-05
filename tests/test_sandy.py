@@ -2673,6 +2673,39 @@ class FilesystemSafetyTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o640)
             self.assertEqual(list(parent.glob(".sandy-*.tmp")), [])
 
+    def test_write_names_its_temporary_file_by_its_pattern(self):
+        # rm --cache finds the temporary files of _write by this pattern, and
+        # removes them only under the port mapping lock. Mocks: os.replace,
+        # which records the temporary name and then replaces.
+        names: list[str] = []
+        real_replace = os.replace
+
+        def replace(
+            source: str,
+            destination: str,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
+            names.append(source)
+            real_replace(
+                source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.opened_parent(Path(temp_dir)), patch.object(
+                sandy.os, "replace", side_effect=replace
+            ):
+                sandy._write("/managed/state", "content")
+        self.assertEqual(len(names), 1)
+        self.assertIsNotNone(sandy.WRITE_TEMPORARY_PATTERN.fullmatch(names[0]))
+        for name in (
+            ".sandy-0.tmp",
+            f".sandy-{'0' * 32}.tmp~",
+            f"sandy-{'0' * 32}.tmp",
+        ):
+            self.assertIsNone(sandy.WRITE_TEMPORARY_PATTERN.fullmatch(name))
+
     def test_write_rejects_invalid_inputs_and_destination_owner(self):
         with self.assertRaises(ValueError):
             sandy._write("/managed/state", b"bytes")
@@ -10949,6 +10982,12 @@ class CacheTests(unittest.TestCase):
             # the lock of the addresses.
             up_lock = cache / "up-ai-dev.lock"
             addresses_lock = cache / sandy.ADDRESSES_LOCK_FILENAME
+            # The lock of the purge is permanent too. A temporary file of an
+            # atomic write waits for the second step, under the port mapping
+            # lock; a look-alike of one is payload.
+            purge_lock = cache / sandy.PURGE_LOCK_FILENAME
+            temporary = cache / f".sandy-{'a' * 32}.tmp"
+            temporary_look_alike = cache / ".sandy-short.tmp"
             look_alike = cache / "up-Bad.lock"
             archive = cache / "cache.tar"
             directory = cache / "partial"
@@ -10961,6 +11000,9 @@ class CacheTests(unittest.TestCase):
             shared_limits_lock.write_text("")
             up_lock.write_text("")
             addresses_lock.write_text("")
+            purge_lock.write_text("")
+            temporary.write_text("")
+            temporary_look_alike.write_text("")
             look_alike.write_text("")
             archive.write_text("archive")
             directory.mkdir()
@@ -10982,12 +11024,51 @@ class CacheTests(unittest.TestCase):
             self.assertTrue(shared_limits_lock.exists())
             self.assertTrue(up_lock.exists())
             self.assertTrue(addresses_lock.exists())
+            self.assertTrue(purge_lock.exists())
+            self.assertTrue(temporary.exists())
+            self.assertFalse(temporary_look_alike.exists())
             self.assertFalse(look_alike.exists())
             self.assertFalse(archive.exists())
             self.assertFalse(state_alias.exists())
             self.assertFalse(directory_alias.exists())
             self.assertTrue(directory.exists())
             rmtree.assert_called_once_with(str(directory))
+
+    def test_clear_cache_removes_only_temporary_files_when_asked(self):
+        # The second step of the purge, under the port mapping lock: it
+        # removes the temporary files of atomic writes, and nothing else.
+        # Mocks: the cache directory, a real temporary directory, and the
+        # removal of a directory tree.
+        instance = make_sandy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = Path(temp_dir)
+            temporary = cache / f".sandy-{'b' * 32}.tmp"
+            archive = cache / "cache.tar"
+            directory = cache / "partial"
+            lock = cache / sandy.PORT_MAPPINGS_LOCK_FILENAME
+            temporary.write_text("")
+            archive.write_text("archive")
+            directory.mkdir()
+            lock.write_text("")
+            with patch.object(
+                instance, "_get_cache_dir", return_value=temp_dir
+            ), patch.object(sandy, "_remove_managed_tree") as rmtree:
+                self.assertTrue(
+                    instance._clear_cache_contents(
+                        preserve_state=True, temporary_files=True
+                    )
+                )
+                # Nothing more to remove.
+                self.assertFalse(
+                    instance._clear_cache_contents(
+                        preserve_state=True, temporary_files=True
+                    )
+                )
+            self.assertFalse(temporary.exists())
+            self.assertTrue(archive.exists())
+            self.assertTrue(directory.exists())
+            self.assertTrue(lock.exists())
+            rmtree.assert_not_called()
 
     def test_create_cache_writes_manifest_and_hardened_tar_command(self):
         instance = make_sandy()
@@ -11269,56 +11350,164 @@ class CacheTests(unittest.TestCase):
         write.assert_not_called()
 
     def test_purge_cache_all_outcomes(self):
+        # Regression test: rm --cache held the port mapping lock for its whole
+        # purge. Meanwhile, an up under the lifecycle lock failed after 5 s,
+        # and the stop after the last session gave up after 5 s. Now the
+        # purge lock keeps purges apart, the payload goes with no port mapping
+        # lock, and only the temporary files of atomic writes go under it.
+        # Mocks: the check of the cache directory, both locks, and both
+        # steps, which record their order.
         instance = make_sandy()
+        purged = "except coordination state and saved shared limits"
+        retained = "retained only coordination state and saved shared limits"
         cases = (
-            (False, False, "No cache directory"),
-            (
-                True,
-                True,
-                "except coordination state and saved shared limits",
-            ),
-            (
-                True,
-                False,
-                "retained only coordination state and saved shared limits",
-            ),
+            (False, (), "No cache directory"),
+            (True, (True, False), purged),
+            (True, (False, True), purged),
+            (True, (False, False), retained),
         )
         for cache_exists, removed, message in cases:
-            with self.subTest(message=message):
+            with self.subTest(cache_exists=cache_exists, removed=removed):
+                manager = MagicMock()
+                manager.clear.side_effect = list(removed)
 
-                @contextmanager
-                def locked():
-                    yield None
+                def lock(holder: MagicMock) -> Callable[..., object]:
+                    @contextmanager
+                    def held(*_args: object, **_kwargs: object) -> Iterator[None]:
+                        holder.enter()
+                        try:
+                            yield
+                        finally:
+                            holder.exit()
+
+                    return held
 
                 with patch.object(
-                    instance,
-                    "_get_cache_dir",
-                    return_value="/cache",
+                    instance, "_get_cache_dir", return_value="/cache"
+                ), patch.object(
+                    sandy.os.path, "exists", return_value=cache_exists
+                ), patch.object(
+                    sandy, "_purge_lock", side_effect=lock(manager.purge)
+                ), patch.object(
+                    instance, "_port_mapping_lock", side_effect=lock(manager.port)
+                ) as port_lock, patch.object(
+                    instance, "_clear_cache_contents", manager.clear
                 ):
-                    with patch.object(
-                        sandy.os.path,
-                        "exists",
-                        return_value=cache_exists,
-                    ):
-                        with patch.object(
-                            instance,
-                            "_port_mapping_lock",
-                            return_value=locked(),
-                        ) as lock:
-                            with patch.object(
-                                instance,
-                                "_clear_cache_contents",
-                                return_value=removed,
-                            ) as clear:
-                                with captured_output() as (stdout, _):
-                                    instance._purge_cache()
+                    with captured_output() as (stdout, _):
+                        instance._purge_cache()
                 self.assertIn(message, stdout.getvalue())
-                if cache_exists:
-                    lock.assert_called_once_with(exclusive=True)
-                    clear.assert_called_once_with(preserve_state=True)
-                else:
-                    lock.assert_not_called()
-                    clear.assert_not_called()
+                if not cache_exists:
+                    self.assertEqual(manager.mock_calls, [])
+                    continue
+                port_lock.assert_called_once_with(exclusive=True)
+                self.assertEqual(
+                    manager.mock_calls,
+                    [
+                        call.purge.enter(),
+                        call.clear(preserve_state=True),
+                        call.port.enter(),
+                        call.clear(preserve_state=True, temporary_files=True),
+                        call.port.exit(),
+                        call.purge.exit(),
+                    ],
+                )
+
+    def test_purge_lock_holds_an_exclusive_flock_on_its_stable_file(self):
+        # Mocks: the stable lock file and flock, which record their calls.
+        handle = MagicMock()
+        handle.fileno.return_value = 9
+        with patch.object(
+            sandy, "_open_stable_lock_file", return_value=handle
+        ) as opened, patch.object(sandy.fcntl, "flock") as flock:
+            with sandy._purge_lock():
+                self.assertEqual(flock.call_args_list, [call(9, sandy.fcntl.LOCK_EX)])
+                handle.close.assert_not_called()
+        opened.assert_called_once_with(
+            os.path.join(sandy.SYSTEMD_MACHINES, "sandy.__cache", "purge.lock")
+        )
+        self.assertEqual(
+            flock.call_args_list,
+            [call(9, sandy.fcntl.LOCK_EX), call(9, sandy.fcntl.LOCK_UN)],
+        )
+        handle.close.assert_called_once_with()
+
+        # An error of the flock closes the file; an error of the unlock does
+        # not hide the result of the purge.
+        handle.reset_mock()
+        with patch.object(
+            sandy, "_open_stable_lock_file", return_value=handle
+        ), patch.object(sandy.fcntl, "flock", side_effect=OSError(errno.EINTR, "x")):
+            with self.assertRaises(OSError):
+                with sandy._purge_lock():
+                    self.fail("the purge ran without the lock")
+        handle.close.assert_called_once_with()
+        handle.reset_mock()
+        with patch.object(
+            sandy, "_open_stable_lock_file", return_value=handle
+        ), patch.object(
+            sandy.fcntl, "flock", side_effect=[None, OSError(errno.EBADF, "x")]
+        ):
+            with sandy._purge_lock():
+                pass
+        handle.close.assert_called_once_with()
+
+    def test_purge_removes_the_payload_without_the_port_mapping_lock(self):
+        # Regression test: rm --cache removed the whole payload under the port
+        # mapping lock. Mocks: the cache directory, which is a real temporary
+        # one; the lock file and flock of the purge lock; the port mapping
+        # lock, which records when it is held; and the removals, which record
+        # whether it is held.
+        instance = make_sandy()
+        held = [False]
+        events: list[str] = []
+        temporary = f".sandy-{'c' * 32}.tmp"
+
+        @contextmanager
+        def port_lock(exclusive: bool) -> Iterator[None]:
+            self.assertTrue(exclusive)
+            held[0] = True
+            try:
+                yield
+            finally:
+                held[0] = False
+
+        def remove_tree(path: str) -> None:
+            events.append(f"{os.path.basename(path)}: {held[0]}")
+            os.unlink(os.path.join(path, "file"))
+            os.rmdir(path)
+
+        real_remove = os.remove
+
+        def remove(path: str) -> None:
+            events.append(f"{os.path.basename(path)}: {held[0]}")
+            real_remove(path)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = Path(temp_dir)
+            (cache / "payload").mkdir()
+            (cache / "payload" / "file").write_text("payload")
+            (cache / "cache.tar").write_text("archive")
+            (cache / temporary).write_text("")
+            with patch.object(
+                instance, "_get_cache_dir", return_value=temp_dir
+            ), patch.object(
+                instance, "_port_mapping_lock", side_effect=port_lock
+            ), patch.object(
+                sandy, "_remove_managed_tree", side_effect=remove_tree
+            ), patch.object(
+                sandy.os, "remove", side_effect=remove
+            ), patch.object(
+                sandy, "_open_stable_lock_file", return_value=MagicMock()
+            ), patch.object(
+                sandy.fcntl, "flock"
+            ):
+                with captured_output():
+                    instance._purge_cache()
+            self.assertEqual(list(cache.iterdir()), [])
+        self.assertEqual(
+            sorted(events),
+            sorted(["cache.tar: False", "payload: False", f"{temporary}: True"]),
+        )
 
 
 class ExecutionTests(unittest.TestCase):

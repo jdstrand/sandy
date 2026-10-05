@@ -46,8 +46,15 @@ LIFECYCLE_LOCK = CACHE_DIR / "lifecycle.lock"
 SHARED_LIMITS = CACHE_DIR / "shared_limits.json"
 SHARED_LIMITS_LOCK = CACHE_DIR / "shared_limits.lock"
 ADDRESSES_LOCK = CACHE_DIR / "addresses.lock"
+PURGE_LOCK = CACHE_DIR / "purge.lock"
 # Product code never removes these stable lock inodes.
-PERSISTENT_LOCKS = (PORT_LOCK, LIFECYCLE_LOCK, SHARED_LIMITS_LOCK, ADDRESSES_LOCK)
+PERSISTENT_LOCKS = (
+    PORT_LOCK,
+    LIFECYCLE_LOCK,
+    SHARED_LIMITS_LOCK,
+    ADDRESSES_LOCK,
+    PURGE_LOCK,
+)
 # Nor the saved shared limits, which are configuration (rm --cache keeps them).
 PERSISTENT_FILES = (*PERSISTENT_LOCKS, SHARED_LIMITS)
 # up waits for the lifecycle lock for at most 10 seconds (LIFECYCLE_LOCK_TIMEOUT

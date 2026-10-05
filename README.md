@@ -142,7 +142,8 @@ $ sudo /path/to/sandy [GLOBAL OPTIONS] [COMMAND] [COMMAND OPTIONS]
   When the console exits, the container stops, unless another `bash` or
   `exec` session is still attached; then the last session to exit stops it.
   If the port mapping lock stays busy for 5 seconds at that time (for
-  example, during `rm --cache`), or the container does not stop in 5 more
+  example, while an `up` publishes many ports), or the container does not
+  stop in 5 more
   seconds, the container keeps running and the session says so; stop it
   with `down`.
   Key flags:
@@ -421,12 +422,17 @@ Port mapping state uses a persistent `0600` coordination lock in
 `/var/lib/machines/sandy.__cache`. Once created, `rm --cache` retains that
 empty lock and its directory so concurrent Sandy processes always coordinate
 on the same inode; it contains no port mappings or cache payload. The
-`lifecycle.lock`, `shared_limits.lock`, and `up-<name>.lock` files in the same
-directory are retained in the same way. `rm --cache` also keeps
-`shared_limits.json`, the shared limits that `update --shared` saved. `up`
+`lifecycle.lock`, `shared_limits.lock`, `addresses.lock`, `purge.lock`, and
+`up-<name>.lock` files in the same directory are retained in the same way.
+`rm --cache` also keeps `shared_limits.json`, the shared limits that
+`update --shared` saved. `rm --cache` removes the cache payload under
+`purge.lock` only, so one purge runs at a time; it holds the port mapping
+lock only for a short step at the end, to remove the temporary files of
+interrupted state writes. `up`
 without `-d`, or with directories to mount, publishes its ports under the
 lifecycle lock, so it waits for the port mapping lock there for at most 5
-seconds. When that lock stays busy (for example, during `rm --cache`), `up`
+seconds. When that lock stays busy (for example, while another `up`
+publishes many ports), `up`
 fails before it starts the container. `up -d` with no directories to mount
 takes no lifecycle lock, so it waits until the port mapping lock is free.
 `up` holds the port mapping lock from the publish until it has pinned the

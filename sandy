@@ -65,6 +65,9 @@ LIFECYCLE_LOCK_TIMEOUT: Final = 10
 # A new image reserves its address: it reads the /init.sh of the other images
 # and writes its own. This lock, in the same directory, makes that one step.
 ADDRESSES_LOCK_FILENAME: Final = "addresses.lock"
+# rm --cache takes this lock, in the same directory, so that two purges do not
+# remove the same tree. No other command waits for it.
+PURGE_LOCK_FILENAME: Final = "purge.lock"
 # Each container name has its own up lock, "up-<name>.lock", in the same
 # directory (see _acquire_up_lock).
 UP_LOCK_FILENAME_PREFIX: Final = "up-"
@@ -2382,6 +2385,11 @@ def _validate_existing_write_target(parent_fd: int, basename: str) -> None:
         raise PermissionError("Existing write destination has multiple links")
 
 
+# _write writes to a temporary file of this name in the directory of the
+# target, and then renames it over the target.
+WRITE_TEMPORARY_PATTERN: Final = re.compile(r"\.sandy-[0-9a-f]{32}\.tmp")
+
+
 def _write(path: str, content: str, mode: int = 0o0600) -> None:
     """Atomically write a file relative to a verified managed directory."""
     if not isinstance(content, str):
@@ -3177,6 +3185,28 @@ def _addresses_lock() -> Iterator[None]:
     limit.
     """
     lock_path = os.path.join(SYSTEMD_MACHINES, "sandy.__cache", ADDRESSES_LOCK_FILENAME)
+    lock_handle = _open_stable_lock_file(lock_path)
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_handle.close()
+
+
+@contextmanager  # ensures flock acquisition/release is paired at the call site
+def _purge_lock() -> Iterator[None]:
+    """Hold the lock of the cache purge exclusively.
+
+    The cache directory must already exist. Only rm --cache takes this lock,
+    so a purge waits only for another purge, and the wait has no limit.
+    """
+    lock_path = os.path.join(SYSTEMD_MACHINES, "sandy.__cache", PURGE_LOCK_FILENAME)
     lock_handle = _open_stable_lock_file(lock_path)
     try:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
@@ -7967,8 +7997,16 @@ class Sandy:
         if os.path.exists(manifest_path):
             os.unlink(manifest_path)
 
-    def _clear_cache_contents(self, preserve_state: bool = True) -> bool:
-        """Clear cache contents while preserving transaction coordination."""
+    def _clear_cache_contents(
+        self, preserve_state: bool = True, *, temporary_files: bool = False
+    ) -> bool:
+        """Clear cache contents while preserving transaction coordination.
+
+        A temporary file of an atomic write (see _write) can belong to an
+        update of the port mapping state in flight. So with temporary_files,
+        remove only those files, under the port mapping lock of the caller;
+        without it, remove everything else, and leave those files.
+        """
         cache_dir = self._get_cache_dir()
         if not os.path.exists(cache_dir):
             return False
@@ -7981,6 +8019,7 @@ class Sandy:
                 LIFECYCLE_LOCK_FILENAME,
                 SHARED_LIMITS_LOCK_FILENAME,
                 ADDRESSES_LOCK_FILENAME,
+                PURGE_LOCK_FILENAME,
             ) or _is_up_lock_filename(entry):
                 # Each lock inode is permanent. Removing one could split
                 # queued and new processes across different locks.
@@ -7989,6 +8028,8 @@ class Sandy:
                 # Configuration that root saved, not a cache.
                 continue
             if preserve_state and entry == PORT_MAPPINGS_FILENAME:
+                continue
+            if bool(WRITE_TEMPORARY_PATTERN.fullmatch(entry)) != temporary_files:
                 continue
             try:
                 entry_stat = os.lstat(entry_path)
@@ -8161,8 +8202,19 @@ class Sandy:
         """Remove cache payloads while retaining stable coordination state."""
         cache_dir = self._get_cache_dir()
         if os.path.exists(cache_dir):
-            with self._port_mapping_lock(exclusive=True):
+            # One purge at a time: two removals of one tree would fail. Only
+            # purges wait for this lock, so the removal of the payload, which
+            # can take long, holds no lock that up or an attach waits for.
+            with _purge_lock():
                 removed_any = self._clear_cache_contents(preserve_state=True)
+                # Then the temporary files of atomic writes, under the port
+                # mapping lock: one can belong to an update of the port
+                # mapping state in flight. This step is short.
+                with self._port_mapping_lock(exclusive=True):
+                    if self._clear_cache_contents(
+                        preserve_state=True, temporary_files=True
+                    ):
+                        removed_any = True
             if removed_any:
                 print(
                     f"I: Purged cache directory ('{cache_dir}') except coordination state and saved shared limits"
