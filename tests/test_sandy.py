@@ -17795,13 +17795,15 @@ class StartFailureTests(unittest.TestCase):
         self.assertIn("did not become ready", stdout.getvalue())
 
     def test_stop_failed_start_terminates_then_removes_port_rules(self):
+        # A supervisor that ends after SIGTERM gives no warning.
         instance = make_sandy()
         manager = MagicMock()
         manager.supervisor.poll.return_value = None
         with patch.object(
             instance, "_cleanup_port_mappings_for_container", manager.cleanup
         ):
-            instance._stop_failed_start(manager.supervisor)
+            with captured_output() as (stdout, _):
+                instance._stop_failed_start(manager.supervisor)
         self.assertEqual(
             manager.mock_calls,
             [
@@ -17811,8 +17813,11 @@ class StartFailureTests(unittest.TestCase):
                 call.cleanup("ai-dev"),
             ],
         )
+        self.assertEqual(stdout.getvalue(), "")
 
     def test_stop_failed_start_kills_after_timeout(self):
+        # A supervisor that ends after SIGKILL gives no warning: only one
+        # that SIGKILL does not end gives it.
         instance = make_sandy()
         manager = MagicMock()
         manager.supervisor.poll.return_value = None
@@ -17823,7 +17828,8 @@ class StartFailureTests(unittest.TestCase):
         with patch.object(
             instance, "_cleanup_port_mappings_for_container", manager.cleanup
         ):
-            instance._stop_failed_start(manager.supervisor)
+            with captured_output() as (stdout, _):
+                instance._stop_failed_start(manager.supervisor)
         self.assertEqual(
             manager.mock_calls[1:],
             [
@@ -17834,6 +17840,7 @@ class StartFailureTests(unittest.TestCase):
                 call.cleanup("ai-dev"),
             ],
         )
+        self.assertEqual(stdout.getvalue(), "")
 
     def test_stop_failed_start_gives_up_after_its_timeouts(self):
         # Regression test: after SIGKILL, the stop waited with no limit, and
