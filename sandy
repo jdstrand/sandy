@@ -9764,9 +9764,10 @@ class Sandy:
                                     env=container_environment,
                                     pass_fds=tuple(runtime_fds),
                                 )
-                            # From now on, the stop of the container
-                            # removes the ports, or _stop_failed_start
-                            # does.
+                            # From now on, other steps remove the ports:
+                            # the handler of a failed pin or marker, in
+                            # this hold; _stop_failed_start, after a later
+                            # failure; or the stop of the container.
                             started = True
                         except (OSError, ValueError) as exc:
                             # The value could not be set, or the start
