@@ -224,13 +224,27 @@ def assert_not_contains(result: CommandResult, unexpected: str) -> None:
         )
 
 
+def _flock_inode(path: Path) -> str:
+    """Return the inode field that /proc/locks shows for a lock of path.
+
+    The <major>:<minor> field is not compared. /proc/locks shows the device
+    of the superblock in hex. On btrfs, stat() shows a different anonymous
+    device for each subvolume, so a device check never matches there. Even
+    the superblock device does not separate btrfs subvolumes, which can
+    reuse inode numbers. The callers also match the pid, so a false match
+    needs the same process to lock another file with the same inode number.
+    """
+    return str(path.stat().st_ino)
+
+
 def waits_for_flock(pid: int, path: Path) -> bool:
     """Return True when process pid waits in flock(2) for the lock of path.
 
     /proc/locks shows each waiter after the lock that blocks it, as
     "N: -> FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF".
+    Only the inode is compared; see _flock_inode.
     """
-    inode = str(path.stat().st_ino)
+    inode = _flock_inode(path)
     for line in PROC_LOCKS.read_text(encoding="utf-8").splitlines():
         fields = line.split()
         if (
@@ -248,8 +262,9 @@ def holds_flock(pid: int, path: Path) -> bool:
 
     /proc/locks shows a held lock as
     "N: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF".
+    Only the inode is compared; see _flock_inode.
     """
-    inode = str(path.stat().st_ino)
+    inode = _flock_inode(path)
     for line in PROC_LOCKS.read_text(encoding="utf-8").splitlines():
         fields = line.split()
         if (
