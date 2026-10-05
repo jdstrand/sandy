@@ -562,9 +562,9 @@ class SharedLimitStateTests(unittest.TestCase):
                             remains += f", cgroup {cgroup}"
                         context.commands.clear()
                         context.shows = [self.show("active"), self.show("active")]
+                        message = f"sandy.slice state remains: {remains}"
                         with self.assertRaisesRegex(
-                            E2EFailure,
-                            f"^sandy.slice state remains: {re.escape(remains)}$",
+                            E2EFailure, f"^{re.escape(message)}$"
                         ):
                             E2EContext.remove_shared_slice(context)
                         self.assertEqual(
@@ -615,9 +615,9 @@ class SharedLimitStateTests(unittest.TestCase):
                         if removed:
                             E2EContext.remove_shared_slice(context)
                         else:
-                            remains = re.escape(f"cgroup {cgroup}")
+                            message = f"sandy.slice state remains: cgroup {cgroup}"
                             with self.assertRaisesRegex(
-                                E2EFailure, f"^sandy.slice state remains: {remains}$"
+                                E2EFailure, f"^{re.escape(message)}$"
                             ):
                                 E2EContext.remove_shared_slice(context)
                     self.assertEqual(context.commands, start_and_stop)
