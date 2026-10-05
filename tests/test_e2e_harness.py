@@ -546,16 +546,34 @@ class SharedLimitStateTests(unittest.TestCase):
                         self.SHOW,
                     ],
                 )
-                # State that remains after the stop is an error, and only
-                # the cgroup of an inactive slice gets a start.
+                # State that remains after the stop is an error. Only the
+                # cgroup of an inactive slice gets a start: a slice that
+                # stays active gets none, also when its cgroup remains.
                 context.on_stop = None
-                context.commands.clear()
-                context.shows = [self.show("active"), self.show("active")]
-                with self.assertRaisesRegex(E2EFailure, "sandy.slice state remains"):
-                    E2EContext.remove_shared_slice(context)
-                self.assertNotIn(
-                    ["systemctl", "start", "sandy.slice"], context.commands
-                )
+                for with_cgroup in (False, True):
+                    with self.subTest(with_cgroup=with_cgroup):
+                        remains = "sandy.slice is active"
+                        if with_cgroup:
+                            cgroup.mkdir()
+                            events.write_text(
+                                "populated 0\nfrozen 0\n", encoding="ascii"
+                            )
+                            remains += f", cgroup {cgroup}"
+                        context.commands.clear()
+                        context.shows = [self.show("active"), self.show("active")]
+                        with self.assertRaisesRegex(
+                            E2EFailure, f"^sandy.slice state remains: {remains}$"
+                        ):
+                            E2EContext.remove_shared_slice(context)
+                        self.assertEqual(
+                            context.commands,
+                            [
+                                self.SHOW,
+                                ["systemctl", "revert", "sandy.slice"],
+                                ["systemctl", "stop", "sandy.slice"],
+                                self.SHOW,
+                            ],
+                        )
 
     def test_remove_shared_slice_starts_and_stops_an_inactive_slice_cgroup(self):
         # Regression test: a run that failed before any container started
