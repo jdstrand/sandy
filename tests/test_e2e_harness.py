@@ -67,6 +67,10 @@ from tests.e2e.test_scope import _has_new_only_child, _leaves, _read_cgroup_file
 # The host directory in which up makes its temporary directories. No test reads
 # or changes it: preflight lists entries there, and cleanup removes them.
 HOST_UP_TEMPORARY_ROOT = support.UP_TEMPORARY_ROOT
+# The name prefix of a temporary directory whose path goes into an error
+# pattern. "+" is a regex metacharacter: a pattern that does not escape the
+# path does not match it.
+REGEX_METACHARACTER_PREFIX = "re+"
 
 
 def setUpModule() -> None:
@@ -510,7 +514,7 @@ class SharedLimitStateTests(unittest.TestCase):
                     context.slice_artifacts()
 
     def test_remove_shared_slice_reverts_and_stops_an_empty_slice(self):
-        with tempfile.TemporaryDirectory() as parent:
+        with tempfile.TemporaryDirectory(prefix=REGEX_METACHARACTER_PREFIX) as parent:
             cgroup = Path(parent) / "sandy.slice"
             events = cgroup / "cgroup.events"
             with patch.object(support, "SLICE_CGROUP", cgroup):
@@ -595,7 +599,9 @@ class SharedLimitStateTests(unittest.TestCase):
         ]
         for removed in (True, False):
             with self.subTest(removed=removed):
-                with tempfile.TemporaryDirectory() as parent:
+                with tempfile.TemporaryDirectory(
+                    prefix=REGEX_METACHARACTER_PREFIX
+                ) as parent:
                     cgroup = Path(parent) / "sandy.slice"
                     events = cgroup / "cgroup.events"
                     cgroup.mkdir()
@@ -2210,7 +2216,7 @@ class UpTemporaryDirectoryTests(unittest.TestCase):
 
     @contextmanager
     def temporary_root(self):
-        with tempfile.TemporaryDirectory() as parent:
+        with tempfile.TemporaryDirectory(prefix=REGEX_METACHARACTER_PREFIX) as parent:
             base = Path(parent)
             for name in (
                 "sandy-keepalive-abc",
