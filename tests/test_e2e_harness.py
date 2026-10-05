@@ -9,7 +9,6 @@ import os
 import re
 import shlex
 import signal
-import socket
 import stat
 import subprocess
 import tempfile
@@ -18,7 +17,7 @@ import threading
 import time
 import unittest
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -1333,17 +1332,18 @@ class SandyInvocationTests(unittest.TestCase):
             self.assertEqual(blocker.read_bytes(), b"not an executable\n")
 
     def test_hidden_system_bus_wraps_sandy_in_a_private_mount_namespace(self):
-        # Mocks: the path of the system bus socket, a real socket in a
-        # temporary directory.
-        with tempfile.TemporaryDirectory() as temp_dir:
+        # Mocks: the path of the system bus socket, a socket file in a
+        # temporary directory. mknod makes the socket file: bind() takes a
+        # socket path of at most 108 bytes, so it failed under a long TMPDIR.
+        # The long directory name keeps each run past that limit.
+        with tempfile.TemporaryDirectory(prefix="x" * 100) as temp_dir:
             root = Path(temp_dir)
             bus = root / "system_bus_socket"
-            with closing(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)) as server:
-                server.bind(str(bus))
-                context = self.make_context()
-                context.root = root
-                with patch("tests.e2e.support.SYSTEM_BUS_SOCKET", bus):
-                    command = context.with_a_hidden_system_bus(["sandy", "rm"])
+            os.mknod(bus, stat.S_IFSOCK | 0o600)
+            context = self.make_context()
+            context.root = root
+            with patch("tests.e2e.support.SYSTEM_BUS_SOCKET", bus):
+                command = context.with_a_hidden_system_bus(["sandy", "rm"])
             blocker = root / "hidden-system-bus"
             self.assertEqual(
                 command,
