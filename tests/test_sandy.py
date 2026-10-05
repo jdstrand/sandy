@@ -15297,14 +15297,19 @@ class RunUpTests(unittest.TestCase):
         # lock, the pin, and the markers (setUp), the port mapping lock, which
         # records the terminal output at its release, the port setup and the
         # port cleanup, the start, and the stop of the failed start (up_mocks).
+        # A ValueError is a failed start too: _supervisor_in_scope passes on
+        # the one of _read_process_cgroup, from the pin or a marker.
         limit = sandy.PORT_MAPPINGS_LOCK_TIMEOUT
         pin = self.pin_supervisor.side_effect
         marker = self.create_marker.side_effect
+        malformed = ValueError("Malformed process cgroup (Sandy requires cgroup v2)")
         for label, detach, published, pin_error, marker_error in (
             ("pin", True, True, OSError(errno.ESRCH, "No such process"), None),
             # Without -d, up holds the lifecycle lock while it pins.
             ("pin", False, True, OSError(errno.ESRCH, "No such process"), None),
+            ("pin value", True, True, malformed, None),
             ("marker", False, True, None, TimeoutError("The scope did not appear")),
+            ("marker value", False, True, None, malformed),
             ("interrupt", False, True, KeyboardInterrupt(), None),
             ("no ports", False, False, OSError(errno.ESRCH, "No such process"), None),
         ):
@@ -15448,6 +15453,7 @@ class RunUpTests(unittest.TestCase):
         pin = self.pin_supervisor.side_effect
         marker = self.create_marker.side_effect
         no_process = "'[Errno 3] No such process'"
+        malformed = "Malformed process cgroup (Sandy requires cgroup v2)"
         for label, detach, published, pin_error, marker_error, expected in (
             (
                 "pin",
@@ -15467,6 +15473,15 @@ class RunUpTests(unittest.TestCase):
                 "I: Starting 'ai-dev' \r\n"
                 "E: Container 'ai-dev' did not start: 'The scope did not appear'\n"
                 f"{removed}\n",
+            ),
+            (
+                "pin value",
+                True,
+                True,
+                ValueError(malformed),
+                None,
+                "I: Starting 'ai-dev' in detached state \r\n"
+                f"E: Container 'ai-dev' did not start: '{malformed}'\n{removed}\n",
             ),
             (
                 "interrupt",
