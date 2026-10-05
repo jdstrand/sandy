@@ -769,8 +769,9 @@ def test_main(context: E2EContext) -> None:
         ).stdout.strip()
         if machine_unit != _unit(name):
             raise E2EFailure(f"Machine unit is {machine_unit!r}")
-        if _tmp_size(context, name) != DEFAULT_TMP_SIZE:
-            raise E2EFailure(f"/tmp has {_tmp_size(context, name)} bytes")
+        tmp_size = _tmp_size(context, name)
+        if tmp_size != DEFAULT_TMP_SIZE:
+            raise E2EFailure(f"/tmp has {tmp_size} bytes")
         supervisors = [
             int(pid)
             for pid in (_unit_dir(name) / "supervisor" / "cgroup.procs")
@@ -1447,8 +1448,9 @@ def test_main(context: E2EContext) -> None:
             raise E2EFailure(f"Scope properties {actual!r} != {expected!r}")
         if (_unit_dir(second) / "pids.max").read_text(encoding="ascii") != "512\n":
             raise E2EFailure("The kernel process limit of the scope is not 512")
-        if _tmp_size(context, second) != 16 * MIB:
-            raise E2EFailure(f"/tmp has {_tmp_size(context, second)} bytes")
+        tmp_size = _tmp_size(context, second)
+        if tmp_size != 16 * MIB:
+            raise E2EFailure(f"/tmp has {tmp_size} bytes")
         # A full /tmp gives ENOSPC, below the shared memory.
         full = context.sandy(
             ["exec", "--", "dd if=/dev/zero of=/tmp/fill bs=1M count=32; rm /tmp/fill"],
@@ -1562,8 +1564,9 @@ def test_main(context: E2EContext) -> None:
             raise E2EFailure("--pids-limit -1 kept a process limit")
         # The tmpfs default: half of the pages of the host memory.
         half = os.sysconf("SC_PHYS_PAGES") // 2 * os.sysconf("SC_PAGE_SIZE")
-        if _tmp_size(context, second) != half:
-            raise E2EFailure(f"/tmp has {_tmp_size(context, second)} bytes, not {half}")
+        tmp_size = _tmp_size(context, second)
+        if tmp_size != half:
+            raise E2EFailure(f"/tmp has {tmp_size} bytes, not {half}")
         context.sandy(["down"], name=second)
         _wait_stopped(context, second)
 
