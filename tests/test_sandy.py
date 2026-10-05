@@ -17647,18 +17647,28 @@ class SupervisorScopeTests(unittest.TestCase):
             sandy._supervisor_scope_argv("Bad", 255, False, limits)
 
     def test_systemctl_show_value_runs_exact_command(self):
+        # Mocks: the subprocess wrapper. A stop under the lifecycle lock
+        # passes the time that is left before its deadline; the query must
+        # end by then.
+        argv = ["systemctl", "show", "sandy-x.scope", "-p", "LoadState", "--value"]
         result = SimpleNamespace(stdout="loaded\n")
-        with patch.object(sandy, "_run_secure_subprocess", return_value=result) as run:
-            self.assertEqual(
-                sandy._systemctl_show_value("sandy-x.scope", "LoadState"), "loaded"
-            )
-        run.assert_called_once_with(
-            ["systemctl", "show", "sandy-x.scope", "-p", "LoadState", "--value"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=sandy.QUERY_COMMAND_TIMEOUT,
-        )
+        for timeout, arguments in (
+            (sandy.QUERY_COMMAND_TIMEOUT, {}),
+            (0.5, {"timeout": 0.5}),
+        ):
+            with self.subTest(timeout=timeout):
+                with patch.object(
+                    sandy, "_run_secure_subprocess", return_value=result
+                ) as run:
+                    self.assertEqual(
+                        sandy._systemctl_show_value(
+                            "sandy-x.scope", "LoadState", **arguments
+                        ),
+                        "loaded",
+                    )
+                run.assert_called_once_with(
+                    argv, capture_output=True, text=True, check=True, timeout=timeout
+                )
 
     def test_systemctl_show_value_rejects_malformed_output(self):
         for output in (
