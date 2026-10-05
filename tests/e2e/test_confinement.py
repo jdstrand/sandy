@@ -355,7 +355,7 @@ def _open_scope_process(pid: int, unit: str) -> int:
     pidfd = os.pidfd_open(pid)
     try:
         cgroup = Path(f"/proc/{pid}/cgroup").read_text(encoding="ascii").strip()
-        scope = f"0::/sandy.slice/{unit}"
+        scope = f"0::/{SLICE}/{unit}"
         if cgroup != scope and not cgroup.startswith(scope + "/"):
             raise E2EFailure(f"PID {pid} is not in {unit}: {cgroup!r}")
         if not _pidfd_alive(pidfd):
