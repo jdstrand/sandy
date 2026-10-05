@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import shlex
 import signal
 import socket
@@ -562,7 +563,8 @@ class SharedLimitStateTests(unittest.TestCase):
                         context.commands.clear()
                         context.shows = [self.show("active"), self.show("active")]
                         with self.assertRaisesRegex(
-                            E2EFailure, f"^sandy.slice state remains: {remains}$"
+                            E2EFailure,
+                            f"^sandy.slice state remains: {re.escape(remains)}$",
                         ):
                             E2EContext.remove_shared_slice(context)
                         self.assertEqual(
@@ -613,9 +615,9 @@ class SharedLimitStateTests(unittest.TestCase):
                         if removed:
                             E2EContext.remove_shared_slice(context)
                         else:
+                            remains = re.escape(f"cgroup {cgroup}")
                             with self.assertRaisesRegex(
-                                E2EFailure,
-                                f"^sandy.slice state remains: cgroup {cgroup}$",
+                                E2EFailure, f"^sandy.slice state remains: {remains}$"
                             ):
                                 E2EContext.remove_shared_slice(context)
                     self.assertEqual(context.commands, start_and_stop)
@@ -2253,8 +2255,10 @@ class UpTemporaryDirectoryTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     E2EFailure,
-                    f"pre-existing Sandy temporary directories: "
-                    f"{base / 'sandy-init-xyz'}, {base / 'sandy-keepalive-abc'}",
+                    re.escape(
+                        "pre-existing Sandy temporary directories: "
+                        f"{base / 'sandy-init-xyz'}, {base / 'sandy-keepalive-abc'}"
+                    ),
                 ):
                     context.preflight()
             self.assertFalse(context._host_state_owned)
