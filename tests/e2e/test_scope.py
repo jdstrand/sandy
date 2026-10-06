@@ -53,6 +53,13 @@ GIB = 1024 * MIB
 DEFAULT_TMP_SIZE = 512 * MIB
 KEEPALIVE_COMM = "sandy-keepalive"
 WAIT_TIMEOUT = 30
+# A file in the container's /tmp that tells sessions that the update is done.
+OOM_UPDATE_GO = "/tmp/oom-update-go"
+# A session that starts during the updates waits this many seconds before it
+# prints its value, so that a whole update can run while it waits.
+OOM_ATTACH_DELAY = 5
+# The most rounds of updates that the concurrent attach check runs.
+OOM_UPDATE_ROUNDS = 3
 # The markers that up makes in the scope of the container that it starts.
 SCOPE_MARKERS = ("mounts-pending", "up-console")
 # The host port that an up publishes when a check under the lock refuses it.
@@ -222,6 +229,186 @@ def _status(pid: int, key: str) -> str:
         if line.startswith(f"{key}:"):
             return line.split(":", 1)[1].strip()
     raise E2EFailure(f"No {key} in /proc/{pid}/status")
+
+
+def _scope_pids(name: str) -> set[int]:
+    """Return the processes of the scope of name and of its cgroups."""
+    pids = set()
+    for procs in _unit_dir(name).rglob("cgroup.procs"):
+        try:
+            text = procs.read_text(encoding="ascii")
+        except OSError as exc:
+            # A leaf removed after the listing gives ENOENT or ENODEV.
+            if exc.errno in (errno.ENOENT, errno.ENODEV):
+                continue
+            raise
+        pids.update(int(value) for value in text.split())
+    return pids
+
+
+def _scope_oom_values(name: str) -> dict[int, int]:
+    """Return the OOM score adjustment of each live process of the scope.
+
+    A process that exits between the listing and the read is skipped.
+    """
+    values = {}
+    for pid in _scope_pids(name):
+        try:
+            values[pid] = _oom_score_adj(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return values
+
+
+def _require_scope_oom_values(name: str, value: int) -> dict[int, int]:
+    """Fail unless each live process of the scope has value."""
+    values = _scope_oom_values(name)
+    wrong = {pid: found for pid, found in values.items() if found != value}
+    if not values or wrong:
+        raise E2EFailure(
+            f"Not every process of {_unit(name)} has {value}: "
+            f"{len(wrong)} of {len(values)} differ, such as "
+            f"{dict(list(wrong.items())[:5])!r}"
+        )
+    return values
+
+
+def _sandy_popen(
+    context: E2EContext, name: str, arguments: list[str], log: Path
+) -> subprocess.Popen[bytes]:
+    """Start sandy for the container name in the background; output to log."""
+    with log.open("w", encoding="utf-8") as stream:
+        return subprocess.Popen(
+            [
+                str(SANDY),
+                "--workspace",
+                context.workspace.name,
+                "--shared",
+                context.shared.name,
+                "--container",
+                name,
+                *arguments,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            cwd=context.root,
+            env=context.safe_environment(),
+        )
+
+
+# nspawn --keep-unit makes these child cgroups of the scope. update freezes
+# the children, never the scope itself.
+SCOPE_CHILDREN = ("payload", "supervisor")
+
+
+def _freeze_requested(name: str, child: str = "") -> bool:
+    """Return whether cgroup.freeze of the scope, or of one child, reads 1."""
+    return _read_cgroup_file(_unit_dir(name) / child / "cgroup.freeze") == "1\n"
+
+
+def _cgroup_thawed(freeze: str | None, events: str | None) -> bool:
+    """Return whether cgroup.freeze and cgroup.events texts show no freeze."""
+    return freeze == "0\n" and events is not None and "frozen 0" in events
+
+
+def _thawed(name: str) -> bool:
+    """Return whether the scope and each child neither request nor have a freeze.
+
+    update also freezes each attach leaf, so the check includes the leaves.
+    sandy can remove a leaf during the check; a removed leaf is not frozen.
+    """
+    unit_dir = _unit_dir(name)
+    for directory in [unit_dir] + [unit_dir / child for child in SCOPE_CHILDREN]:
+        if not _cgroup_thawed(
+            (directory / "cgroup.freeze").read_text(encoding="ascii"),
+            (directory / "cgroup.events").read_text(encoding="ascii"),
+        ):
+            return False
+    for leaf in _leaves(name):
+        freeze = _read_cgroup_file(unit_dir / leaf / "cgroup.freeze")
+        events = _read_cgroup_file(unit_dir / leaf / "cgroup.events")
+        if freeze is not None and events is not None:
+            if not _cgroup_thawed(freeze, events):
+                return False
+    return True
+
+
+def _update_while_watching(
+    context: E2EContext,
+    name: str,
+    value: int,
+    hangup: signal.Signals | None = None,
+    on_freeze: Callable[[], object] | None = None,
+) -> tuple[int, bool, str]:
+    """Run update --oom-score-adj value and watch cgroup.freeze of payload.
+
+    Return the exit status, whether the update was seen to freeze the
+    payload, and the output. As soon as it is frozen, send hangup, or call
+    on_freeze. Without either, fail unless the update succeeds.
+    """
+    log = context.root / f"update-{time.monotonic_ns()}.log"
+    update = _sandy_popen(context, name, ["update", "--oom-score-adj", str(value)], log)
+    seen_frozen = False
+    deadline = time.monotonic() + WAIT_TIMEOUT
+    try:
+        while update.poll() is None and time.monotonic() < deadline:
+            if _freeze_requested(name, "payload"):
+                seen_frozen = True
+                if hangup is not None:
+                    update.send_signal(hangup)
+                    break
+                if on_freeze is not None:
+                    on_freeze()
+                    break
+            time.sleep(0.001)
+        returncode = update.wait(timeout=WAIT_TIMEOUT)
+    finally:
+        if update.poll() is None:
+            update.kill()
+            update.wait(timeout=10)
+    output = log.read_text(encoding="utf-8", errors="replace")
+    if hangup is None and on_freeze is None and returncode != 0:
+        raise E2EFailure(f"update --oom-score-adj {value} failed: {output[-500:]}")
+    return returncode, seen_frozen, output
+
+
+TimedValue = tuple[float, float, int]
+
+
+def _stale_attach_values(
+    initial: int,
+    updates: list[TimedValue],
+    attaches: list[TimedValue],
+    delay: float = 0.0,
+) -> list[TimedValue]:
+    """Return the attaches that printed a value that they cannot have.
+
+    Each entry is (start, end, value) in time.monotonic() seconds; the
+    updates run one after the other. An attach prints its value no earlier
+    than delay seconds after its start. It can print the value of the last
+    update that ended before that time (initial before the first one), or
+    of an update that ran until then. Each interval covers its whole
+    command, so a correct value never fails the check. With a delay, an
+    update that ran while the session waited is in the past: a session
+    that kept the earlier value fails.
+    """
+    stale = []
+    for start, end, printed in attaches:
+        last = initial
+        overlapping = set()
+        for update_start, update_end, value in sorted(updates):
+            if update_end < start + delay:
+                last = value
+            elif update_start < end:
+                overlapping.add(value)
+        if printed != last and printed not in overlapping:
+            stale.append((start, end, printed))
+    return stale
+
+
+def _process_exists(pid: int) -> bool:
+    return Path(f"/proc/{pid}").exists()
 
 
 def _children(pid: int) -> list[int]:
@@ -437,6 +624,7 @@ class _Attach:
         name: str,
         command: str,
         terminal: StoppableTerminal | None = None,
+        user: str | None = None,
     ) -> None:
         self.context = context
         self.name = name
@@ -447,6 +635,7 @@ class _Attach:
             context.workspace.name,
             "--shared",
             context.shared.name,
+            *(["--user", user] if user is not None else []),
             "--container",
             name,
             "exec",
@@ -1649,6 +1838,418 @@ def test_main(context: E2EContext) -> None:
         actual = {prop: _show(context, second, prop) for prop in _default_limits()}
         if actual != _default_limits():
             raise E2EFailure(f"Scope properties after update {actual!r}")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+
+    with context.case("update changes the OOM score adjustment of a container"):
+        context.sandy(
+            [
+                "up",
+                "--detach",
+                "--persistent",
+                "--network",
+                "host",
+                "--oom-score-adj",
+                "-500",
+            ],
+            name=second,
+        )
+        context.wait_for_machine(second, running=True)
+        # A running session with a value that it set itself.
+        holder = _Attach(
+            context,
+            second,
+            "echo 500 > /proc/self/oom_score_adj && exec sleep 120",
+        )
+        # Sessions that exist before the update and try to go below the new
+        # value after it. Their own shell writes, so the entry helper of a
+        # new session cannot be what sets the lowest value. Without that
+        # lowest value from the update, both users could go down to -500,
+        # the lowest value from up.
+        lowering = (
+            "echo READY; "
+            f"while [ ! -e {OOM_UPDATE_GO} ]; do sleep 0.1; done; "
+            "if echo 99 > /proc/self/oom_score_adj; then echo LOWERED; "
+            "else echo REFUSED; fi; "
+            "echo 100 > /proc/self/oom_score_adj && echo EQUAL; "
+            "cat /proc/self/oom_score_adj"
+        )
+        lowerers = {
+            user: _Attach(context, second, lowering, user=user)
+            for user in (context.cache_user, "root")
+        }
+        sessions = [holder, *lowerers.values()]
+        try:
+            for session in sessions:
+                session.leaf()
+
+            def raised() -> bool:
+                return 500 in _scope_oom_values(second).values()
+
+            _wait_for("the session sets its own value", raised)
+
+            def ready() -> bool:
+                return all(
+                    "READY" in session.output.read_text(encoding="utf-8")
+                    for session in lowerers.values()
+                )
+
+            _wait_for("the sessions that try to go lower start", ready)
+            updated = context.sandy(["update", "--oom-score-adj", "100"], name=second)
+            assert_contains(
+                updated, f"I: Updated '{second}': OOM score adjustment 100 ("
+            )
+            # Each process of the scope has the value: nspawn, the Leader,
+            # the payload, the entry helpers, and the sessions.
+            values = _require_scope_oom_values(second, 100)
+            leader_pid = int(context.machine_leader(second) or 0)
+            for pid in (leader_pid, _payload(leader_pid), holder.helper()):
+                if pid not in values:
+                    raise E2EFailure(f"PID {pid} is not in the scope {values!r}")
+            if not _thawed(second):
+                raise E2EFailure("update left the scope frozen")
+            if holder.process.poll() is not None:
+                raise E2EFailure("update ended the running session")
+            context.sandy(
+                ["exec", "--", f"touch {OOM_UPDATE_GO}"], name=second, user="root"
+            )
+            for user, session in lowerers.items():
+                returncode, output = session.finish()
+                if returncode != 0:
+                    raise E2EFailure(f"The session of {user} exited {returncode}")
+                for text in ("REFUSED", "EQUAL"):
+                    assert_contains_text(output, text)
+                if "LOWERED" in output or output.strip().splitlines()[-1] != "100":
+                    raise E2EFailure(
+                        f"An existing session of {user} went below the "
+                        f"updated value: {output[-300:]!r}"
+                    )
+        finally:
+            for session in sessions:
+                if session.process.poll() is None:
+                    session.process.send_signal(signal.SIGTERM)
+                session.finish()
+        # A new session gets the value. The lowest value is now 100, also for
+        # container root, which could go to -500 before.
+        for user in (context.cache_user, "root"):
+            session = context.sandy(
+                ["exec", "--", "cat /proc/self/oom_score_adj"], name=second, user=user
+            )
+            if session.stdout.strip() != "100":
+                raise E2EFailure(f"A session of {user} has {session.stdout!r}")
+            lower = context.sandy(
+                ["exec", "--", "echo 99 > /proc/self/oom_score_adj"],
+                name=second,
+                user=user,
+                expected=None,
+            )
+            if lower.returncode == 0:
+                raise E2EFailure(f"A session of {user} went below the updated value")
+            context.sandy(
+                ["exec", "--", "echo 200 > /proc/self/oom_score_adj"],
+                name=second,
+                user=user,
+            )
+        # A lower value protects the container again.
+        context.sandy(["update", "--oom-score-adj", "-600"], name=second)
+        session = context.sandy(
+            ["exec", "--", "cat /proc/self/oom_score_adj"], name=second, user="root"
+        )
+        if session.stdout.strip() != "-600":
+            raise E2EFailure(f"A session after -600 has {session.stdout!r}")
+        for arguments, expected, message in (
+            (["update", "--oom-score-adj", "-1000"], 2, "invalid OOM score"),
+            (
+                ["update", "--shared", "--oom-score-adj", "1"],
+                1,
+                "update --shared cannot be used with --oom-score-adj",
+            ),
+        ):
+            refused = context.sandy(arguments, expected=expected)
+            assert_contains(refused, message)
+            assert_not_contains(refused, "Traceback")
+        context.sandy(["down"], name=second)
+        _wait_stopped(context, second)
+        stopped = context.sandy(
+            ["update", "--oom-score-adj", "1"], name=second, expected=1
+        )
+        assert_contains(stopped, "not found or not running")
+
+    with context.case("update freezes the container and reaches new processes"):
+        context.sandy(
+            ["up", "--detach", "--persistent", "--network", "host"], name=second
+        )
+        context.wait_for_machine(second, running=True)
+        # Many processes make the scan, and so the freeze, long enough to
+        # see. One session starts processes all the time: each one that
+        # starts during an update must also get the value.
+        bulk = _Attach(
+            context, second, "for i in $(seq 1000); do sleep 600 & done; wait"
+        )
+        churn = _Attach(context, second, "while :; do sleep 2 & sleep 0.02; done")
+        stop = threading.Event()
+        attach_failures: list[str] = []
+        attach_values: list[TimedValue] = []
+        update_times: list[TimedValue] = []
+
+        def attach_loop() -> None:
+            # Sessions that start and end during the updates. Each waits, so
+            # that an update can run and end meanwhile, and then records the
+            # value that it has. A session that keeps an earlier value fails
+            # the stale check below, and the scope scan after the update
+            # while it waits.
+            while not stop.is_set():
+                start = time.monotonic()
+                try:
+                    session = context.sandy(
+                        [
+                            "exec",
+                            "--",
+                            f"sleep {OOM_ATTACH_DELAY}; cat /proc/self/oom_score_adj",
+                        ],
+                        name=second,
+                        expected=None,
+                    )
+                except E2EFailure as exc:
+                    attach_failures.append(str(exc)[-200:])
+                    return
+                end = time.monotonic()
+                printed = session.stdout.strip()
+                if session.returncode != 0 or not re.fullmatch(r"-?[0-9]+", printed):
+                    attach_failures.append(session.output[-200:])
+                    continue
+                attach_values.append((start, end, int(printed)))
+
+        attachers = [threading.Thread(target=attach_loop) for _ in range(3)]
+        unit = _unit(second)
+        try:
+            _wait_for(
+                "the processes of the load start",
+                lambda: len(_scope_pids(second)) > 1000,
+            )
+            initial = _oom_score_adj(int(context.machine_leader(second) or 0))
+
+            def covered() -> list[TimedValue]:
+                # The stale check can fail only when a whole update ran while
+                # a session waited: then the update ended before the print.
+                return [
+                    attach
+                    for attach in list(attach_values)
+                    if any(
+                        attach[0] < update_start
+                        and update_end < attach[0] + OOM_ATTACH_DELAY
+                        for update_start, update_end, _ in update_times
+                    )
+                ]
+
+            def run_update(value: int) -> None:
+                start = time.monotonic()
+                _, seen_frozen, _ = _update_while_watching(context, second, value)
+                update_times.append((start, time.monotonic(), value))
+                if not seen_frozen:
+                    raise E2EFailure(f"update to {value} did not freeze the scope")
+                _require_scope_oom_values(second, value)
+                if not _thawed(second):
+                    raise E2EFailure(f"update to {value} left the scope frozen")
+
+            for thread in attachers:
+                thread.start()
+            # On a slow host, a round can have no update that ran while an
+            # attach waited. Then run another round, with new values, so
+            # that a stale value cannot match a later update.
+            for round_number in range(OOM_UPDATE_ROUNDS):
+                for value in (300, -300, 700, -700):
+                    run_update(value + round_number)
+                # The attaches that waited during this round print within
+                # OOM_ATTACH_DELAY, plus the time of an exec.
+                deadline = time.monotonic() + OOM_ATTACH_DELAY + WAIT_TIMEOUT
+                while not covered() and time.monotonic() < deadline:
+                    time.sleep(0.2)
+                if covered():
+                    break
+            run_update(50)
+            stop.set()
+            for thread in attachers:
+                thread.join(timeout=2 * WAIT_TIMEOUT)
+            if attach_failures:
+                raise E2EFailure(f"Attaches failed: {attach_failures[:3]!r}")
+            # Each concurrent attach has the value of the last update before
+            # it printed, or of an update that ran then; never an older one.
+            if initial in {value for _, _, value in update_times}:
+                raise E2EFailure(f"The initial value {initial} is also an update")
+            stale = _stale_attach_values(
+                initial, update_times, attach_values, OOM_ATTACH_DELAY
+            )
+            if stale:
+                raise E2EFailure(f"Attaches got an older value: {stale[:5]!r}")
+            if not covered():
+                raise E2EFailure(
+                    f"No update ran while an attach waited: {attach_values!r}, "
+                    f"updates {update_times!r}"
+                )
+            for process in (bulk.process, churn.process):
+                if process.poll() is not None:
+                    raise E2EFailure("update ended a session of the load")
+            session = context.sandy(
+                ["exec", "--", "cat /proc/self/oom_score_adj"], name=second
+            )
+            if session.stdout.strip() != "50":
+                raise E2EFailure(f"A new session has {session.stdout!r}")
+
+            # An earlier freeze stays: update neither freezes nor thaws it.
+            context.run(["systemctl", "freeze", unit])
+            try:
+                context.sandy(["update", "--oom-score-adj", "123"], name=second)
+                if not _freeze_requested(second):
+                    raise E2EFailure("update thawed a scope that systemctl froze")
+                state = _show(context, second, "FreezerState")
+                if state != "frozen":
+                    raise E2EFailure(f"systemd has FreezerState={state}")
+                _require_scope_oom_values(second, 123)
+            finally:
+                context.run(["systemctl", "thaw", unit], expected=None)
+            if not _thawed(second):
+                raise E2EFailure("systemctl thaw did not thaw the scope")
+
+            # A hangup, a stop request, or a Ctrl-C while the scope is frozen
+            # acts only after the thaw, and the update completes its writes
+            # first. An uncaught KeyboardInterrupt ends Python with SIGINT.
+            for value, hangup in (
+                (-123, signal.SIGTERM),
+                (234, signal.SIGHUP),
+                (-234, signal.SIGINT),
+            ):
+                returncode, seen_frozen, _ = _update_while_watching(
+                    context, second, value, hangup
+                )
+                if not seen_frozen:
+                    raise E2EFailure(f"No freeze to send {hangup.name} into")
+                if returncode != -hangup:
+                    raise E2EFailure(f"update exited {returncode} after {hangup.name}")
+                if not _thawed(second):
+                    raise E2EFailure(f"{hangup.name} left the scope frozen")
+                _require_scope_oom_values(second, value)
+
+            # Another writer during the freeze. A systemctl freeze stays:
+            # the update does not thaw it.
+            returncode, seen_frozen, output = _update_while_watching(
+                context,
+                second,
+                345,
+                on_freeze=lambda: context.run(["systemctl", "freeze", unit]),
+            )
+            if not seen_frozen or returncode != 0:
+                raise E2EFailure(f"update with a systemctl freeze: {output[-300:]}")
+            state = _show(context, second, "FreezerState")
+            if not _freeze_requested(second) or state != "frozen":
+                raise E2EFailure(f"update undid a systemctl freeze ({state})")
+            _require_scope_oom_values(second, 345)
+            context.run(["systemctl", "thaw", unit])
+            if not _thawed(second):
+                raise E2EFailure("systemctl thaw did not thaw the scope")
+            # A direct write of 1 to the scope's cgroup.freeze stays too.
+            # cgroup.freeze has no compare-and-set, and systemd does not
+            # record such a freeze, so the update must never write the
+            # scope's own file.
+            returncode, seen_frozen, output = _update_while_watching(
+                context,
+                second,
+                567,
+                on_freeze=lambda: (_unit_dir(second) / "cgroup.freeze").write_text(
+                    "1", encoding="ascii"
+                ),
+            )
+            if not seen_frozen or returncode != 0:
+                raise E2EFailure(f"update with a direct freeze: {output[-300:]}")
+            if not _freeze_requested(second):
+                raise E2EFailure("update undid a direct freeze of the scope")
+            _wait_for(
+                "the scope to stay frozen after a direct freeze",
+                lambda: "frozen 1"
+                in (_unit_dir(second) / "cgroup.events").read_text(encoding="ascii"),
+            )
+            _require_scope_oom_values(second, 567)
+            (_unit_dir(second) / "cgroup.freeze").write_text("0", encoding="ascii")
+            _wait_for("the scope to thaw", lambda: _thawed(second))
+            # A thaw of the scope does not thaw the children that the
+            # update froze, so the update completes.
+            returncode, seen_frozen, output = _update_while_watching(
+                context,
+                second,
+                678,
+                on_freeze=lambda: context.run(["systemctl", "thaw", unit]),
+            )
+            if not seen_frozen or returncode != 0:
+                raise E2EFailure(f"update with a systemctl thaw: {output[-300:]}")
+            if not _thawed(second):
+                raise E2EFailure("The scope stays frozen after a systemctl thaw")
+            _require_scope_oom_values(second, 678)
+            # A thaw of a child by another writer lets processes run during
+            # the scan, so the update fails and asks for a new run.
+            returncode, seen_frozen, output = _update_while_watching(
+                context,
+                second,
+                456,
+                on_freeze=lambda: (
+                    _unit_dir(second) / "payload" / "cgroup.freeze"
+                ).write_text("0", encoding="ascii"),
+            )
+            if not seen_frozen or returncode != 1:
+                raise E2EFailure(f"update with a child thaw: {output[-300:]}")
+            assert_contains_text(output, "thawed the container during the update")
+            if not _thawed(second):
+                raise E2EFailure("The scope stays frozen after a child thaw")
+            _update_while_watching(context, second, 456)
+            _require_scope_oom_values(second, 456)
+            # A new session takes the value from nspawn, not from the
+            # Leader. Container root cannot write the Leader's value
+            # (measured: Permission denied), so here host root changes it,
+            # as a stand-in for any change of the Leader.
+            denied = context.sandy(
+                ["exec", "--", "echo 900 > /proc/1/oom_score_adj"],
+                name=second,
+                user="root",
+                expected=None,
+            )
+            if denied.returncode == 0:
+                raise E2EFailure("Container root wrote the Leader's value")
+            leader = int(context.machine_leader(second) or 0)
+            Path(f"/proc/{leader}/oom_score_adj").write_text("900", encoding="ascii")
+            if _oom_score_adj(leader) != 900:
+                raise E2EFailure("The Leader's value did not change")
+            for user in (context.cache_user, "root"):
+                session = context.sandy(
+                    ["exec", "--", "cat /proc/self/oom_score_adj"],
+                    name=second,
+                    user=user,
+                )
+                if session.stdout.strip() != "456":
+                    raise E2EFailure(
+                        f"A session of {user} after a raised Leader has "
+                        f"{session.stdout!r}"
+                    )
+        finally:
+            stop.set()
+            for thread in attachers:
+                if thread.is_alive():
+                    thread.join(timeout=2 * WAIT_TIMEOUT)
+            if _show(context, second, "FreezerState") != "running":
+                context.run(["systemctl", "thaw", unit], expected=None)
+            # Do not leave a frozen scope, child or attach leaf to the
+            # cleanup. A frozen session cannot exit.
+            for child in ("",) + SCOPE_CHILDREN + tuple(_leaves(second)):
+                if _freeze_requested(second, child):
+                    try:
+                        (_unit_dir(second) / child / "cgroup.freeze").write_text(
+                            "0", encoding="ascii"
+                        )
+                    except OSError as exc:
+                        if exc.errno not in (errno.ENOENT, errno.ENODEV):
+                            raise
+            for session in (bulk, churn):
+                if session.process.poll() is None:
+                    session.process.send_signal(signal.SIGTERM)
+                session.finish()
         context.sandy(["down"], name=second)
         _wait_stopped(context, second)
 
