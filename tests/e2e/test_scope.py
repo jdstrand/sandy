@@ -308,6 +308,7 @@ def _freeze_requested(name: str, child: str = "") -> bool:
 
 
 def _cgroup_thawed(freeze: str | None, events: str | None) -> bool:
+    """Return whether cgroup.freeze and cgroup.events texts show no freeze."""
     return freeze == "0\n" and events is not None and "frozen 0" in events
 
 

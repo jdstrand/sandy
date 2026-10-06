@@ -18343,6 +18343,16 @@ class ScopeOomScoreAdjTests(unittest.TestCase):
                 body()
         body.assert_not_called()
         self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+        # A cgroup.procs larger than the limit fails closed and thaws.
+        (self.unit / "cgroup.procs").write_text(
+            "\n" * sandy.CGROUP_PROCS_MAX_BYTES + "\n"
+        )
+        body = MagicMock()
+        with self.assertRaisesRegex(ValueError, "too large"):
+            with sandy._frozen_cgroup(unit_fd):
+                body()
+        body.assert_not_called()
+        self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
 
     def test_frozen_cgroup_fails_at_once_on_a_thaw_during_the_wait(self):
         # A thaw by another writer before the children are frozen: no wait
@@ -18585,6 +18595,14 @@ class ScopeOomScoreAdjTests(unittest.TestCase):
                     procs.write_text(text)
                     with self.assertRaises(error):
                         sandy._read_supervisor_oom_score_adj("ai-dev")
+            # The read is bounded: a file of exactly the limit is read, and
+            # one byte more fails closed.
+            limit = sandy.CGROUP_PROCS_MAX_BYTES
+            procs.write_text("\n" * (limit - 3) + "40\n")
+            self.assertEqual(sandy._read_supervisor_oom_score_adj("ai-dev"), -500)
+            procs.write_text("\n" * (limit - 2) + "40\n")
+            with self.assertRaisesRegex(ValueError, "too large"):
+                sandy._read_supervisor_oom_score_adj("ai-dev")
             (self.proc / "41" / "oom_score_adj").write_text("100\n")
             procs.write_text("40\n41\n")
             with self.assertRaisesRegex(ValueError, "different"):
