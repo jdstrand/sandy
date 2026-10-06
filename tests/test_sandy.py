@@ -18098,6 +18098,15 @@ class ScopeOomScoreAdjTests(unittest.TestCase):
         # The scope's own cgroup.freeze was never written.
         self.assertEqual((self.unit / "cgroup.freeze").read_text(), "0\n")
 
+    def test_frozen_cgroup_freezes_and_thaws_an_attach_leaf(self):
+        # Mocks only the cgroup files; the attach leaf stays for the update.
+        leaf = self.make_child("attach-" + "a" * 32)
+        unit_fd = self.open_dir(self.unit)
+        with sandy._frozen_cgroup(unit_fd):
+            self.assertEqual((leaf / "cgroup.freeze").read_text(), "1\n")
+        self.assertEqual((leaf / "cgroup.freeze").read_text(), "0\n")
+        self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+
     def test_frozen_cgroup_keeps_each_freeze_and_thaw_of_the_scope(self):
         # Regression: cgroup.freeze has no compare-and-set, and the thaw of
         # the scope undid a direct write of 1 to it during the update. The

@@ -304,24 +304,32 @@ SCOPE_CHILDREN = ("payload", "supervisor")
 
 def _freeze_requested(name: str, child: str = "") -> bool:
     """Return whether cgroup.freeze of the scope, or of one child, reads 1."""
-    try:
-        text = (_unit_dir(name) / child / "cgroup.freeze").read_text(encoding="ascii")
-    except FileNotFoundError:
-        return False
-    return text == "1\n"
+    return _read_cgroup_file(_unit_dir(name) / child / "cgroup.freeze") == "1\n"
+
+
+def _cgroup_thawed(freeze: str | None, events: str | None) -> bool:
+    return freeze == "0\n" and events is not None and "frozen 0" in events
 
 
 def _thawed(name: str) -> bool:
-    """Return whether the scope and each child neither request nor have a freeze."""
-    for directory in [_unit_dir(name)] + [
-        _unit_dir(name) / child for child in SCOPE_CHILDREN
-    ]:
-        if (directory / "cgroup.freeze").read_text(
-            encoding="ascii"
-        ) != "0\n" or "frozen 0" not in (directory / "cgroup.events").read_text(
-            encoding="ascii"
+    """Return whether the scope and each child neither request nor have a freeze.
+
+    update also freezes each attach leaf, so the check includes the leaves.
+    sandy can remove a leaf during the check; a removed leaf is not frozen.
+    """
+    unit_dir = _unit_dir(name)
+    for directory in [unit_dir] + [unit_dir / child for child in SCOPE_CHILDREN]:
+        if not _cgroup_thawed(
+            (directory / "cgroup.freeze").read_text(encoding="ascii"),
+            (directory / "cgroup.events").read_text(encoding="ascii"),
         ):
             return False
+    for leaf in _leaves(name):
+        freeze = _read_cgroup_file(unit_dir / leaf / "cgroup.freeze")
+        events = _read_cgroup_file(unit_dir / leaf / "cgroup.events")
+        if freeze is not None and events is not None:
+            if not _cgroup_thawed(freeze, events):
+                return False
     return True
 
 
@@ -2226,12 +2234,17 @@ def test_main(context: E2EContext) -> None:
                     thread.join(timeout=2 * WAIT_TIMEOUT)
             if _show(context, second, "FreezerState") != "running":
                 context.run(["systemctl", "thaw", unit], expected=None)
-            # Do not leave a frozen scope or child to the cleanup.
-            for child in ("",) + SCOPE_CHILDREN:
+            # Do not leave a frozen scope, child or attach leaf to the
+            # cleanup. A frozen session cannot exit.
+            for child in ("",) + SCOPE_CHILDREN + tuple(_leaves(second)):
                 if _freeze_requested(second, child):
-                    (_unit_dir(second) / child / "cgroup.freeze").write_text(
-                        "0", encoding="ascii"
-                    )
+                    try:
+                        (_unit_dir(second) / child / "cgroup.freeze").write_text(
+                            "0", encoding="ascii"
+                        )
+                    except OSError as exc:
+                        if exc.errno not in (errno.ENOENT, errno.ENODEV):
+                            raise
             for session in (bulk, churn):
                 if session.process.poll() is None:
                     session.process.send_signal(signal.SIGTERM)
