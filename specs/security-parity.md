@@ -455,8 +455,9 @@ Correction (step 2 of `sandy-nspawn-scope-brief.md`): nspawn now runs with
 `--property=` options do not apply. Put the limits on that scope instead,
 through `systemd-run --property=MemoryMax=` and the like. The scope holds the
 supervisor, the container, and every attached session, so one limit covers
-all of them. Step 2 keeps the defaults of the machined scope
-(`TasksMax=16384`, no memory or CPU limit), so this item stays open.
+all of them. Step 2 kept the defaults of the machined scope
+(`TasksMax=16384`, no memory or CPU limit). "Implemented fix" below sets the
+limits.
 
 Set an explicit `size=` on the `/tmp` tmpfs. Expose the values as validated
 CLI options with conservative defaults.
@@ -1770,9 +1771,9 @@ it, so the question does not arise until someone installs it by hand.
       runtime surprise. Keep the Codex landlock sandbox enabled, because it
       works and needs no user namespace.
 - [ ] **TODO: add or update a sandboxing section in `README.md`.** Partly
-      done: the README sections "Attached sessions" and "Container scope and
-      session lifecycle" state the entry-path parity, `TasksMax=16384`, and
-      that there is no memory or CPU limit. It should also state the other
+      done: the README section "Attached sessions" states the entry-path
+      parity, and "Resource limits" states the CPU, memory, process, `/tmp`,
+      swap, and OOM score settings of item 2. It should also state the other
       confinement properties (LSM, `NoNewPrivs`, landlock), that agent-internal
       sandboxes do not run by default, what `--allow-inner-sandboxing` changes,
       and that the host AppArmor setting remains the user's decision. Cover the
@@ -1973,13 +1974,16 @@ These are proposals, not part of items 1 to 6.
 ### 7. No test asserts any of these properties
 
 Item 1 now has E2E and unit coverage (`tests/e2e/test_confinement.py`, and the
-entry helper tests in `tests/test_sandy.py`). For item 2, the E2E suite checks
-today's scope values (`TasksMax=16384`, no memory or CPU limit;
-`tests/e2e/test_scope.py`), and unit tests check the exact `systemd-run`
-`--property=` arguments. Nothing detects a regression in items 3 and 4. The
-unit test `test_detached_host_command_has_security_flags` still asserts only
-that some nspawn argument starts with `--system-call-filter=`. It does not
-check the value, and it cannot check the effect.
+entry helper tests in `tests/test_sandy.py`). For item 2, the E2E suite
+(`tests/e2e/test_scope.py`) checks the shared limits of `sandy.slice`
+(`AllowedCPUs`, `MemoryMax`, `TasksMax`), the scope values (`TasksMax`,
+`MemorySwapMax=0`, no `MemoryMax` of its own), the `/tmp` size, and the OOM
+score adjustment, for the defaults and for configured values. Unit tests check
+the exact `systemd-run` `--property=` arguments. Nothing detects a regression
+in items 3 and 4. The unit test `test_detached_host_command_has_security_flags`
+still asserts only that some nspawn argument starts with
+`--system-call-filter=`. It does not check the value, and it cannot check the
+effect.
 
 Every property in this document is measured by reading `/proc/<pid>/status` or
 by calling a syscall and checking `errno`. Both are cheap and deterministic in
@@ -1998,20 +2002,19 @@ an E2E context. Proposed coverage:
   is already shipped and already load-bearing, so its test is due now rather
   than as part of this proposal.
 
-Status: the first two bullets are done for item 1. The third is done for
-today's default scope values only. The fourth is done for the scope's
-`--property=` arguments. The fifth is partly done (see the landlock checklist
-item above).
+Status: the first two bullets are done for item 1. The third is done. The
+fourth is done for the scope's `--property=` arguments. The fifth is partly
+done (see the landlock checklist item above).
 
 Without this, a later systemd version or a refactor can silently remove the
 confinement, as the `nsenter` path did before item 1's fix.
 
 ### 8. The README does not state the confinement model
 
-`README.md` now states the entry-path parity ("Attached sessions"),
-`TasksMax=16384`, and that there is no memory or CPU limit ("Container scope
-and session lifecycle"). It does not state the other kernel-level confinement
-properties: no LSM profile, `NoNewPrivs` 0, and the landlock allowance.
+`README.md` now states the entry-path parity ("Attached sessions") and the
+limits of item 2 ("Resource limits"). It does not state the other kernel-level
+confinement properties: no LSM profile, `NoNewPrivs` 0, and the landlock
+allowance.
 
 Proposed: add a short table to the Security section that lists each property,
 its state, and whether it differs between entry paths. Update it when items 2 to
