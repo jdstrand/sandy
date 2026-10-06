@@ -499,17 +499,40 @@ The options have the names and units of `docker run` and `podman run`:
   running transient scope writes `/run/systemd/transient/<unit>.d/`, which
   systemd removes when the scope stops).
 - `update --oom-score-adj N` changes the OOM score adjustment of a running
-  container. Under the lifecycle lock, Sandy freezes the scope's cgroup
-  (`cgroup.freeze`), waits for `frozen 1` in `cgroup.events` (at most 5
-  seconds), and writes the value to the `oom_score_adj` of each host process
-  whose `/proc/<pid>/cgroup` is the scope or below it: nspawn, the Leader,
-  the container's processes, and the attach leaves. Each write goes through
-  the pinned `/proc/<pid>` directory of the checked process. Then Sandy
-  thaws the scope, also after an error. While the scope is frozen, no
+  container. Under the lifecycle lock, Sandy freezes each child cgroup of
+  the scope (`cgroup.freeze` of nspawn's `payload` and `supervisor`
+  cgroups and of the attach leaves), waits for `frozen 1` in the
+  `cgroup.events` of each (at most 5 seconds), and writes the value to the
+  `oom_score_adj` of each host process whose `/proc/<pid>/cgroup` is the
+  scope or below it: nspawn, the Leader, the container's processes, and the
+  attach leaves. Each write goes through the pinned `/proc/<pid>` directory
+  of the checked process. Then Sandy thaws the children that it froze,
+  also after an error. A child whose `cgroup.freeze` already reads 1 stays
+  frozen.
+  Sandy never writes the scope's own `cgroup.freeze`. That file has no
+  compare-and-set, so a write there could undo a freeze that another writer
+  made meanwhile; it belongs to `systemctl freeze` and to the
+  administrator. A freeze of the scope before or during the update, with
+  `systemctl freeze` or with a direct write, therefore stays, and a thaw of
+  the scope does not thaw the children. Only host root can create a child
+  of the scope or move a process into the scope's own cgroup, and Sandy
+  does both only under the lifecycle lock. Neither would be frozen, so a
+  new child or a process in the scope's own cgroup (the Leader is there
+  while the container starts) makes the update fail and ask for a new run.
+  A child that is removed meanwhile (the leaf of an attach that ended)
+  needs no thaw. A thaw of a child by another writer during the update
+  lets processes run, so each child that Sandy froze must still read 1
+  during the freeze wait and after the scan, and each child must still be
+  frozen after the scan. Otherwise the update fails at once and asks for a
+  new run. Sandy blocks SIGHUP and SIGTERM from before the freeze until
+  after the thaw, so that a closed terminal or a stop request cannot end it
+  while the children are frozen. For the same time, Sandy holds back
+  SIGINT: a Ctrl-C acts after the thaw. While the children are frozen, no
   process of the container can start a process with the earlier value. The
   scan must find the Leader, otherwise the update fails. As host root, each
-  write also sets the lowest value that the process can set. The value ends
-  with the container. Not measured yet.
+  write also sets the lowest value that the process can set. The value
+  ends with the container. The E2E tests check a freeze and a thaw of the
+  scope, and a thaw of a child, during the update.
 - `update --shared [--cpuset-cpus LIST] [-m SIZE] [--pids-limit N]` and
   `update --shared --reset` change the shared limits, with or without
   running containers. `-m 0` and `--pids-limit -1` mean no shared limit;
@@ -538,11 +561,18 @@ the shared memory.
 
 nspawn's `--oom-score-adjust=` fails with `--private-users` (measured), so
 `up` sets its own `/proc/self/oom_score_adj` while it starts the scope, and
-restores it. The container inherits the value. The entry helper reads the
-Leader's value through its pinned `/proc/<pid>` directory, and writes it to
-its own process under the lifecycle lock, before it joins its attach leaf.
-So `update --oom-score-adj` cannot change the Leader between the read and
-the write. As host root, each write also sets the lowest value that the
+restores it. The container and nspawn inherit the value. The entry helper
+reads nspawn's value, not the Leader's. The Leader is a process of the
+container; nspawn is outside the container's PID and user namespaces.
+Container root cannot write the Leader's value through `/proc` (measured:
+permission denied), but the read does not depend on that. nspawn `--keep-unit` runs in the scope's `supervisor` cgroup.
+The helper reads each PID of that cgroup's `cgroup.procs`, checks through
+the pinned `/proc/<pid>` directory that the process is still in that
+cgroup, and reads its value there. Every process there must have the same
+value, otherwise the attach fails. The helper writes the value to its own
+process under the lifecycle lock, before it joins its attach leaf. So
+`update --oom-score-adj` cannot change nspawn between the read and the
+write. As host root, each write also sets the lowest value that the
 container and the session can set; container root cannot go lower
 (measured).
 

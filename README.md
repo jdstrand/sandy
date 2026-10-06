@@ -755,8 +755,14 @@ running container. `sudo sandy -c NAME update --oom-score-adj N` gives each
 process of a running container, and each later `bash` and `exec` session,
 the OOM score adjustment. It also replaces a value that a process set
 itself, and the lowest value that a process can set. Sandy freezes the
-container during the change, and fails when the container does not freeze
-within 5 seconds. The changes end with the
+container during the change: it freezes the child cgroups of the scope,
+not the scope itself. It fails when the container does not freeze within 5
+seconds. A container that was frozen before, or during the change, with
+`systemctl freeze` or with a write to the scope's `cgroup.freeze` stays
+frozen. When another program thaws a child cgroup of the scope during the
+change, or while the container is still starting, the update fails; run
+it again. Later sessions get the value from nspawn, which is outside the
+container. The changes end with the
 container; the next `up` uses its own flags. A container has no CPU or
 memory limit of its own.
 

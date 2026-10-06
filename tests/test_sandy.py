@@ -9,6 +9,8 @@ import importlib.util
 import io
 import json
 import os
+import shutil
+import signal
 import stat
 import struct
 import subprocess
@@ -5218,7 +5220,9 @@ class LeaderExtractionTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(sandy, "_read_capability_bounding_set", manager.capbnd)
             )
-            stack.enter_context(patch.object(sandy, "_read_oom_score_adj", manager.oom))
+            stack.enter_context(
+                patch.object(sandy, "_read_supervisor_oom_score_adj", manager.oom)
+            )
             stack.enter_context(
                 patch.object(sandy, "_write_own_oom_score_adj", manager.write_oom)
             )
@@ -5271,12 +5275,13 @@ class LeaderExtractionTests(unittest.TestCase):
                 call.open("ns/user", ns_flags, dir_fd=20),
                 call.filters(42),
                 call.capbnd(20),
-                # From the pinned Leader directory (item 2).
-                call.oom(20),
                 call.close(20),
                 call.alive(10),
-                # Under the lock, so that update --oom-score-adj cannot
-                # change the Leader between the read and the write.
+                # From nspawn, which is outside the container, not from the
+                # Leader (item 2). Under the lock, so that update
+                # --oom-score-adj cannot change it between the read and the
+                # write.
+                call.oom("ai-dev"),
                 call.write_oom(-500),
                 call.join("ai-dev", ATTACH_LEAF),
                 call.lock_exit(),
@@ -5428,7 +5433,6 @@ class LeaderExtractionTests(unittest.TestCase):
         for name, error in (
             ("filters", OSError(errno.EACCES, "x")),
             ("capbnd", ValueError("bad")),
-            ("oom", ValueError("Malformed oom_score_adj")),
             ("pidfd_open", ProcessLookupError("gone")),
             ("cgroup_error", ValueError("bad")),
             ("payload", ValueError("bad")),
@@ -5443,6 +5447,23 @@ class LeaderExtractionTests(unittest.TestCase):
                 manager.lock_exit.assert_called_once_with()
                 if name != "pidfd_open":
                     self.assertIn(call(10), manager.close.call_args_list)
+
+    def test_extract_leader_confinement_fails_closed_without_the_nspawn_value(self):
+        # Mocks: as extraction_mocks; the read of nspawn's value fails.
+        for error in (
+            ValueError("Malformed oom_score_adj"),
+            ProcessLookupError("The container has no nspawn process"),
+            FileNotFoundError("supervisor"),
+        ):
+            with self.subTest(error=error):
+                with self.extraction_mocks(oom=error) as manager:
+                    with self.assertRaises(type(error)):
+                        sandy._extract_leader_confinement("ai-dev", 42, ATTACH_LEAF)
+                manager.oom.assert_called_once_with("ai-dev")
+                manager.write_oom.assert_not_called()
+                manager.join.assert_not_called()
+                self.assertIn(call(10), manager.close.call_args_list)
+                manager.lock_exit.assert_called_once_with()
 
     def test_extract_leader_confinement_fails_closed_while_starting(self):
         # No payload yet: nothing of the Leader is opened, stopped, or read.
@@ -17962,14 +17983,19 @@ class StartFailureTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
 
 
+# nspawn --keep-unit makes these child cgroups of the scope.
+SCOPE_CHILDREN = ("payload", "supervisor")
+
+
 class ScopeOomScoreAdjTests(unittest.TestCase):
     """update --oom-score-adj: the freeze, the scan, and the writes.
 
     Tests use plain directories and regular files in place of cgroupfs and
     the host /proc. Mocks: the /proc listing, the opening of /proc/<pid>, the
-    Leader query, the supervisor cgroup, and the freeze poll timing. E2E
-    tests must prove the real freeze, the kernel values, and the lowest
-    value that a process can set.
+    Leader query, the supervisor cgroup, the cgroup and /proc/<pid> opens of
+    the nspawn value read, and the freeze poll timing. E2E tests must prove
+    the real freeze, the kernel values, and the lowest value that a process
+    can set.
     """
 
     def setUp(self):
@@ -17978,10 +18004,25 @@ class ScopeOomScoreAdjTests(unittest.TestCase):
         self.root = Path(self.tempdir.name)
         self.unit = self.root / "unit"
         self.unit.mkdir()
-        (self.unit / "cgroup.freeze").write_text("")
-        (self.unit / "cgroup.events").write_text("populated 1\nfrozen 1\n")
+        (self.unit / "cgroup.freeze").write_text("0\n")
+        (self.unit / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+        (self.unit / "cgroup.procs").write_text("")
         self.proc = self.root / "proc"
         self.proc.mkdir()
+        # A read of cgroup.freeze on cgroupfs ends with a newline; a plain
+        # file keeps what was written. Add it as the kernel does.
+        real_write = sandy._write_cgroup_file
+
+        def kernel_write(dir_fd, name, value):
+            if name == "cgroup.freeze":
+                value += b"\n"
+            return real_write(dir_fd, name, value)
+
+        writer = patch.object(sandy, "_write_cgroup_file", side_effect=kernel_write)
+        writer.start()
+        self.addCleanup(writer.stop)
+        for name in SCOPE_CHILDREN:
+            self.make_child(name)
 
     def open_dir(self, path):
         fd = os.open(path, sandy.DIRECTORY_OPEN_FLAGS)
@@ -17994,6 +18035,13 @@ class ScopeOomScoreAdjTests(unittest.TestCase):
             os.close(fd)
         except OSError:
             pass
+
+    def make_child(self, name):
+        child = self.unit / name
+        child.mkdir()
+        (child / "cgroup.freeze").write_text("0\n")
+        (child / "cgroup.events").write_text("populated 1\nfrozen 1\n")
+        return child
 
     def fake_process(self, pid, cgroup):
         directory = self.proc / str(pid)
@@ -18017,31 +18065,85 @@ class ScopeOomScoreAdjTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "cgroup.events"):
                     sandy._cgroup_frozen(unit_fd)
 
-    def test_frozen_cgroup_freezes_waits_and_thaws(self):
+    def children(self):
+        return [self.unit / name for name in SCOPE_CHILDREN]
+
+    def child_freezes(self):
+        return [(child / "cgroup.freeze").read_text() for child in self.children()]
+
+    def set_child_events(self, text):
+        for child in self.children():
+            (child / "cgroup.events").write_text(text)
+
+    def test_frozen_cgroup_freezes_each_child_waits_and_thaws(self):
         unit_fd = self.open_dir(self.unit)
-        events = self.unit / "cgroup.events"
-        events.write_text("populated 1\nfrozen 0\n")
+        self.set_child_events("populated 1\nfrozen 0\n")
         polls = []
 
         def sleep(_interval):
             # The kernel reports the freeze after the first poll.
-            polls.append((self.unit / "cgroup.freeze").read_text())
-            events.write_text("populated 1\nfrozen 1\n")
+            polls.append(self.child_freezes())
+            self.set_child_events("populated 1\nfrozen 1\n")
 
         with patch.object(sandy.time, "sleep", side_effect=sleep):
             with sandy._frozen_cgroup(unit_fd):
-                self.assertEqual((self.unit / "cgroup.freeze").read_text(), "1")
-        self.assertEqual(polls, ["1"])
-        self.assertEqual((self.unit / "cgroup.freeze").read_text(), "0")
-        # An error in the body thaws the cgroup too.
+                self.assertEqual(self.child_freezes(), ["1\n", "1\n"])
+        self.assertEqual(polls, [["1\n", "1\n"]])
+        self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+        # An error in the body thaws the children too.
         with self.assertRaisesRegex(RuntimeError, "body"):
             with sandy._frozen_cgroup(unit_fd):
                 raise RuntimeError("body")
-        self.assertEqual((self.unit / "cgroup.freeze").read_text(), "0")
+        self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+        # The scope's own cgroup.freeze was never written.
+        self.assertEqual((self.unit / "cgroup.freeze").read_text(), "0\n")
+
+    def test_frozen_cgroup_keeps_each_freeze_and_thaw_of_the_scope(self):
+        # Regression: cgroup.freeze has no compare-and-set, and the thaw of
+        # the scope undid a direct write of 1 to it during the update. The
+        # scope's file now belongs to systemctl and the administrator only.
+        unit_fd = self.open_dir(self.unit)
+        scope_freeze = self.unit / "cgroup.freeze"
+        real_write = sandy._write_cgroup_file
+        written = []
+
+        def write(dir_fd, name, value):
+            written.append(os.readlink(f"/proc/self/fd/{dir_fd}"))
+            return real_write(dir_fd, name, value)
+
+        with patch.object(sandy, "_write_cgroup_file", side_effect=write):
+            for before, during in (("0\n", "1\n"), ("1\n", "0\n"), ("1\n", "1\n")):
+                with self.subTest(before=before, during=during):
+                    scope_freeze.write_text(before)
+                    written.clear()
+                    with sandy._frozen_cgroup(unit_fd):
+                        scope_freeze.write_text(during)
+                    self.assertEqual(scope_freeze.read_text(), during)
+                    self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+                    self.assertEqual(
+                        sorted(written), sorted([str(c) for c in self.children()] * 2)
+                    )
+
+    def test_frozen_cgroup_keeps_a_child_freeze_that_it_did_not_set(self):
+        unit_fd = self.open_dir(self.unit)
+        payload, supervisor = self.children()
+        (payload / "cgroup.freeze").write_text("1\n")
+        real_write = sandy._write_cgroup_file
+        written = []
+
+        def write(dir_fd, name, value):
+            written.append((os.readlink(f"/proc/self/fd/{dir_fd}"), value))
+            return real_write(dir_fd, name, value)
+
+        with patch.object(sandy, "_write_cgroup_file", side_effect=write):
+            with sandy._frozen_cgroup(unit_fd):
+                pass
+        self.assertEqual(written, [(str(supervisor), b"1"), (str(supervisor), b"0")])
+        self.assertEqual(self.child_freezes(), ["1\n", "0\n"])
 
     def test_frozen_cgroup_times_out_and_thaws(self):
         unit_fd = self.open_dir(self.unit)
-        (self.unit / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+        self.set_child_events("populated 1\nfrozen 0\n")
         times = iter((0.0, 1.0, sandy.CGROUP_FREEZE_TIMEOUT))
         body = MagicMock()
         with patch.object(
@@ -18052,29 +18154,437 @@ class ScopeOomScoreAdjTests(unittest.TestCase):
                     body()
         body.assert_not_called()
         sleep.assert_called_once_with(sandy.CGROUP_FREEZE_POLL_INTERVAL)
-        self.assertEqual((self.unit / "cgroup.freeze").read_text(), "0")
+        self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
 
-    def test_frozen_cgroup_reports_a_failed_thaw(self):
+    def test_frozen_cgroup_reports_a_failed_thaw_and_thaws_the_other_children(self):
         unit_fd = self.open_dir(self.unit)
+        payload = str(self.children()[0])
+        real_write = sandy._write_cgroup_file
         writes = []
 
         def write(dir_fd, name, value):
-            writes.append(value)
-            if value == b"0":
+            path = os.readlink(f"/proc/self/fd/{dir_fd}")
+            writes.append((path, value))
+            if value == b"0" and path == payload:
                 raise OSError(errno.EBUSY, "busy")
+            return real_write(dir_fd, name, value)
 
         with patch.object(sandy, "_write_cgroup_file", side_effect=write):
-            with self.assertRaisesRegex(OSError, "stays frozen"):
+            with self.assertRaisesRegex(OSError, "which stays frozen"):
                 with sandy._frozen_cgroup(unit_fd):
                     pass
-            # A failed freeze still tries to thaw.
-            writes.clear()
-            with patch.object(
-                sandy, "_cgroup_frozen", side_effect=ValueError("bad")
-            ), self.assertRaisesRegex(OSError, "stays frozen"):
+        self.assertEqual(self.child_freezes(), ["1\n", "0\n"])
+        self.assertEqual(len(writes), 4)
+        # Both thaws fail: each child is tried, and the first error stays.
+        for child in self.children():
+            (child / "cgroup.freeze").write_text("0\n")
+        first = OSError(errno.EBUSY, "first")
+
+        def fail_thaw(dir_fd, name, value, errors=[first, OSError(errno.EBUSY, "x")]):
+            if value == b"0":
+                raise errors.pop(0)
+            return real_write(dir_fd, name, value)
+
+        with patch.object(sandy, "_write_cgroup_file", side_effect=fail_thaw):
+            with self.assertRaises(OSError) as raised:
                 with sandy._frozen_cgroup(unit_fd):
                     pass
-        self.assertEqual(writes, [b"1", b"0"])
+        self.assertIs(raised.exception.__cause__, first)
+        self.assertEqual(self.child_freezes(), ["1\n", "1\n"])
+
+    def test_frozen_cgroup_does_not_claim_a_freeze_that_did_not_happen(self):
+        # Regression: when the freeze write failed, a failed thaw said that
+        # the container stays frozen.
+        unit_fd = self.open_dir(self.unit)
+        error = OSError(errno.EACCES, "denied")
+        with patch.object(sandy, "_write_cgroup_file", side_effect=error):
+            with self.assertRaises(OSError) as raised:
+                with sandy._frozen_cgroup(unit_fd):
+                    pass
+        # cgroup.freeze still reads 0: the freeze write's own error stays.
+        self.assertIs(raised.exception, error)
+
+    def test_thaw_cgroup_reports_the_state_after_a_failed_write(self):
+        unit_fd = self.open_dir(self.unit)
+        busy = OSError(errno.EBUSY, "busy")
+        for read, error, message in (
+            # The cgroup is gone: it has no processes to thaw.
+            (OSError(errno.ENOENT, "gone"), ProcessLookupError, "was removed"),
+            (OSError(errno.ENODEV, "gone"), ProcessLookupError, "was removed"),
+            # The state is unknown.
+            (OSError(errno.EACCES, "denied"), OSError, "which can stay frozen"),
+            (ValueError("Malformed cgroup.freeze"), OSError, "which can stay frozen"),
+            (True, OSError, "which stays frozen"),
+        ):
+            with self.subTest(read=read):
+                state = MagicMock(
+                    side_effect=read if isinstance(read, Exception) else None,
+                    return_value=read,
+                )
+                with patch.object(
+                    sandy, "_write_cgroup_file", side_effect=busy
+                ), patch.object(sandy, "_cgroup_freeze_set", state):
+                    with self.assertRaisesRegex(error, message) as raised:
+                        sandy._thaw_cgroup(unit_fd)
+                self.assertIs(raised.exception.__cause__, busy)
+        # Not frozen after the failed write: nothing to report.
+        with patch.object(sandy, "_write_cgroup_file", side_effect=busy):
+            sandy._thaw_cgroup(unit_fd)
+
+    def test_frozen_cgroup_skips_a_child_that_is_removed(self):
+        # The leaf of an attach that ends is removed outside the lock. A
+        # removed cgroup gives ENOENT for its files.
+        unit_fd = self.open_dir(self.unit)
+        leaf = self.make_child(ATTACH_LEAF)
+        with sandy._frozen_cgroup(unit_fd):
+            self.assertEqual((leaf / "cgroup.freeze").read_text(), "1\n")
+            shutil.rmtree(leaf)
+        self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+        # Removed at the freeze write, and before the first read.
+        for error in (errno.ENOENT, errno.ENODEV):
+            with self.subTest(error=error):
+                leaf = self.make_child(ATTACH_LEAF)
+                real_write = sandy._write_cgroup_file
+
+                def write(dir_fd, name, value, leaf=leaf, error=error):
+                    if os.readlink(f"/proc/self/fd/{dir_fd}").endswith(ATTACH_LEAF):
+                        shutil.rmtree(leaf)
+                        raise OSError(error, "removed")
+                    return real_write(dir_fd, name, value)
+
+                with patch.object(sandy, "_write_cgroup_file", side_effect=write):
+                    with sandy._frozen_cgroup(unit_fd):
+                        pass
+                self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+        self.make_child(ATTACH_LEAF)
+        real_freeze_set = sandy._cgroup_freeze_set
+
+        def freeze_set(dir_fd):
+            if os.readlink(f"/proc/self/fd/{dir_fd}").endswith(ATTACH_LEAF):
+                raise FileNotFoundError(errno.ENOENT, "removed")
+            return real_freeze_set(dir_fd)
+
+        with patch.object(sandy, "_cgroup_freeze_set", side_effect=freeze_set):
+            with sandy._frozen_cgroup(unit_fd):
+                pass
+        self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+        # Removed between the listing and the open, and the stat.
+        with patch.object(
+            sandy.os,
+            "listdir",
+            return_value=os.listdir(self.unit) + ["attach-gone"],
+        ):
+            with sandy._frozen_cgroup(unit_fd):
+                pass
+        real_open = os.open
+
+        def open_child(path, flags, dir_fd=None):
+            if path == ATTACH_LEAF:
+                shutil.rmtree(self.unit / ATTACH_LEAF)
+                raise FileNotFoundError(path)
+            return real_open(path, flags, dir_fd=dir_fd)
+
+        with patch.object(sandy.os, "open", side_effect=open_child):
+            with sandy._frozen_cgroup(unit_fd):
+                pass
+        self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+
+    def test_frozen_cgroup_fails_on_a_new_child_or_a_process_of_the_scope(self):
+        # Neither would be frozen. Only host root can make either; Sandy
+        # makes them only under the lifecycle lock, which the caller holds.
+        unit_fd = self.open_dir(self.unit)
+
+        def change(kind):
+            if kind == "child":
+                self.make_child("other")
+            else:
+                # For example the Leader while the container starts.
+                (self.unit / "cgroup.procs").write_text("42\n")
+
+        def undo(kind):
+            if kind == "child":
+                shutil.rmtree(self.unit / "other")
+            else:
+                (self.unit / "cgroup.procs").write_text("")
+
+        for kind in ("child", "process"):
+            with self.subTest(kind=kind, during="body"):
+                with self.assertRaisesRegex(RuntimeError, "if it is still starting"):
+                    with sandy._frozen_cgroup(unit_fd):
+                        change(kind)
+                self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+                undo(kind)
+            with self.subTest(kind=kind, during="wait"):
+                self.set_child_events("populated 1\nfrozen 0\n")
+                body = MagicMock()
+                with patch.object(
+                    sandy.time, "sleep", side_effect=lambda _: change(kind)
+                ), self.assertRaisesRegex(RuntimeError, "cgroups of the container"):
+                    with sandy._frozen_cgroup(unit_fd):
+                        body()
+                body.assert_not_called()
+                self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+                undo(kind)
+                self.set_child_events("populated 1\nfrozen 1\n")
+        # A process already there at the start: no body either.
+        change("process")
+        body = MagicMock()
+        with self.assertRaisesRegex(RuntimeError, "cgroups of the container"):
+            with sandy._frozen_cgroup(unit_fd):
+                body()
+        body.assert_not_called()
+        self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+
+    def test_frozen_cgroup_fails_at_once_on_a_thaw_during_the_wait(self):
+        # A thaw by another writer before the children are frozen: no wait
+        # for the timeout, and the same error as a thaw during the body.
+        unit_fd = self.open_dir(self.unit)
+        self.set_child_events("populated 1\nfrozen 0\n")
+        body = MagicMock()
+
+        def sleep(_interval):
+            (self.children()[1] / "cgroup.freeze").write_text("0\n")
+
+        with patch.object(sandy.time, "sleep", side_effect=sleep) as sleeper:
+            with self.assertRaisesRegex(RuntimeError, "thawed the container"):
+                with sandy._frozen_cgroup(unit_fd):
+                    body()
+        sleeper.assert_called_once_with(sandy.CGROUP_FREEZE_POLL_INTERVAL)
+        body.assert_not_called()
+        self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+
+    def test_frozen_cgroup_fails_when_another_writer_thaws_a_child(self):
+        unit_fd = self.open_dir(self.unit)
+        for freeze, events in (
+            ("0\n", "populated 1\nfrozen 0\n"),
+            ("1\n", "populated 1\nfrozen 0\n"),
+            ("0\n", "populated 1\nfrozen 1\n"),
+        ):
+            with self.subTest(freeze=freeze, events=events):
+                self.set_child_events("populated 1\nfrozen 1\n")
+                with self.assertRaisesRegex(RuntimeError, "thawed the container"):
+                    with sandy._frozen_cgroup(unit_fd):
+                        (self.children()[0] / "cgroup.freeze").write_text(freeze)
+                        (self.children()[0] / "cgroup.events").write_text(events)
+                # The thaw of its own freezes still runs.
+                self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+
+    @staticmethod
+    def current_mask():
+        return signal.pthread_sigmask(signal.SIG_BLOCK, [])
+
+    def test_frozen_cgroup_blocks_hangup_signals_until_the_thaw(self):
+        # Mocks: none for the signal mask; the test changes and checks the
+        # mask of this thread only. cgroup files are regular files.
+        unit_fd = self.open_dir(self.unit)
+        hangup = set(sandy.ATTACH_HANGUP_SIGNALS)
+        before = self.current_mask()
+        self.assertFalse(hangup & before)
+        real_write = sandy._write_cgroup_file
+        masks = []
+
+        def write(dir_fd, name, value):
+            masks.append((value, hangup <= self.current_mask()))
+            return real_write(dir_fd, name, value)
+
+        with patch.object(sandy, "_write_cgroup_file", side_effect=write):
+            with sandy._frozen_cgroup(unit_fd):
+                self.assertLessEqual(hangup, self.current_mask())
+            self.assertEqual(masks, [(b"1", True)] * 2 + [(b"0", True)] * 2)
+            self.assertEqual(self.current_mask(), before)
+            # The mask is restored after an error in the body.
+            with self.assertRaisesRegex(RuntimeError, "body"):
+                with sandy._frozen_cgroup(unit_fd):
+                    raise RuntimeError("body")
+            self.assertEqual(self.current_mask(), before)
+        # And after a failed freeze and thaw.
+        with patch.object(
+            sandy, "_write_cgroup_file", side_effect=OSError(errno.EBUSY, "busy")
+        ), self.assertRaisesRegex(OSError, "busy"):
+            with sandy._frozen_cgroup(unit_fd):
+                pass
+        self.assertEqual(self.current_mask(), before)
+
+    def test_frozen_cgroup_keeps_signals_that_the_caller_blocked(self):
+        unit_fd = self.open_dir(self.unit)
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGTERM])
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, previous)
+        with sandy._frozen_cgroup(unit_fd):
+            pass
+        self.assertIn(signal.SIGTERM, self.current_mask())
+        self.assertNotIn(signal.SIGHUP, self.current_mask())
+
+    def test_a_termination_during_the_freeze_acts_after_the_thaw(self):
+        # Regression: SIGTERM or SIGHUP during the update ended sandy before
+        # the thaw, and the container stayed frozen. Mocks: a Python handler
+        # stands in for the default action, which would end the test.
+        unit_fd = self.open_dir(self.unit)
+        for signum in sandy.ATTACH_HANGUP_SIGNALS:
+            with self.subTest(signal=signum.name):
+                received = []
+
+                def handler(number, _frame):
+                    received.append((number, self.child_freezes()))
+
+                old_handler = signal.signal(signum, handler)
+                try:
+                    with sandy._frozen_cgroup(unit_fd):
+                        # A signal for this thread: a process-directed one
+                        # can go to another thread of the test run that does
+                        # not block it. The update path has one thread.
+                        signal.pthread_kill(threading.get_ident(), signum)
+                        self.assertEqual(received, [])
+                        self.assertIn(signum, signal.sigpending())
+                finally:
+                    signal.signal(signum, old_handler)
+                # The signal acted only after the thaw.
+                self.assertEqual(received, [(signum, ["0\n", "0\n"])])
+
+    def test_an_interrupt_during_the_freeze_acts_after_the_thaw(self):
+        # Regression: a Ctrl-C during the update raised KeyboardInterrupt
+        # before the thaw, and the container stayed frozen. Mocks: none;
+        # Python's default SIGINT handler stays in place.
+        unit_fd = self.open_dir(self.unit)
+        real_thaw = sandy._thaw_cgroup
+
+        def thaw(dir_fd):
+            signal.pthread_kill(threading.get_ident(), signal.SIGINT)
+            return real_thaw(dir_fd)
+
+        handler = signal.getsignal(signal.SIGINT)
+        with patch.object(sandy, "_thaw_cgroup", side_effect=thaw) as thawer:
+            with self.assertRaises(KeyboardInterrupt):
+                with sandy._frozen_cgroup(unit_fd):
+                    signal.pthread_kill(threading.get_ident(), signal.SIGINT)
+        # Both thaws ran, and the interrupt came after them.
+        self.assertEqual(thawer.call_count, 2)
+        self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+        self.assertIs(signal.getsignal(signal.SIGINT), handler)
+        # Without an interrupt, nothing is raised.
+        with sandy._frozen_cgroup(unit_fd):
+            pass
+        self.assertIs(signal.getsignal(signal.SIGINT), handler)
+
+    def test_frozen_cgroup_rejects_a_malformed_freeze_file(self):
+        unit_fd = self.open_dir(self.unit)
+        before = self.current_mask()
+        body = MagicMock()
+        for text in ("", "1", "0", "2\n", "-1\n", "0\n0\n", "1\n" * 16):
+            with self.subTest(text=text):
+                for child in self.children():
+                    (child / "cgroup.freeze").write_text(text)
+                with patch.object(sandy, "_write_cgroup_file") as write:
+                    with self.assertRaises(ValueError):
+                        with sandy._frozen_cgroup(unit_fd):
+                            body()
+                write.assert_not_called()
+                body.assert_not_called()
+                self.assertEqual(self.current_mask(), before)
+
+    def test_child_cgroup_names_lists_directories_only(self):
+        unit_fd = self.open_dir(self.unit)
+        (self.unit / "link").symlink_to(self.children()[0])
+        self.assertEqual(
+            sorted(sandy._child_cgroup_names(unit_fd)), sorted(SCOPE_CHILDREN)
+        )
+        # An entry removed between the listing and the stat.
+        with patch.object(
+            sandy.os, "listdir", return_value=["gone"] + list(SCOPE_CHILDREN)
+        ):
+            self.assertEqual(sandy._child_cgroup_names(unit_fd), list(SCOPE_CHILDREN))
+
+    def test_frozen_cgroup_raises_other_child_errors(self):
+        unit_fd = self.open_dir(self.unit)
+        denied = OSError(errno.EACCES, "denied")
+        for name in ("_cgroup_freeze_set", "_cgroup_frozen"):
+            with self.subTest(name=name):
+                real = getattr(sandy, name)
+                calls = []
+
+                def fail(dir_fd, real=real, calls=calls):
+                    calls.append(dir_fd)
+                    # The first read of each child passes.
+                    if len(calls) > 2:
+                        raise denied
+                    return real(dir_fd)
+
+                with patch.object(sandy, name, side_effect=fail):
+                    with self.assertRaises(OSError) as raised:
+                        with sandy._frozen_cgroup(unit_fd):
+                            pass
+                self.assertIs(raised.exception, denied)
+                self.assertEqual(self.child_freezes(), ["0\n", "0\n"])
+        # At the first read of a child: no freeze write.
+        with patch.object(
+            sandy, "_cgroup_freeze_set", side_effect=denied
+        ), patch.object(sandy, "_write_cgroup_file") as write:
+            with self.assertRaises(OSError) as raised:
+                with sandy._frozen_cgroup(unit_fd):
+                    pass
+        self.assertIs(raised.exception, denied)
+        write.assert_not_called()
+
+    def test_read_supervisor_oom_score_adj(self):
+        # Mocks: the cgroup open and the /proc/<pid> open; plain files stand
+        # in for cgroupfs and procfs.
+        supervisor = self.root / "supervisor-cgroup"
+        supervisor.mkdir()
+        procs = supervisor / "cgroup.procs"
+        cgroup = "0::/sandy.slice/sandy-ai-dev.scope/supervisor\n"
+        for pid, value in ((40, "-500\n"), (41, "-500\n")):
+            (self.fake_process(pid, cgroup) / "oom_score_adj").write_text(value)
+        # A reused PID in another cgroup, as the Leader, which container
+        # root can raise.
+        (
+            self.fake_process(42, "0::/sandy.slice/sandy-ai-dev.scope/payload\n")
+            / "oom_score_adj"
+        ).write_text("900\n")
+
+        def open_process(pid):
+            return os.open(self.proc / str(pid), sandy.DIRECTORY_OPEN_FLAGS)
+
+        def open_cgroup(components):
+            self.assertEqual(
+                components, ("sandy.slice", "sandy-ai-dev.scope", "supervisor")
+            )
+            return os.open(supervisor, sandy.DIRECTORY_OPEN_FLAGS)
+
+        with patch.object(
+            sandy, "_open_cgroup_path", side_effect=open_cgroup
+        ), patch.object(sandy, "_open_process_dir", side_effect=open_process):
+            for text, expected in (
+                ("40\n", -500),
+                ("40\n41\n", -500),
+                ("40\n42\n", -500),
+                # Exited: no /proc directory.
+                ("99\n40\n", -500),
+            ):
+                with self.subTest(text=text):
+                    procs.write_text(text)
+                    self.assertEqual(
+                        sandy._read_supervisor_oom_score_adj("ai-dev"), expected
+                    )
+            for text, error in (
+                ("", ProcessLookupError),
+                ("42\n", ProcessLookupError),
+                ("99\n", ProcessLookupError),
+                ("x\n", ValueError),
+                ("0\n", ValueError),
+                (" 40\n", ValueError),
+            ):
+                with self.subTest(text=text):
+                    procs.write_text(text)
+                    with self.assertRaises(error):
+                        sandy._read_supervisor_oom_score_adj("ai-dev")
+            (self.proc / "41" / "oom_score_adj").write_text("100\n")
+            procs.write_text("40\n41\n")
+            with self.assertRaisesRegex(ValueError, "different"):
+                sandy._read_supervisor_oom_score_adj("ai-dev")
+            # A process that exits after the open.
+            (self.proc / "41" / "cgroup").unlink()
+            self.assertEqual(sandy._read_supervisor_oom_score_adj("ai-dev"), -500)
+            with self.assertRaises(ValueError):
+                sandy._read_supervisor_oom_score_adj("Bad")
 
     def test_process_in_scope(self):
         unit = "sandy-ai-dev.scope"
@@ -19609,6 +20119,7 @@ class UpdateCommandTests(unittest.TestCase):
             OSError(errno.EACCES, "denied"),
             ValueError("Invalid container Leader PID"),
             subprocess.CalledProcessError(1, ["machinectl"]),
+            RuntimeError("Another program thawed the container during the update"),
         ):
             with self.subTest(error=type(error).__name__):
                 self.set_oom.side_effect = error

@@ -61,7 +61,12 @@ from tests.e2e.test_confinement import (
     _exec_when_mounted,
 )
 from tests.e2e.test_network import _wait_for_public_https
-from tests.e2e.test_scope import _has_new_only_child, _leaves, _read_cgroup_file
+from tests.e2e.test_scope import (
+    _has_new_only_child,
+    _leaves,
+    _read_cgroup_file,
+    _stale_attach_values,
+)
 
 # The host directory in which up makes its temporary directories. No test reads
 # or changes it: preflight lists entries there, and cleanup removes them.
@@ -2731,6 +2736,63 @@ class StoppableTerminalTests(unittest.TestCase):
         self.assertFalse(reader.is_alive())
         # A second close does nothing.
         terminal.close()
+
+
+class StaleAttachValueTests(unittest.TestCase):
+    """_stale_attach_values: the check of the values of concurrent attaches."""
+
+    # Updates to 300 from 10 to 11, and to -300 from 20 to 21.
+    UPDATES = [(10.0, 11.0, 300), (20.0, 21.0, -300)]
+
+    def test_accepts_the_last_value_and_overlapping_updates(self):
+        attaches = [
+            # Before any update: the initial value.
+            (1.0, 2.0, 0),
+            # Overlaps the first update: either value.
+            (9.5, 10.5, 0),
+            (9.5, 10.5, 300),
+            # Between the updates: the first update's value.
+            (12.0, 13.0, 300),
+            # Overlaps the second update.
+            (19.0, 20.5, 300),
+            (19.0, 20.5, -300),
+            # Spans both updates.
+            (9.0, 22.0, 0),
+            (9.0, 22.0, -300),
+            # After both.
+            (22.0, 23.0, -300),
+        ]
+        self.assertEqual(_stale_attach_values(0, self.UPDATES, attaches), [])
+
+    def test_rejects_an_older_value(self):
+        attaches = [
+            # The initial value after the first update ended.
+            (12.0, 13.0, 0),
+            # The first update's value after the second one ended.
+            (22.0, 23.0, 300),
+            # A value of no update.
+            (1.0, 2.0, 7),
+            # A later update's value before that update started.
+            (12.0, 13.0, -300),
+        ]
+        self.assertEqual(_stale_attach_values(0, self.UPDATES, attaches), attaches)
+
+    def test_a_delay_rejects_a_session_that_kept_the_value_from_its_start(self):
+        # Regression: a session that read 0 at its start, before the first
+        # update, and kept it after that update ended passed the check.
+        kept = (9.0, 15.0, 0)
+        self.assertEqual(_stale_attach_values(0, self.UPDATES, [kept]), [])
+        self.assertEqual(_stale_attach_values(0, self.UPDATES, [kept], 5.0), [kept])
+        attaches = [
+            # The update ended before the print: only its value.
+            (9.0, 15.0, 300),
+            # The print can come during the second update: either value.
+            (16.0, 20.5, 300),
+            (16.0, 20.5, -300),
+        ]
+        self.assertEqual(_stale_attach_values(0, self.UPDATES, attaches, 5.0), [])
+        stale = [(16.0, 20.5, 0), (17.0, 23.0, 300)]
+        self.assertEqual(_stale_attach_values(0, self.UPDATES, stale, 5.0), stale)
 
 
 if __name__ == "__main__":
