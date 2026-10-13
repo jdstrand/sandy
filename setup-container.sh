@@ -18,6 +18,15 @@ NVM_INSTALL_VERSION="0.40.8"
 NVM_INSTALL_SHA256="48a0eee9a60e07422dce0eb5774754c83889570ca1ee2566c516acbe8af03a9e"
 CLAUDE_INSTALL_SHA256="3a68d3406cf674e17bed1733a4dcf37805e2e47d87417700007d7e1aa766a944"
 
+GRAFANA_MCP_VERSION="2.0.2"
+GRAFANA_MCP_ARCH="x64"
+GRAFANA_MCP_SHA256="70272a53a96d8e61973e3592e19b97d633b46adfefba3f625a9331e786105c94"
+if [ "$ARCH" = "aarch64" ]; then
+    GRAFANA_MCP_SHA256="7f650b1d0c968e634b30d408c6700863672f4ad4c8b171626ffac1e4ca7f87de"
+    GRAFANA_MCP_ARCH="arm64"
+fi
+YQ_VERSION="4.54.1"
+
 export DEBIAN_FRONTEND=noninteractive
 
 # If running under Ghostty, fall back to xterm-256color since the container
@@ -233,7 +242,7 @@ if [ ! -e "/home/$AI_USER/.nvm" ]; then
   echo -e "\nI: Install node"
   cd "$TMPDIR"
   curl -o install.sh https://raw.githubusercontent.com/nvm-sh/nvm/v"$NVM_INSTALL_VERSION"/install.sh
-  echo "$NVM_INSTALL_SHA256  install.sh" sha256sum --check -- || exit 1
+  echo "$NVM_INSTALL_SHA256  install.sh" | sha256sum --check -- || exit 1
   su -l "$AI_USER" -c "bash $TMPDIR/install.sh"
   echo -e "\nI: Install node 24"
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && nvm install 24"
@@ -253,7 +262,7 @@ for tool in semver yarn pnpm typescript typescript-language-server ts-morph tree
   su -l "$AI_USER" -c ". \"/home/$AI_USER/.nvm/nvm.sh\" && npm install -g '$tool'"
 done
 
-for tool in "github.com/mikefarah/yq/v4@v4.47.2" "golang.org/x/tools/gopls@latest" "golang.org/x/tools/cmd/callgraph@latest" ; do
+for tool in "github.com/mikefarah/yq/v4@v$YQ_VERSION" "golang.org/x/tools/gopls@latest" "golang.org/x/tools/cmd/callgraph@latest" ; do
     echo -e "\nI: Install $tool (go)"
   # this installs to ~/go/bin which is in the user's PATH as part of rustup
   su -l "$AI_USER" -c "/usr/local/go/bin/go install '$tool'"
@@ -349,7 +358,12 @@ fi
 # install mcp-grafana
 if ! test -e "/home/$AI_USER"/go/bin/mcp-grafana ; then
   echo -e "\nI: Install mcp-grafana"
-  su -l "$AI_USER" -c "/usr/local/go/bin/go install github.com/grafana/mcp-grafana/cmd/mcp-grafana@v0.7.8"
+  GRAFANA_MCP_TARBALL="$TMPDIR/mcp-grafana.tar.gz"
+  # https://github.com/grafana/mcp-grafana/releases
+  curl -o "$GRAFANA_MCP_TARBALL" -L --proto "=https" https://github.com/grafana/mcp-grafana/releases/download/v"$GRAFANA_MCP_VERSION"/linux."$GRAFANA_MCP_ARCH".grafana.tar.gz
+  echo "$GRAFANA_MCP_SHA256  $GRAFANA_MCP_TARBALL" | sha256sum --check -- || exit 1
+  chmod 644 "$GRAFANA_MCP_TARBALL"
+  su -l "$AI_USER" -c "tar -C /home/$AI_USER/go/bin -zxf $GRAFANA_MCP_TARBALL mcp-grafana"
   ai_tools+=("mcp-grafana (https://github.com/grafana/mcp-grafana)")
 fi
 
