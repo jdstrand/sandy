@@ -65,9 +65,14 @@ apt-get install -y \
   locales \
   tzdata
 
+# tzdata wants to make a backup of /usr/share/zoneinfo/Etc/UTC, which fails
+# under nspawn. Workaround this by pinning tzdata.
+echo -e "\nI: apt-mark hold tzdata"
+apt-mark hold tzdata
+
 # Add the user
 getent passwd "$AI_USER" || {
-  echo -e "I: Add \"$AI_USER\" user"
+  echo -e "\nI: Add \"$AI_USER\" user"
   adduser --disabled-password --gecos "AI User,,," "$AI_USER"
 }
 
