@@ -1,4 +1,4 @@
-black==26.3.1
+black==26.10.1
 click==8.4.2
 coverage==7.15.2
 mypy-extensions==1.1.0
