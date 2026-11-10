@@ -297,11 +297,13 @@ if [ ! -e "/home/$AI_USER/.local/bin/claude" ]; then
   ai_tools+=("- verbose: launch with 'claude --verbose' or use '/config' to toggle")
 
   # disable auto-updates (don't work in ephemeral container; verify with native install)
-  echo '{"autoUpdates": false}' > "/home/$AI_USER/.claude.json"
-  chown "$AI_USER:$AI_USER" "/home/$AI_USER/.claude.json"
-  chmod 600 "/home/$AI_USER/.claude.json"
+  echo -e "\nI: Disable auto-updates"
+  echo "export DISABLE_AUTOUPDATER=1" >> "/home/$AI_USER/.bashrc"
 
-  echo -e "\nI: Disable mouse click in the new TUI"
+  echo -e "\nI: Enable fullscreen (alternate screen; no flicker TUI)"
+  echo "export CLAUDE_CODE_NO_FLICKER=1" >> "/home/$AI_USER/.bashrc"
+
+  echo -e "\nI: Disable mouse click and capture in fullscreen TUI"
   echo "export CLAUDE_CODE_DISABLE_MOUSE=1" >> "/home/$AI_USER/.bashrc"
 
   echo -e "\nI: Claude-Session in commit messages"
