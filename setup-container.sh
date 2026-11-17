@@ -146,6 +146,7 @@ apt-get update  # for command-not-found
 echo -e "\nI: Install tools for AI"
 apt-get install -y \
   binutils \
+  brotli \
   bsdextrautils \
   ca-certificates \
   curl \
@@ -162,7 +163,8 @@ apt-get install -y \
   shellcheck \
   sqlite3 \
   unzip \
-  wget
+  wget \
+  zstd
 
 echo -e "\nI: Install build tools"
 apt-get install -y \
