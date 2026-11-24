@@ -262,7 +262,7 @@ fi
 #
 # Helpful additional tools
 #
-for tool in semver yarn pnpm typescript typescript-language-server ts-morph tree-sitter-cli; do
+for tool in semver yarn pnpm pyright typescript typescript-language-server ts-morph tree-sitter-cli; do
   echo -e "\nI: Install $tool (node)"
   # this installs to ~/.nvm/versions/node/<nodever>/bin which is in the user's
   # PATH as part of nvm install
